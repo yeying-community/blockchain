@@ -1,0 +1,127 @@
+"""Scenario runner for the ZhixingGraph economic simulation (whitepaper B.3.5).
+
+Runs the scenario matrix and prints a Markdown results table.
+
+    python3 sim/run.py                 # run all scenarios (auto backend), print table
+    python3 sim/run.py --md            # same, plus write sim/RESULTS.md
+    python3 sim/run.py --backend python# force pure-Python ΔK backend
+    python3 sim/run.py --backend rust  # force Rust ΔK backend (build engine first)
+    python3 sim/run.py --compare       # time the baseline scenario python vs rust
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import sys
+import time
+
+from model import SimConfig, Simulation, rust_available
+
+# --- Scenario matrix (B.3.5) --------------------------------------------------
+SCENARIOS: dict[str, SimConfig] = {
+    "baseline": SimConfig(),
+    "inflation_stress": SimConfig(base_emission=32.0, demand_rate=0.5),
+    "sybil_collusion": SimConfig(n_honest=30, n_spammers=15, n_colluders=10),
+    "cold_start": SimConfig(n_honest=8, demand_base=0.1),
+    "demand_shock": SimConfig(demand_rate=0.2, demand_base=0.1),
+}
+
+# What each scenario is expected to show (from the whitepaper).
+EXPECT = {
+    "baseline": "supply stable, low Gini, no attackers, honest ROI > 0",
+    "inflation_stress": "high emission -> supply inflates (ceiling needed)",
+    "sybil_collusion": "attacker ROI < 0 (loss) << honest ROI; fake pass -> 0",
+    "cold_start": "sparse start still bootstraps the graph",
+    "demand_shock": "demand collapse inflates but does not deadlock",
+}
+
+
+def run_all(backend: str | None = None) -> dict[str, dict]:
+    results = {}
+    for name, cfg in SCENARIOS.items():
+        if backend is not None:
+            cfg = dataclasses.replace(cfg, backend=backend)
+        results[name] = Simulation(cfg).run()
+    return results
+
+
+def compare_backends() -> None:
+    """Time the baseline scenario on both backends and check they agree."""
+    if not rust_available():
+        print("Rust engine not built; run ./engine/build_python.sh first.")
+        sys.exit(1)
+    cfg = SCENARIOS["baseline"]
+    out = {}
+    for backend in ("python", "rust"):
+        t0 = time.perf_counter()
+        out[backend] = Simulation(dataclasses.replace(cfg, backend=backend)).run()
+        dt = time.perf_counter() - t0
+        print(f"  {backend:6s}: {dt:7.3f}s  final_supply={out[backend]['final_supply']}"
+              f"  gini={out[backend]['final_gini']}"
+              f"  nodes={out[backend]['graph_nodes']}")
+    # both backends share the B.2.3 contract; identical seed -> identical run
+    same = all(out["python"][k] == out["rust"][k]
+               for k in out["python"] if k != "backend")
+    print("\n  identical results:", "OK" if same else "DIFFER")
+    if not same:
+        for k in out["python"]:
+            if k != "backend" and out["python"][k] != out["rust"][k]:
+                print(f"    {k}: python={out['python'][k]} rust={out['rust'][k]}")
+
+
+def to_markdown(results: dict[str, dict]) -> str:
+    cols = [
+        ("supply_delta", "Supply(gen→fin)"),
+        ("avg_net_emission", "NetEmit/ep"),
+        ("final_gini", "Gini"),
+        ("final_valley_balance", "ValleyBal"),
+        ("avg_fake_pass_rate", "FakePass"),
+        ("avg_attacker_roi", "AtkROI"),
+        ("final_honest_roi", "HonROI"),
+    ]
+    lines = []
+    lines.append("| Scenario | " + " | ".join(h for _, h in cols) + " | Expectation |")
+    lines.append("|---" * (len(cols) + 2) + "|")
+    for name, r in results.items():
+        r = dict(r)
+        r["supply_delta"] = f"{r['genesis_supply']}→{r['final_supply']}"
+        cells = " | ".join(str(r[k]) for k, _ in cols)
+        lines.append(f"| {name} | {cells} | {EXPECT.get(name, '')} |")
+    return "\n".join(lines)
+
+
+def main() -> None:
+    if "--compare" in sys.argv:
+        print("\nBaseline scenario — Python vs Rust ΔK backend\n")
+        compare_backends()
+        return
+
+    backend = None
+    for i, a in enumerate(sys.argv):
+        if a == "--backend" and i + 1 < len(sys.argv):
+            backend = sys.argv[i + 1]
+        elif a == "--rust":
+            backend = "rust"
+        elif a == "--python":
+            backend = "python"
+
+    results = run_all(backend)
+    table = to_markdown(results)
+    used = next(iter(results.values()))["backend"]
+    print(f"\nZhixingGraph economic simulation — scenario results (backend: {used})\n")
+    print(table)
+    print("\nMetrics: Supply(gen→fin)=genesis vs final $COG supply; NetEmit/ep="
+          "avg net emission per epoch (mint-burn-slash); Gini=inequality of "
+          "contributor earnings (0=equal); ValleyBal=cross-domain balance "
+          "min/max node count (1=evenly filled); FakePass=share of fake "
+          "submissions accepted; AtkROI/HonROI=attacker vs honest NET "
+          "return-on-stake, (earned-slashed)/staked (<0 means net loss).")
+    if "--md" in sys.argv:
+        with open("sim/RESULTS.md", "w") as f:
+            f.write("# Simulation results (auto-generated by sim/run.py)\n\n")
+            f.write(table + "\n")
+        print("\nWrote sim/RESULTS.md")
+
+
+if __name__ == "__main__":
+    main()
