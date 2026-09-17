@@ -1,0 +1,25 @@
+[package]
+name = "zhixing-node"
+version = "0.1.0"
+edition = "2021"
+description = "Reference PoK consensus node for ZhixingGraph: a deterministic state machine over the ΔK engine"
+license = "MIT"
+
+[lib]
+name = "zhixing_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "node"
+path = "src/main.rs"
+
+# The engine is reused as a plain rlib (no `python` feature, no pyo3). The node
+# is an *application*, so it takes an audited crypto dependency for signatures
+# (hand-rolling ed25519 would be irresponsible); the engine itself stays zero-dep.
+[dependencies]
+zhixing-engine = { path = "../engine" }
+ed25519-dalek = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
