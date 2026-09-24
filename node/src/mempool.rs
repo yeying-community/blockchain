@@ -86,10 +86,23 @@ impl Mempool {
             height: chain.state.height + 1,
             prev_hash: chain.head,
             timestamp_days,
+            // left unsealed: the driver appends ops then seals via `Chain::seal`.
+            next_validators_root: [0u8; 32],
+            // M23: state_root/accounts_root are stamped by `Chain::commit`
+            // after the trial apply succeeds, not by the builder.
+            state_root: [0u8; 32],
+            accounts_root: [0u8; 32],
+            // M27: same auto-stamp contract — the builder leaves it zero
+            // and `Chain::seal` (or `Chain::commit`'s fallback) fills it in.
+            graph_root: [0u8; 32],
+            bridge_root: [0u8; 32],
             txs: included,
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
             slashing_evidence: Vec::new(),
+            bridge_locks: Vec::new(),
+            bridge_headers: Vec::new(),
+            bridge_redeems: Vec::new(),
         })
     }
 
@@ -138,6 +151,7 @@ mod tests {
                 (22, kp(22).public(), 1),
                 (23, kp(23).public(), 1),
             ],
+            bridge_sources: vec![],
         }
     }
 
@@ -174,7 +188,7 @@ mod tests {
         mp.insert(&chain, tx(3, 3, 3, 2 * MICRO)).unwrap();
         assert_eq!(mp.len(), 3);
 
-        let blk = mp.build_block(&chain, 1.0).unwrap();
+        let mut blk = mp.build_block(&chain, 1.0).unwrap();
         // canonical order == sorted by tx hash, regardless of insertion order
         let order: Vec<Hash> = blk.txs.iter().map(|t| t.hash()).collect();
         let mut sorted = order.clone();
@@ -182,7 +196,8 @@ mod tests {
         assert_eq!(order, sorted);
 
         let mut c = chain;
-        assert!(c.commit(&blk).is_ok()); // built block is guaranteed to apply
+        c.seal(&mut blk).unwrap();
+        assert!(c.commit(&mut blk).is_ok()); // built block is guaranteed to apply
     }
 
     #[test]
@@ -209,10 +224,11 @@ mod tests {
         // of the two can be covered once the first escrows its stake.
         mp.insert(&chain, tx(1, 4, 4, 30 * MICRO)).unwrap();
 
-        let blk = mp.build_block(&chain, 1.0).unwrap();
+        let mut blk = mp.build_block(&chain, 1.0).unwrap();
         let mut c = chain;
+        c.seal(&mut blk).unwrap();
         // whatever the builder chose, the block commits cleanly (no stale tx)
-        assert!(c.commit(&blk).is_ok());
+        assert!(c.commit(&mut blk).is_ok());
         assert!(c.state.supply_conserved());
     }
 

@@ -50,10 +50,50 @@ pub struct Submission {
     pub timestamp_days: f32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GraphNode {
+    /// M25: monotonic id assigned at insertion (0, 1, 2, ...). Stable for
+    /// inclusion proofs and external references — distinct from the
+    /// node's position in `CognitiveGraph::nodes`, which is the same
+    /// value, but the id is what the chain commits to in the per-node
+    /// leaf preimage.
+    pub node_id: u64,
     pub embedding: Embedding,
     pub domain: u32,
+}
+
+impl GraphNode {
+    /// M25: canonical leaf preimage for inclusion proofs. Mirrors the
+    /// per-node layout used by `ChainState::state_root` for graph nodes,
+    /// but prepends `node_id` so the leaf identifies a specific node
+    /// independent of position. Total width: 8 + 32 + 4 = 44 bytes.
+    pub fn merkle_leaf(&self) -> Vec<u8> {
+        let mut e = Enc(Vec::new());
+        e.u64(self.node_id);
+        e.emb(&self.embedding);
+        e.u32(self.domain);
+        e.0
+    }
+}
+
+/// Minimal endian-aware encoder so the engine can produce a leaf
+/// preimage without depending on any external crate. Mirrors
+/// `node::codec::Enc` semantics byte-for-byte.
+struct Enc(Vec<u8>);
+
+impl Enc {
+    fn u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_be_bytes());
+    }
+    fn u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_be_bytes());
+    }
+    fn f32(&mut self, v: f32) {
+        self.0.extend_from_slice(&v.to_be_bytes());
+    }
+    fn emb(&mut self, e: &Embedding) {
+        for &x in e { self.f32(x); }
+    }
 }
 
 /// Minimal cognitive graph with same-domain kNN and a cross-domain bridge probe.
@@ -72,9 +112,14 @@ impl CognitiveGraph {
         CognitiveGraph { nodes: Vec::with_capacity(cap) }
     }
 
+    /// Append a node to the graph and return its monotonic `node_id`.
+    /// The id equals the insertion index; both are stable for the
+    /// lifetime of the graph.
     #[inline]
-    pub fn add(&mut self, node: GraphNode) {
-        self.nodes.push(node);
+    pub fn add(&mut self, embedding: Embedding, domain: u32) -> u64 {
+        let id = self.nodes.len() as u64;
+        self.nodes.push(GraphNode { node_id: id, embedding, domain });
+        id
     }
 
     pub fn len(&self) -> usize {
@@ -83,6 +128,12 @@ impl CognitiveGraph {
 
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    /// M25: index → node_id reverse lookup. Returns `None` if `idx` is
+    /// out of range. Equivalent to `nodes[idx].node_id` but bounds-checked.
+    pub fn id_at(&self, idx: usize) -> Option<u64> {
+        self.nodes.get(idx).map(|n| n.node_id)
     }
 
     /// Max cosine similarity to any same-domain node, plus whether the domain has
@@ -120,6 +171,66 @@ impl CognitiveGraph {
             }
         }
         (seen.count_ones() as usize) + extra.len()
+    }
+
+    /// M26: full sorted (cosine-desc, node_id-asc) ranking of every node
+    /// against `query`. Cross-domain (no domain filter). No truncation —
+    /// the caller decides whether to keep all ties or cut at k. Pure,
+    /// append-only-safe; identical output on any client given the same
+    /// committed graph. O(n) one-pass scan + O(n log n) sort.
+    pub fn rank_by_cosine(&self, query: &Embedding) -> Vec<(u64, f32)> {
+        let mut out: Vec<(u64, f32)> = self
+            .nodes
+            .iter()
+            .map(|n| (n.node_id, cos_sim(query, &n.embedding)))
+            .collect();
+        // Stable sort: cosine desc, then node_id asc (final tie-breaker).
+        // `partial_cmp` returns None for NaN; we treat NaN ties as Equal
+        // and let node_id break them — defensive: `cos_sim` can only
+        // produce NaN if an embedding contains NaN, which the chain
+        // never admits, but the verifier must not panic on a malicious
+        // prover who tampered at the Merkle-leaf level.
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        out
+    }
+
+    /// M26: top-k with all ties at the boundary. If the node at rank k-1
+    /// shares cosine similarity with rank k (or any later), all matching
+    /// nodes are returned — the result may have `len > k`. Pure; identical
+    /// output on any client.
+    ///
+    /// Ties are broken by `node_id` ascending, the same tie-breaker used
+    /// by `rank_by_cosine`. So if 5 nodes all share sim 0.95 and k=3, the
+    /// 3 lowest-`node_id` ones are kept (and the higher-`node_id` 0.95
+    /// nodes are dropped — they're truly indistinguishable by cosine, so
+    /// dropping by node_id is the only fair deterministic cut).
+    pub fn k_nearest_with_ties(&self, query: &Embedding, k: usize) -> Vec<(u64, f32)> {
+        if k == 0 {
+            return Vec::new();
+        }
+        let ranked = self.rank_by_cosine(query);
+        if ranked.is_empty() {
+            return Vec::new();
+        }
+        if ranked.len() <= k {
+            return ranked;
+        }
+        let cutoff = ranked[k - 1].1;
+        // Keep every node with sim >= cutoff. The sort is stable, so ties
+        // before the k-th slot are already in (node_id asc) order; ties
+        // past the k-th slot share the same sim and we include them too.
+        // `ranked` is sorted cos-desc, so once we see one < cutoff we are
+        // done — every later node has even lower sim.
+        let out: Vec<(u64, f32)> = ranked
+            .into_iter()
+            .take_while(|(_, s)| *s >= cutoff)
+            .collect();
+        debug_assert!(out.len() >= k);
+        out
     }
 }
 
@@ -269,11 +380,36 @@ mod tests {
     #[test]
     fn near_duplicate_gets_zero() {
         let mut g = CognitiveGraph::new();
-        g.add(GraphNode { embedding: unit(1.0), domain: 0 });
+        g.add(unit(1.0), 0);
         let sub = Submission { embedding: unit(1.0), domain: 0, timestamp_days: 0.0 };
         let reviews = vec![(1.0, 0.9); 5];
         let dk = compute_delta_k(&sub, &g, &reviews, (3, 3), &DeltaKParams::default(), 0.0);
         assert_eq!(dk, 0.0); // cos_sim == 1 > tau_dup -> novelty 0 -> gated to 0
+    }
+
+    #[test]
+    fn add_assigns_monotonic_node_ids() {
+        let mut g = CognitiveGraph::new();
+        assert_eq!(g.add(unit(1.0), 0), 0);
+        assert_eq!(g.add(unit(0.5), 1), 1);
+        assert_eq!(g.add(unit(0.0), 0), 2);
+        assert_eq!(g.id_at(0), Some(0));
+        assert_eq!(g.id_at(2), Some(2));
+        assert_eq!(g.id_at(3), None);
+    }
+
+    #[test]
+    fn merkle_leaf_is_stable_and_id_prefixed() {
+        let n = GraphNode { node_id: 7, embedding: unit(1.0), domain: 3 };
+        let leaf = n.merkle_leaf();
+        assert_eq!(leaf.len(), 8 + 32 + 4); // 44 bytes
+        // id is at the front in BE
+        assert_eq!(&leaf[0..8], &7u64.to_be_bytes());
+        // embedding follows: 8 × f32, first one is 1.0
+        let e0 = f32::from_be_bytes(leaf[8..12].try_into().unwrap());
+        assert!((e0 - 1.0).abs() < 1e-6);
+        // domain is the trailing u32 in BE
+        assert_eq!(&leaf[40..44], &3u32.to_be_bytes());
     }
 
     #[test]
@@ -283,6 +419,92 @@ mod tests {
         let reviews = vec![(1.0, 0.05); 5];
         let dk = compute_delta_k(&sub, &g, &reviews, (0, 3), &DeltaKParams::default(), 0.0);
         assert_eq!(dk, 0.0);
+    }
+
+    // ----- M26: k_nearest_with_ties -----
+
+    /// Build a graph with 5 nodes whose embeddings, vs query=[1,0,0,0,0,0,0,0],
+    /// have cosine similarities [0.95, 0.80, 0.70, 0.70, 0.60] in insertion order.
+    ///
+    /// `cos_sim(query, n) = n[0]` when both are unit-length AND query is
+    /// `unit(1.0)`. So `unit(x)` works only for x in {-1, 0, +1}; for in-between
+    /// values we have to fill in the other dimensions to keep the vector unit.
+    fn embed(c: f32) -> Embedding {
+        // cos_sim(query=[1,0,...], n) = n[0] / |n|. We pick n = (c, s, 0, ...)
+        // where s = sqrt(1 - c^2), so |n| = 1 and cos_sim = c.
+        let s = (1.0 - c * c).max(0.0).sqrt();
+        let mut e = [0.0f32; DIM];
+        e[0] = c;
+        e[1] = s;
+        e
+    }
+
+    fn build_knn_graph() -> CognitiveGraph {
+        let mut g = CognitiveGraph::new();
+        g.add(embed(0.95), 0); // id=0
+        g.add(embed(0.80), 0); // id=1
+        g.add(embed(0.70), 0); // id=2  (tied with id=3)
+        g.add(embed(0.70), 0); // id=3  (tied with id=2)
+        g.add(embed(0.60), 0); // id=4
+        g
+    }
+
+    #[test]
+    fn rank_by_cosine_is_cosine_desc_then_id_asc() {
+        let g = build_knn_graph();
+        let ranked = g.rank_by_cosine(&unit(1.0));
+        // Expected order: 0.95 (id 0), 0.80 (id 1), 0.70 (id 2), 0.70 (id 3), 0.60 (id 4)
+        let ids: Vec<u64> = ranked.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4]);
+        // Sanity: sims match insertion values (within 1e-5).
+        let sims: Vec<f32> = ranked.iter().map(|(_, s)| *s).collect();
+        for (got, want) in sims.iter().zip([0.95f32, 0.80, 0.70, 0.70, 0.60].iter()) {
+            assert!((got - want).abs() < 1e-5, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn k_nearest_with_ties_keeps_all_nodes_at_the_boundary() {
+        let g = build_knn_graph();
+        // k=2: cutoff = ranked[1].1 = 0.80. Nodes with sim >= 0.80 are id=0 and id=1.
+        // Tied-at-0.70 nodes (id=2, id=3) are NOT included because their sim (0.70)
+        // is strictly less than the cutoff (0.80). Result: exactly 2 nodes.
+        let r2 = g.k_nearest_with_ties(&unit(1.0), 2);
+        assert_eq!(r2.len(), 2, "k=2 result: {:?}", r2);
+        let ids: Vec<u64> = r2.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![0, 1]);
+
+        // Now k=3: cutoff = ranked[2].1 = 0.70. Nodes with sim >= 0.70 are
+        // id={0,1,2,3} — four nodes returned because both tied 0.70 nodes
+        // are at the boundary. The tie-breaker is node_id asc, so id=2 comes
+        // before id=3. Result: exactly 4 nodes (1 over k).
+        let r3 = g.k_nearest_with_ties(&unit(1.0), 3);
+        assert_eq!(r3.len(), 4, "k=3 result: {:?}", r3);
+        let ids: Vec<u64> = r3.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn k_nearest_with_ties_returns_all_when_n_leq_k() {
+        let g = build_knn_graph(); // n = 5
+        let r = g.k_nearest_with_ties(&unit(1.0), 5);
+        assert_eq!(r.len(), 5);
+        let r10 = g.k_nearest_with_ties(&unit(1.0), 10);
+        assert_eq!(r10.len(), 5);
+    }
+
+    #[test]
+    fn k_nearest_with_ties_returns_empty_for_k_zero() {
+        let g = build_knn_graph();
+        let r = g.k_nearest_with_ties(&unit(1.0), 0);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn k_nearest_with_ties_on_empty_graph() {
+        let g = CognitiveGraph::new();
+        let r = g.k_nearest_with_ties(&unit(1.0), 5);
+        assert!(r.is_empty());
     }
 }
 
@@ -330,7 +552,7 @@ mod python {
 
         fn add(&mut self, embedding: Vec<f32>, domain: u32) -> PyResult<()> {
             let emb = to_embedding(&embedding)?;
-            self.graph.add(GraphNode { embedding: emb, domain });
+            let _id = self.graph.add(emb, domain);
             Ok(())
         }
 
