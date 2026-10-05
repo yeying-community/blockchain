@@ -173,7 +173,19 @@ pub enum GossipMsg {
     /// wall-clock timers, `apply_certified` — live in the Actor). Boxed because a
     /// `Proposal` carries a whole `Block`.
     Consensus(Box<crate::round::Msg>),
+    /// M39: a peer address book for discovery — `(node_id, "host:port")` hints.
+    /// A node self-advertises its own `(id, listen)` here (so neighbors learn its
+    /// listen address without a handshake change) and re-gossips what it knows.
+    /// The daemon Actor merges these into its book and auto-dials any discovered
+    /// higher-id peer; the pure `GossipNode` / `LightGossipNode` cores drop it (no
+    /// I/O, no dialing). Capped at [`MAX_PEERS`] entries per message.
+    Peers(Vec<(u64, String)>),
 }
+
+/// M39: maximum entries in a single [`GossipMsg::Peers`] address book — over the
+/// cap is a codec error ([`CodecError::TooManyItems`]). Bounds a hostile peer's
+/// book so decoding can't fan out unboundedly.
+pub const MAX_PEERS: usize = 1024;
 
 /// M24: maximum items in a single [`GossipMsg::GetProof`] / [`GossipMsg::Proof`]
 /// — over the cap is a codec error (`TooManyItems`). Keeps a single request
@@ -209,6 +221,10 @@ pub const TAG_LOCK: u8 = 15;
 /// M33: distributed BFT consensus message (proposal / prevote / precommit).
 /// Handled by the daemon Actor, not the pure gossip cores.
 pub const TAG_CONSENSUS: u8 = 16;
+/// M39: peer address book — a list of `(node_id, listen_addr)` hints gossiped
+/// for peer discovery. Handled by the daemon Actor (auto-dials discovered
+/// higher-id peers); the pure gossip cores drop it.
+pub const TAG_PEERS: u8 = 17;
 
 /// M29: maximum items in a single heterogeneous batched
 /// request/response. Mirrors `MAX_PROOF_BATCH = 32` so the bus caps
@@ -216,6 +232,67 @@ pub const TAG_CONSENSUS: u8 = 16;
 /// bound, range cut bound, etc.) are enforced inside each
 /// `serve_*` helper as today.
 pub const MAX_BATCH_ITEMS: usize = 32;
+
+/// M55: a flood-dedup hash set bounded to its `capacity` most-recent entries.
+/// Unlike the mempool's *reject-at-bound* policy (M54), a dedup set must keep
+/// accepting new hashes to suppress floods, so it evicts the **oldest** entry
+/// (FIFO) once full. Eviction only risks a bounded re-flood of a long-silent
+/// item (it is treated as new once, re-admitted-or-dropped by state validation,
+/// and re-broadcast once) — never a consensus-safety or replay violation, since
+/// admission is independently gated by `validate_tx` in `Mempool::insert`.
+///
+/// `capacity == usize::MAX` ⇒ unbounded (the default): the FIFO `order` deque is
+/// never touched, so behavior is byte-for-byte identical to a plain `BTreeSet`.
+struct SeenSet {
+    set: BTreeSet<Hash>,
+    /// Insertion order for FIFO eviction; only maintained when bounded.
+    order: VecDeque<Hash>,
+    capacity: usize,
+}
+
+impl SeenSet {
+    fn new() -> Self {
+        SeenSet {
+            set: BTreeSet::new(),
+            order: VecDeque::new(),
+            capacity: usize::MAX,
+        }
+    }
+
+    /// Set the per-set bound (`usize::MAX` ⇒ unbounded). Trims immediately if
+    /// already over — at startup the set is empty so this is normally a no-op.
+    fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity;
+        while self.capacity != usize::MAX && self.order.len() > self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+    }
+
+    /// Mirrors `BTreeSet::insert`: returns `true` iff the hash was newly
+    /// inserted. Evicts the oldest entry (FIFO) once over capacity.
+    fn insert(&mut self, h: Hash) -> bool {
+        let is_new = self.set.insert(h);
+        if is_new && self.capacity != usize::MAX {
+            self.order.push_back(h);
+            while self.order.len() > self.capacity {
+                if let Some(old) = self.order.pop_front() {
+                    self.set.remove(&old);
+                }
+            }
+        }
+        is_new
+    }
+
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
 
 /// One peer: a chain, a mempool, the retained certified chain (blocks paired with
 /// certificates, for serving sync), and the gossip bookkeeping. Its [`on_message`]
@@ -238,12 +315,13 @@ pub struct GossipNode {
     /// `i+1`. Kept so this node can answer a peer's `GetBlocks`.
     blocks: Vec<Block>,
     certs: Vec<Commit>,
-    /// Content hashes of transactions already seen — makes gossip flooding idempotent.
-    seen_tx: BTreeSet<Hash>,
+    /// Content hashes of transactions already seen — makes gossip flooding
+    /// idempotent. M55: bounded (FIFO-evicting) via [`SeenSet`].
+    seen_tx: SeenSet,
     /// Content hashes of equivocation evidence already seen — dedup for `Evidence`.
-    seen_evidence: BTreeSet<Hash>,
+    seen_evidence: SeenSet,
     /// Content hashes of stake ops already seen — dedup for `StakeOp`.
-    seen_stake_op: BTreeSet<Hash>,
+    seen_stake_op: SeenSet,
     /// Evidence staged to be carried by the next block this node proposes
     /// (drained by the driver via [`Self::take_pending_evidence`]).
     pending_evidence: Vec<SlashEvidence>,
@@ -263,9 +341,9 @@ impl GossipNode {
             mempool: Mempool::new(max_txs),
             blocks: Vec::new(),
             certs: Vec::new(),
-            seen_tx: BTreeSet::new(),
-            seen_evidence: BTreeSet::new(),
-            seen_stake_op: BTreeSet::new(),
+            seen_tx: SeenSet::new(),
+            seen_evidence: SeenSet::new(),
+            seen_stake_op: SeenSet::new(),
             pending_evidence: Vec::new(),
             pending_stake_ops: Vec::new(),
             peers: peers.into_iter().filter(|&p| p != id).collect(),
@@ -414,6 +492,62 @@ impl GossipNode {
                 })
             }
         }
+    }
+
+    /// M60: bundle any `ProofKind`'s inclusion proof with the certified header it
+    /// verifies against (reviewer/validator/graph node over RPC, generalizing
+    /// M59's account-only `account_inclusion`). `None` ⇒ unknown id/index OR no
+    /// certified head yet (height 0). GraphNode addresses by insertion index.
+    pub fn inclusion(
+        &self,
+        kind: crate::light::ProofKind,
+        id: u64,
+    ) -> Option<(CertifiedHeader, crate::light::ProofEntry)> {
+        let entry = self.serve_inclusion(kind, id)?;
+        let head_ch = self.headers_from(self.height()).into_iter().next_back()?;
+        Some((head_ch, entry))
+    }
+
+    /// M61: serve a heterogeneous batch bundled with the certified head it
+    /// verifies against — the RPC analogue of the gossip GetBatch path,
+    /// generalizing M60's single `inclusion`. `None` ⇒ `serve_batch` rejected
+    /// (over `MAX_BATCH_ITEMS` or a degenerate Diff range) OR no certified head
+    /// yet (height 0). Inclusion/kNN/range slots verify against the bundled
+    /// head; Diff slots additionally need the client's own range blocks.
+    ///
+    /// M62: the third tuple element ships exactly that range — `[1..=max_h2]`,
+    /// where `max_h2` is the largest h₂ across the request's Diff items (0 ⇒
+    /// empty when the batch has no Diff item) — so a Diff slot verifies without
+    /// the client having pre-synced the chain. Computed before `items` is moved
+    /// into `serve_batch`.
+    pub fn batch(
+        &self,
+        items: Vec<crate::light::BatchItem>,
+    ) -> Option<crate::light::BatchReply> {
+        let max_h2 = items
+            .iter()
+            .filter_map(|it| match it {
+                crate::light::BatchItem::Diff { h2, .. } => Some(*h2),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let env = self.serve_batch(items)?;
+        let head_ch = self.headers_from(self.height()).into_iter().next_back()?;
+        Some((head_ch, env, self.blocks_through(max_h2)))
+    }
+
+    /// M59: bundle an account inclusion proof with the certified header it
+    /// verifies against. `None` ⇒ unknown account OR no certified head yet
+    /// (height 0). The head block's `accounts_root` commits to exactly the
+    /// current state the proof is built from, so the returned pair always
+    /// self-verifies (same soundness as the gossip `GetProof` path — this is
+    /// just the single-account producer wired for the external read RPC).
+    pub fn account_inclusion(
+        &self,
+        id: u64,
+    ) -> Option<(CertifiedHeader, crate::light::ProofEntry)> {
+        self.inclusion(crate::light::ProofKind::Account, id)
     }
 
     /// M29: serve a heterogeneous batched proof request. Walks
@@ -726,6 +860,22 @@ impl GossipNode {
         })
     }
 
+    /// M64: every bridge lock on this chain as `(lock_id, height, lock)`, id order
+    /// (the `BTreeMap` iterates sorted) — the directory a client enumerates before
+    /// fetching a single lock's proof via `serve_lock`. Plain (unverified) data; a
+    /// client verifies any one lock via the M63 `/bridge/lock/{id}/proof` route.
+    pub fn lock_listing(&self) -> crate::light::LockListing {
+        self.chain
+            .state
+            .bridge_locks
+            .iter()
+            .map(|(&id, lock)| {
+                let h = self.chain.state.bridge_lock_heights.get(&id).copied().unwrap_or(0);
+                (id, h, lock.clone())
+            })
+            .collect()
+    }
+
     /// The certified blocks from `height` onward (inclusive), capped at
     /// [`MAX_BATCH`] — the payload for a peer's `GetBlocks`.
     fn batch_from(&self, height: u64) -> Vec<(Block, Commit)> {
@@ -734,6 +884,20 @@ impl GossipNode {
         }
         let start = (height - 1) as usize;
         (start..self.blocks.len().min(start + MAX_BATCH))
+            .map(|i| (self.blocks[i].clone(), self.certs[i].clone()))
+            .collect()
+    }
+
+    /// M62: every certified `(Block, Commit)` from height 1 through `up_to`
+    /// inclusive (`[1..=up_to]`), in height order — the block range a client
+    /// needs to replay for `ValidatorTracker::verify_diff_against_headers`.
+    /// Unlike [`Self::batch_from`] this is NOT capped at [`MAX_BATCH`]: the
+    /// Diff verifier replays the whole prefix, so a short cap would make a
+    /// long-chain Diff unverifiable. `up_to == 0` ⇒ empty (a batch with no Diff
+    /// item needs no range); `up_to` beyond the tip clamps to the stored tip.
+    fn blocks_through(&self, up_to: u64) -> Vec<(Block, Commit)> {
+        let end = (up_to as usize).min(self.blocks.len());
+        (0..end)
             .map(|i| (self.blocks[i].clone(), self.certs[i].clone()))
             .collect()
     }
@@ -848,12 +1012,55 @@ impl GossipNode {
     /// the gossip to flood it to peers. A tx that fails static validation is
     /// dropped (empty result).
     pub fn submit_local(&mut self, tx: SubmissionTx) -> Vec<(u64, GossipMsg)> {
+        self.submit_local_checked(tx).map(|(_, out)| out).unwrap_or_default()
+    }
+
+    /// M54: bound the pending mempool (DoS hardening). `usize::MAX` ⇒ unbounded.
+    /// Admission past the bound is rejected with `ChainError::MempoolFull`.
+    pub fn set_mempool_capacity(&mut self, capacity: usize) {
+        self.mempool.set_capacity(capacity);
+    }
+
+    /// M57: bound how many pending txs a single account (`author`) may hold at once
+    /// (DoS hardening — stops one account from monopolizing the pool). `usize::MAX`
+    /// ⇒ unbounded. Admission past it is rejected with `ChainError::AccountQuotaFull`.
+    pub fn set_mempool_per_account_limit(&mut self, limit: usize) {
+        self.mempool.set_per_account_limit(limit);
+    }
+
+    /// M55: bound each gossip dedup set (`seen_tx`/`seen_evidence`/`seen_stake_op`)
+    /// to `capacity` most-recent entries (FIFO eviction). `usize::MAX` ⇒ unbounded
+    /// (the default). The three sets are bounded independently to the same value.
+    pub fn set_seen_capacity(&mut self, capacity: usize) {
+        self.seen_tx.set_capacity(capacity);
+        self.seen_evidence.set_capacity(capacity);
+        self.seen_stake_op.set_capacity(capacity);
+    }
+
+    /// M55: current number of entries in the tx dedup set (the one under flood
+    /// pressure) — surfaced as a metrics gauge.
+    pub fn seen_tx_len(&self) -> usize {
+        self.seen_tx.len()
+    }
+
+    /// M55: the configured tx dedup-set bound (`usize::MAX` ⇒ unbounded).
+    pub fn seen_tx_capacity(&self) -> usize {
+        self.seen_tx.capacity()
+    }
+
+    /// M53: like [`submit_local`](Self::submit_local) but surfaces the mempool's
+    /// rejection reason instead of swallowing it — used by the external ingress
+    /// RPC to report accept (with the tx hash) or reject (with a `ChainError`).
+    /// Ordering matches `submit_local` verbatim: the tx is marked seen even when
+    /// admission fails, so a rejected tx is not re-requested from peers.
+    pub fn submit_local_checked(
+        &mut self,
+        tx: SubmissionTx,
+    ) -> Result<(Hash, Vec<(u64, GossipMsg)>), crate::ChainError> {
         let h = tx.hash();
         self.seen_tx.insert(h);
-        if self.mempool.insert(&self.chain, tx.clone()).is_err() {
-            return Vec::new();
-        }
-        self.broadcast(GossipMsg::Tx(tx), None)
+        let hash = self.mempool.insert(&self.chain, tx.clone())?;
+        Ok((hash, self.broadcast(GossipMsg::Tx(tx), None)))
     }
 
     /// Submit a locally-originated piece of equivocation evidence: stage it
@@ -992,6 +1199,9 @@ impl GossipNode {
             // the Keypair, wall-clock timers, and apply_certified side effects);
             // the pure core never handles it.
             GossipMsg::Consensus(_) => Vec::new(),
+            // M39: peer discovery is driven by the daemon Actor (it owns the
+            // address book and dialing); the pure core does no I/O.
+            GossipMsg::Peers(_) => Vec::new(),
         }
     }
 
@@ -1375,7 +1585,9 @@ impl LightGossipNode {
             | GossipMsg::Evidence(_)
             | GossipMsg::StakeOp(_)
             // M33: consensus is an Actor concern; light clients never vote.
-            | GossipMsg::Consensus(_) => Vec::new(),
+            | GossipMsg::Consensus(_)
+            // M39: peer discovery is an Actor concern; the pure core does no I/O.
+            | GossipMsg::Peers(_) => Vec::new(),
         }
     }
 
@@ -1555,11 +1767,9 @@ pub fn encode_gossip(m: &GossipMsg) -> Vec<u8> {
         }
         GossipMsg::Blocks(batch) => {
             out.push(TAG_BLOCKS);
-            out.extend_from_slice(&(batch.len() as u64).to_be_bytes());
-            for (b, c) in batch {
-                put_bytes(&mut out, &encode_block(b));
-                put_bytes(&mut out, &encode_commit(c));
-            }
+            // M62: body format lifted to the standalone `encode_blocks` so the
+            // RPC `/batch` `range_blocks=` line shares these exact bytes.
+            out.extend_from_slice(&encode_blocks(batch));
         }
         GossipMsg::Tx(tx) => {
             out.push(TAG_TX);
@@ -1631,29 +1841,7 @@ pub fn encode_gossip(m: &GossipMsg) -> Vec<u8> {
         // symmetric with the M24/M28 pairs.
         GossipMsg::GetBatch { items } => {
             out.push(TAG_GETBATCH);
-            out.extend_from_slice(&(items.len() as u32).to_be_bytes());
-            for item in items.iter() {
-                out.push(crate::codec::encode_batch_response_kind(item.kind_tag()));
-                match item {
-                    crate::light::BatchItem::Inclusion { kind, id } => {
-                        out.push(crate::codec::encode_proof_kind(*kind));
-                        out.extend_from_slice(&id.to_be_bytes());
-                    }
-                    crate::light::BatchItem::Knn { query, k } => {
-                        put_bytes(&mut out, &crate::codec::encode_knn_request(query, *k));
-                    }
-                    crate::light::BatchItem::Range { query, min_sim } => {
-                        put_bytes(
-                            &mut out,
-                            &crate::codec::encode_range_request(query, *min_sim),
-                        );
-                    }
-                    crate::light::BatchItem::Diff { h1, h2 } => {
-                        out.extend_from_slice(&h1.to_be_bytes());
-                        out.extend_from_slice(&h2.to_be_bytes());
-                    }
-                }
-            }
+            out.extend_from_slice(&encode_batch_request(items));
         }
         GossipMsg::Batch { envelope } => {
             out.push(TAG_BATCH);
@@ -1673,6 +1861,16 @@ pub fn encode_gossip(m: &GossipMsg) -> Vec<u8> {
         GossipMsg::Consensus(m) => {
             out.push(TAG_CONSENSUS);
             put_bytes(&mut out, &crate::codec::encode_consensus_msg(m));
+        }
+        // M39: peer address book — u32 count then per-entry (u64 id + length-
+        // prefixed utf8 addr).
+        GossipMsg::Peers(entries) => {
+            out.push(TAG_PEERS);
+            out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            for (id, addr) in entries.iter() {
+                out.extend_from_slice(&id.to_be_bytes());
+                put_bytes(&mut out, addr.as_bytes());
+            }
         }
     }
     out
@@ -1817,6 +2015,22 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
         TAG_CONSENSUS => GossipMsg::Consensus(Box::new(
             crate::codec::decode_consensus_msg(take_bytes(&mut rest)?)?,
         )),
+        // M39: peer address book — u32 count then per-entry (u64 id + length-
+        // prefixed utf8 addr). Addrs are best-effort hints (parse-checked before
+        // dialing), so a non-utf8 addr decodes lossily rather than failing.
+        TAG_PEERS => {
+            let n = take_u32(&mut rest)?;
+            if n as usize > MAX_PEERS {
+                return Err(CodecError::TooManyItems(n as u64));
+            }
+            let mut entries = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                let id = take_u64(&mut rest)?;
+                let addr = String::from_utf8_lossy(take_bytes(&mut rest)?).into_owned();
+                entries.push((id, addr));
+            }
+            GossipMsg::Peers(entries)
+        }
         other => return Err(CodecError::BadEnum(other as u32)),
     };
     if !rest.is_empty() {
@@ -1938,6 +2152,41 @@ pub fn decode_lock_envelope(buf: &[u8]) -> Result<crate::bridge::LockEnvelope, C
     })
 }
 
+/// M62: standalone codec for a `(Block, Commit)` range, so the RPC `/batch`
+/// `range_blocks=` line shares the exact byte format the gossip `Blocks` payload
+/// carries inline (`encode_gossip`'s `Blocks` arm delegates here). Layout:
+/// u64_be(count), then per pair a length-prefixed `encode_block` followed by a
+/// length-prefixed `encode_commit`.
+pub fn encode_blocks(batch: &[(Block, Commit)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(batch.len() as u64).to_be_bytes());
+    for (b, c) in batch.iter() {
+        put_bytes(&mut out, &encode_block(b));
+        put_bytes(&mut out, &encode_commit(c));
+    }
+    out
+}
+
+/// Mirror of [`encode_blocks`]. Unlike the inline gossip `TAG_BLOCKS` decoder
+/// this is NOT capped at [`MAX_BATCH`] — a legitimate Diff range can span the
+/// whole chain — and it does NOT pre-`with_capacity` on the declared count, so a
+/// buffer that lies about its length fails fast at the first missing pair
+/// (`UnexpectedEof`) instead of over-allocating.
+pub fn decode_blocks(buf: &[u8]) -> Result<Vec<(Block, Commit)>, CodecError> {
+    let mut rest = buf;
+    let n = take_u64(&mut rest)?;
+    let mut batch = Vec::new();
+    for _ in 0..n {
+        let block = decode_block(take_bytes(&mut rest)?)?;
+        let commit = decode_commit(take_bytes(&mut rest)?)?;
+        batch.push((block, commit));
+    }
+    if !rest.is_empty() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(batch)
+}
+
 /// M29: encode a `BatchResponseEnvelope` as a single length-prefixed
 /// blob for the `Batch { envelope }` wire format. Body layout:
 ///   u32_be(|items|)
@@ -1947,6 +2196,82 @@ pub fn decode_lock_envelope(buf: &[u8]) -> Result<crate::bridge::LockEnvelope, C
 ///     Knn:       1-byte presence tag ‖ length-prefixed `encode_knn_claim`
 ///     Range:     1-byte presence tag ‖ length-prefixed `encode_range_claim`
 ///     Diff:      length-prefixed `encode_diff_envelope`
+/// M61: standalone codec for a batch *request* (`Vec<BatchItem>`), so the RPC
+/// `POST /batch` body shares the exact byte format the gossip `GetBatch` carries
+/// inline (`encode_gossip` delegates here). Layout: u32 item count, then per item
+/// a 1-byte kind tag + per-kind body — Inclusion: 1-byte proof-kind + u64 id;
+/// Knn/Range: length-prefixed request; Diff: two u64 heights. No trailing length
+/// prefix (the gossip tag framing / RPC body length bound it).
+pub fn encode_batch_request(items: &[crate::light::BatchItem]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(items.len() as u32).to_be_bytes());
+    for item in items.iter() {
+        out.push(crate::codec::encode_batch_response_kind(item.kind_tag()));
+        match item {
+            crate::light::BatchItem::Inclusion { kind, id } => {
+                out.push(crate::codec::encode_proof_kind(*kind));
+                out.extend_from_slice(&id.to_be_bytes());
+            }
+            crate::light::BatchItem::Knn { query, k } => {
+                put_bytes(&mut out, &crate::codec::encode_knn_request(query, *k));
+            }
+            crate::light::BatchItem::Range { query, min_sim } => {
+                put_bytes(&mut out, &crate::codec::encode_range_request(query, *min_sim));
+            }
+            crate::light::BatchItem::Diff { h1, h2 } => {
+                out.extend_from_slice(&h1.to_be_bytes());
+                out.extend_from_slice(&h2.to_be_bytes());
+            }
+        }
+    }
+    out
+}
+
+/// M61: inverse of [`encode_batch_request`]. Caps the item count at
+/// `MAX_BATCH_ITEMS` (→ [`CodecError::TooManyItems`]), matching the inline gossip
+/// `GetBatch` decoder and [`decode_batch_envelope`].
+pub fn decode_batch_request(
+    buf: &[u8],
+) -> Result<Vec<crate::light::BatchItem>, CodecError> {
+    let mut rest = buf;
+    let n = take_u32(&mut rest)? as usize;
+    if n > MAX_BATCH_ITEMS {
+        return Err(CodecError::TooManyItems(n as u64));
+    }
+    let mut items = Vec::with_capacity(n);
+    for _ in 0..n {
+        let kind = crate::codec::decode_batch_response_kind(
+            rest.first().copied().ok_or(CodecError::UnexpectedEof)?,
+        )?;
+        rest = &rest[1..];
+        match kind {
+            0 => {
+                let kind_byte = rest.first().copied().ok_or(CodecError::UnexpectedEof)?;
+                rest = &rest[1..];
+                let k = crate::codec::decode_proof_kind(kind_byte)?;
+                let id = take_u64(&mut rest)?;
+                items.push(crate::light::BatchItem::Inclusion { kind: k, id });
+            }
+            1 => {
+                let (query, k) = crate::codec::decode_knn_request(take_bytes(&mut rest)?)?;
+                items.push(crate::light::BatchItem::Knn { query, k });
+            }
+            2 => {
+                let (query, min_sim) =
+                    crate::codec::decode_range_request(take_bytes(&mut rest)?)?;
+                items.push(crate::light::BatchItem::Range { query, min_sim });
+            }
+            3 => {
+                let h1 = take_u64(&mut rest)?;
+                let h2 = take_u64(&mut rest)?;
+                items.push(crate::light::BatchItem::Diff { h1, h2 });
+            }
+            other => return Err(CodecError::BadEnum(other as u32)),
+        }
+    }
+    Ok(items)
+}
+
 pub fn encode_batch_envelope(env: &crate::light::BatchResponseEnvelope) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(env.items.len() as u32).to_be_bytes());
@@ -2364,6 +2689,38 @@ mod tests {
         }
     }
 
+    /// M39: a `Peers` address book round-trips exactly, and a book claiming
+    /// more than `MAX_PEERS` entries is rejected at decode (bounded so a
+    /// hostile peer can't ship an unbounded book).
+    #[test]
+    fn peers_gossip_round_trips() {
+        let entries = vec![
+            (21u64, "127.0.0.1:19711".to_string()),
+            (22, "127.0.0.1:19712".to_string()),
+            (23, "10.0.0.7:30303".to_string()),
+        ];
+        let book = GossipMsg::Peers(entries.clone());
+        let bytes = encode_gossip(&book);
+        match decode_gossip(&bytes) {
+            Ok(GossipMsg::Peers(back)) => assert_eq!(back, entries),
+            other => panic!("expected Peers, got {other:?}"),
+        }
+        // An empty book is legal (a node with no known peers).
+        let empty = encode_gossip(&GossipMsg::Peers(vec![]));
+        match decode_gossip(&empty) {
+            Ok(GossipMsg::Peers(back)) => assert!(back.is_empty()),
+            other => panic!("expected empty Peers, got {other:?}"),
+        }
+        // A book that claims more than MAX_PEERS entries is rejected before it
+        // can allocate: hand-craft the wire header with an over-cap count.
+        let mut evil = vec![TAG_PEERS];
+        evil.extend_from_slice(&((MAX_PEERS as u32) + 1).to_be_bytes());
+        match decode_gossip(&evil) {
+            Err(CodecError::TooManyItems(n)) => assert_eq!(n, MAX_PEERS as u64 + 1),
+            other => panic!("expected TooManyItems, got {other:?}"),
+        }
+    }
+
     /// Build a real cert-signed `LockEnvelope` for round-trip testing. We
     /// spin up a single-validator chain, stage one lock, and serve it via
     /// `GossipNode::serve_lock` — same shape as the production path, just
@@ -2576,6 +2933,31 @@ mod tests {
     }
 
     #[test]
+    fn submit_local_checked_surfaces_reject() {
+        // M53: the checked variant returns the tx hash on admission and the
+        // ChainError on rejection, while plain submit_local stays byte-identical
+        // (empty vec on that same reject, marked seen either way).
+        let mut node = GossipNode::new(1, genesis(), 16, [1, 2]);
+
+        let good = tx(1, 1, 1);
+        let h = good.hash();
+        let (returned, gossip) =
+            node.submit_local_checked(good).expect("valid tx is admitted");
+        assert_eq!(returned, h);
+        assert!(node.mempool.contains(&h), "valid tx landed in the mempool");
+        assert!(!gossip.is_empty(), "admission produces gossip to flood");
+
+        // An unknown-author tx fails validation → the checked variant surfaces it.
+        let bad = tx(99, 2, 2);
+        let bh = bad.hash();
+        assert!(node.submit_local_checked(bad.clone()).is_err(), "reject is surfaced");
+        assert!(!node.mempool.contains(&bh), "rejected tx never entered the mempool");
+
+        // Plain submit_local swallows the same reject (empty vec), byte-identical.
+        assert!(node.submit_local(bad).is_empty(), "submit_local drops the reject");
+    }
+
+    #[test]
     fn a_duplicate_tx_does_not_re_flood() {
         let ids = [1u64, 2];
         let nodes: Vec<GossipNode> =
@@ -2588,6 +2970,73 @@ mod tests {
         // re-injecting the same tx to node 2 yields no new forwarding
         let again = net.nodes.get_mut(&2).unwrap().on_message(1, GossipMsg::Tx(t));
         assert!(again.is_empty(), "an already-seen tx is not re-gossiped");
+    }
+
+    #[test]
+    fn seen_set_evicts_oldest_at_capacity() {
+        // M55: a bounded SeenSet keeps only its `capacity` most-recent entries,
+        // evicting the oldest (FIFO). Re-inserting an evicted hash reports it as
+        // new again; a still-present hash reports as a duplicate.
+        let mut s = SeenSet::new();
+        s.set_capacity(2);
+        let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        assert!(s.insert(a));
+        assert!(s.insert(b));
+        assert!(s.insert(c)); // evicts a (oldest)
+        assert_eq!(s.len(), 2);
+        assert!(!s.insert(c), "newest still present ⇒ duplicate");
+        assert!(!s.insert(b), "b still present ⇒ duplicate");
+        assert!(s.insert(a), "a was evicted ⇒ treated as new again");
+        assert_eq!(s.len(), 2); // inserting a evicted b
+    }
+
+    #[test]
+    fn seen_set_unbounded_by_default() {
+        // Default capacity is usize::MAX ⇒ nothing is ever evicted and the FIFO
+        // order deque stays empty (byte-identical to a plain BTreeSet).
+        let mut s = SeenSet::new();
+        assert_eq!(s.capacity(), usize::MAX);
+        for i in 0..1000u32 {
+            let mut h = [0u8; 32];
+            h[..4].copy_from_slice(&i.to_le_bytes());
+            assert!(s.insert(h));
+        }
+        assert_eq!(s.len(), 1000);
+        assert!(s.order.is_empty(), "unbounded mode never tracks order");
+    }
+
+    #[test]
+    fn seen_set_set_capacity_trims_when_over() {
+        // Lowering the bound below the current size evicts oldest down to it.
+        let mut s = SeenSet::new();
+        s.set_capacity(10);
+        for i in 0..3u8 {
+            s.insert([i; 32]);
+        }
+        assert_eq!(s.len(), 3);
+        s.set_capacity(1);
+        assert_eq!(s.len(), 1, "trimmed down to the new bound");
+        assert!(s.insert([0u8; 32]), "the two older entries were evicted");
+    }
+
+    #[test]
+    fn bounded_seen_tx_reaccepts_evicted_flood() {
+        // M55: once a tx hash is evicted from the bounded seen_tx set, the same tx
+        // arriving again via gossip is treated as new and re-floods (contrast with
+        // `a_duplicate_tx_does_not_re_flood`). Bounded re-flood is the accepted cost
+        // of bounding; it is never a consensus-safety issue.
+        let mut node = GossipNode::new(1, genesis(), 16, [1, 2, 3]);
+        node.set_seen_capacity(1);
+
+        let a = tx(1, 1, 1);
+        let b = tx(2, 2, 2);
+        node.submit_local_checked(a.clone()).expect("A admitted");
+        // Submitting B marks B seen and evicts A's hash from the size-1 seen set.
+        node.submit_local_checked(b).expect("B admitted");
+
+        // A arrives again from peer 2: no longer "seen" ⇒ re-flooded to the others.
+        let out = node.on_message(2, GossipMsg::Tx(a));
+        assert!(!out.is_empty(), "an evicted tx re-floods when it reappears");
     }
 
     #[test]
@@ -2926,6 +3375,112 @@ mod tests {
     }
 
     // --- M24: batched typed proof gossip + light wallet end-to-end ---------
+
+    #[test]
+    fn batch_request_codec_round_trip() {
+        // M61: the standalone batch-request codec (reused by the RPC `POST /batch`
+        // body) round-trips a heterogeneous `Vec<BatchItem>`, caps the item count,
+        // and emits bytes byte-identical to the inline gossip `GetBatch` framing.
+        let items = vec![
+            crate::light::BatchItem::Inclusion { kind: crate::light::ProofKind::Reviewer, id: 10 },
+            crate::light::BatchItem::Knn { query: unit(0), k: 1 },
+            crate::light::BatchItem::Range { query: unit(0), min_sim: 0.0 },
+            crate::light::BatchItem::Diff { h1: 1, h2: 2 },
+        ];
+
+        // Round-trip: re-encoding the decoded items reproduces the original bytes
+        // (compared as bytes to sidestep float Eq on the embedding queries).
+        let bytes = encode_batch_request(&items);
+        let decoded = decode_batch_request(&bytes).expect("decode batch request");
+        assert_eq!(encode_batch_request(&decoded), bytes, "round-trip must be stable");
+
+        // The standalone encoding equals the tail of the inline gossip `GetBatch`
+        // framing (tag byte + request bytes) — the RPC body shares that wire format.
+        let gossip = encode_gossip(&GossipMsg::GetBatch { items: items.clone() });
+        assert_eq!(gossip[0], TAG_GETBATCH, "gossip GetBatch leads with its tag");
+        assert_eq!(&gossip[1..], &bytes[..], "RPC body matches the gossip GetBatch tail");
+
+        // Over-cap request is rejected at decode time (mirrors the gossip decoder).
+        let big: Vec<_> = (0..=MAX_BATCH_ITEMS)
+            .map(|i| crate::light::BatchItem::Inclusion {
+                kind: crate::light::ProofKind::Account,
+                id: i as u64,
+            })
+            .collect();
+        let over = encode_batch_request(&big);
+        assert!(
+            matches!(decode_batch_request(&over), Err(CodecError::TooManyItems(_))),
+            "over-cap batch must decode to TooManyItems",
+        );
+    }
+
+    #[test]
+    fn blocks_codec_round_trip() {
+        // M62: the standalone `(Block, Commit)` range codec (the RPC `/batch`
+        // `range_blocks=` line) round-trips, matches the inline gossip `Blocks`
+        // framing byte-for-byte, and fails fast on a lying length.
+        let (blocks, certs) = certified_chain(2);
+        let batch: Vec<(Block, Commit)> =
+            blocks.iter().cloned().zip(certs.iter().cloned()).collect();
+
+        let bytes = encode_blocks(&batch);
+        let decoded = decode_blocks(&bytes).expect("decode blocks");
+        assert_eq!(encode_blocks(&decoded), bytes, "round-trip must be stable");
+
+        // The standalone encoding equals the tail of the inline gossip `Blocks`
+        // framing (tag byte + body) — the RPC line shares that wire format.
+        let gossip = encode_gossip(&GossipMsg::Blocks(batch.clone()));
+        assert_eq!(gossip[0], TAG_BLOCKS, "gossip Blocks leads with its tag");
+        assert_eq!(&gossip[1..], &bytes[..], "range_blocks line matches the gossip Blocks tail");
+
+        // An empty range encodes to just the u64 count (0) and round-trips.
+        assert_eq!(encode_blocks(&[]), 0u64.to_be_bytes().to_vec());
+        assert!(decode_blocks(&encode_blocks(&[])).expect("decode empty").is_empty());
+
+        // A buffer that lies about its count (huge n, no bodies) fails fast at the
+        // first missing pair — no OOM from a pre-sized allocation.
+        let mut liar = 1_000_000u64.to_be_bytes().to_vec();
+        liar.extend_from_slice(&[0u8; 4]); // some trailing junk, far short of a pair
+        assert!(
+            matches!(decode_blocks(&liar), Err(CodecError::UnexpectedEof)),
+            "a lying count must fail at EOF, not allocate",
+        );
+    }
+
+    #[test]
+    fn batch_includes_range_for_diff_and_verifies() {
+        // M62: a batch carrying a Diff item ships the `[1..=max_h2]` block range
+        // the Diff verifier replays, so `verify_batch` accepts the Diff slot
+        // without the client having pre-synced the chain.
+        let (blocks, certs) = certified_chain(2);
+        let mut full = GossipNode::new(1, genesis(), 8, []);
+        full.load_certified(&blocks, &certs);
+
+        let items = vec![
+            crate::light::BatchItem::Diff { h1: 1, h2: 2 },
+            crate::light::BatchItem::Inclusion {
+                kind: crate::light::ProofKind::Reviewer,
+                id: 10,
+            },
+        ];
+        let (ch, env, range) = full.batch(items.clone()).expect("batch served");
+        assert_eq!(env.items.len(), items.len(), "one slot per request item");
+        assert_eq!(range.len(), 2, "Diff{{1,2}} ships the full [1..=2] block range");
+
+        let tracker = crate::light::ValidatorTracker::from_genesis(&genesis());
+        let tracked = tracker.validators().clone();
+        tracker
+            .verify_batch(&genesis(), &ch.header, &ch.cert, &tracked, &range, &items, &env)
+            .expect("the shipped range satisfies the Diff slot; head anchors the rest");
+
+        // A Diff-free batch ships no range.
+        let plain = vec![crate::light::BatchItem::Inclusion {
+            kind: crate::light::ProofKind::Reviewer,
+            id: 10,
+        }];
+        let (_ch2, _env2, range2) = full.batch(plain).expect("batch served");
+        assert!(range2.is_empty(), "no Diff item ⇒ empty range");
+    }
 
     #[test]
     fn full_node_serves_a_batch_of_proofs_in_response_to_get_proof() {
