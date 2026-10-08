@@ -416,6 +416,24 @@ enum Cmd {
     QueryLocks {
         reply: oneshot::Sender<crate::light::LockListing>,
     },
+    /// M83: list the active validator set (id + power + pubkey) for the plain read-class
+    /// RPC directory — the list sibling of the single `/validator/{id}` plain read. Always
+    /// a (possibly empty) list.
+    QueryValidators {
+        reply: oneshot::Sender<Vec<crate::validator::Validator>>,
+    },
+    /// M84: list all accounts (id + balance + stats + pubkey) for the plain read-class RPC
+    /// directory — the list sibling of the single `/account/{id}` plain read. Always a
+    /// (possibly empty) list.
+    QueryAccounts {
+        reply: oneshot::Sender<Vec<(u64, Account)>>,
+    },
+    /// M85: list all reviewers (id + reputation) for the plain read-class RPC directory —
+    /// the list sibling of the single `/reviewer/{id}` plain read. Always a (possibly
+    /// empty) list.
+    QueryReviewers {
+        reply: oneshot::Sender<Vec<(u64, f32)>>,
+    },
     /// M61: serve a heterogeneous proof batch + the certified head it verifies
     /// against, for the verifiable batch read RPC. `None` ⇒ `serve_batch` rejected
     /// (over `MAX_BATCH_ITEMS` or a degenerate Diff range) or no certified head
@@ -1073,6 +1091,28 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             }
             Cmd::QueryLocks { reply } => {
                 let _ = reply.send(actor.node.lock_listing());
+            }
+            Cmd::QueryValidators { reply } => {
+                // M83: read the validator set straight from state, like QueryEntity.
+                let _ = reply.send(actor.node.chain.state.validators.validators().to_vec());
+            }
+            Cmd::QueryAccounts { reply } => {
+                // M84: snapshot the id-sorted account map for the list directory.
+                let accounts = actor
+                    .node
+                    .chain
+                    .state
+                    .accounts
+                    .iter()
+                    .map(|(&id, a)| (id, a.clone()))
+                    .collect();
+                let _ = reply.send(accounts);
+            }
+            Cmd::QueryReviewers { reply } => {
+                // M85: snapshot the id-sorted reviewer reputation map for the list directory.
+                let reviewers =
+                    actor.node.chain.state.reviewers.iter().map(|(&id, &r)| (id, r)).collect();
+                let _ = reply.send(reviewers);
             }
             Cmd::QueryBatch { items, reply } => {
                 let _ = reply.send(actor.node.batch(items));
@@ -1777,15 +1817,16 @@ fn http_response(status_line: &str, body: &str) -> String {
 /// `text/plain; charset=utf-8` (via [`http_response`]); a `?format=json` read passes
 /// bare `application/json` (JSON is always UTF-8, so it carries no `charset` param).
 /// `Content-Length` is the UTF-8 byte length of `body`, exactly as before.
-/// M71: every response carries `Vary: Accept` (RFC 7231 §7.1.4) — the endpoint
-/// selects text vs JSON from the request's `Accept` header, so shared caches must
-/// key on it (lest a JSON body be replayed to a text client, or vice-versa).
+/// M71: every response carries `Vary` (RFC 7231 §7.1.4) — the endpoint selects text vs
+/// JSON from the request's `Accept` header, so shared caches must key on it (lest a JSON
+/// body be replayed to a text client, or vice-versa). M82: the response also negotiates on
+/// `Accept-Charset` (UTF-8-only ⇒ possible `406`), so `Vary` widens to `Accept, Accept-Charset`.
 fn http_response_ct(status_line: &str, content_type: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {}\r\n\
          Content-Type: {}\r\n\
          Content-Length: {}\r\n\
-         Vary: Accept\r\n\
+         Vary: Accept, Accept-Charset\r\n\
          Connection: close\r\n\
          \r\n\
          {}",
@@ -1812,6 +1853,21 @@ fn not_acceptable_json() -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("{{\"error\":\"not_acceptable\",\"available\":[{available}]}}")
+}
+
+/// M82: the charsets this RPC server can emit. UTF-8 only (every body is UTF-8), so a
+/// single source of truth for Accept-Charset negotiation + its `406` body.
+const OFFERED_CHARSETS: [&str; 1] = ["utf-8"];
+
+/// M82: RFC 7231 §6.5.6 — the `406` body when `Accept-Charset` rules out every charset we
+/// emit. Same machine-readable error shape as `not_acceptable_json`, listing charsets.
+fn not_acceptable_charset_json() -> String {
+    let available = OFFERED_CHARSETS
+        .iter()
+        .map(|c| json_str(c))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"error\":\"not_acceptable\",\"available_charsets\":[{available}]}}")
 }
 
 /// Accept loop for the ingress RPC endpoint. Mirrors [`run_metrics`]: each
@@ -1860,6 +1916,15 @@ enum GetRoute {
     /// M64: `GET /bridge/locks` — the plain (unverified) directory of every bridge
     /// lock on the chain (id + height + fields), so a client can discover ids.
     BridgeLocks,
+    /// M83: `GET /validators` — the plain (unverified) directory of the active
+    /// validator set (id + power + pubkey), the list sibling of `Plain(Validator, id)`.
+    Validators,
+    /// M84: `GET /accounts` — the plain (unverified) balances directory (id + balance +
+    /// stats + pubkey), the list sibling of `Account(u64)`.
+    Accounts,
+    /// M85: `GET /reviewers` — the plain (unverified) reviewer directory (id + reputation),
+    /// the list sibling of `Plain(Reviewer, id)`.
+    Reviewers,
     NotFound,
 }
 
@@ -2049,6 +2114,56 @@ fn resolve_format(query: &str, head: &str) -> Option<RespFormat> {
     }
 }
 
+/// M82: best q-milli for a concrete charset against an `Accept-Charset` value
+/// (RFC 7231 §5.3.3). An exact (case-insensitive) name beats the `*` wildcard; a charset
+/// neither named nor covered by `*` scores 0. Mirrors `media_match`; reuses `parse_qmilli`.
+fn charset_q(accept_value: &str, name: &str) -> u16 {
+    let (mut best_q, mut best_spec) = (0u16, 0u8);
+    for range in accept_value.split(',') {
+        let mut parts = range.split(';');
+        let token = parts.next().unwrap_or("").trim();
+        let spec = if token.eq_ignore_ascii_case(name) {
+            2
+        } else if token == "*" {
+            1
+        } else {
+            0
+        };
+        if spec == 0 {
+            continue;
+        }
+        let mut q = 1000u16;
+        for p in parts {
+            let p = p.trim();
+            if let Some(v) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
+                q = parse_qmilli(v);
+            }
+        }
+        if spec > best_spec || (spec == best_spec && q > best_q) {
+            best_spec = spec;
+            best_q = q;
+        }
+    }
+    best_q
+}
+
+/// M82: `Accept-Charset` negotiation (RFC 7231 §5.3.3). We emit UTF-8 only: an absent header
+/// is unconstrained (⇒ acceptable, keeping no-header requests byte-identical bar `Vary`); a
+/// present header is acceptable iff some offered charset gets a non-zero q. An explicit
+/// `utf-8;q=0` (exact beats `*`) or a list omitting utf-8/`*` ⇒ not acceptable ⇒ `406`.
+fn charset_acceptable(head: &str) -> bool {
+    let mut value = None;
+    for line in head.split("\r\n") {
+        let Some((name, v)) = line.split_once(':') else { continue };
+        if name.trim().eq_ignore_ascii_case("accept-charset") {
+            value = Some(v);
+            break;
+        }
+    }
+    let Some(value) = value else { return true }; // absent ⇒ no constraint
+    OFFERED_CHARSETS.iter().any(|c| charset_q(value, c) > 0)
+}
+
 fn route_get(path: &str) -> GetRoute {
     match path {
         "/height" => GetRoute::Height,
@@ -2056,6 +2171,15 @@ fn route_get(path: &str) -> GetRoute {
         // M64: the plain bridge-lock directory. Exact-match here, so it never collides
         // with the M63 `/bridge/lock/` prefix below (`…lock` + `s`, not `…lock` + `/`).
         "/bridge/locks" => GetRoute::BridgeLocks,
+        // M83: the plain validator-set directory. Exact-match here, so it never collides
+        // with the M60/M65 `/validator/` prefix below (`…validator` + `s`, not `…validator` + `/`).
+        "/validators" => GetRoute::Validators,
+        // M84: the plain account/balances directory. Exact-match here, so it never collides
+        // with the M58/M59 `/account/` prefix below (`…account` + `s`, not `…account` + `/`).
+        "/accounts" => GetRoute::Accounts,
+        // M85: the plain reviewer directory. Exact-match here, so it never collides with
+        // the M60/M65 `/reviewer/` prefix below (`…reviewer` + `s`, not `…reviewer` + `/`).
+        "/reviewers" => GetRoute::Reviewers,
         p => {
             if let Some(rest) = p.strip_prefix("/account/") {
                 // M59: `{id}/proof` is the verifiable read; a bare `{id}` is the M58
@@ -2356,6 +2480,80 @@ fn json_lock_listing(locks: &[(u64, u64, crate::BridgeLock)]) -> String {
                 json_u64(l.nonce),
             )
         })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+/// M83: render the validator set as grep-friendly `key=value` lines, one per validator
+/// (empty string when the set is empty). Plain/unverified, like `format_lock_listing` — a
+/// client verifies any single validator via `/validator/{id}/proof`.
+fn format_validator_listing(vs: &[crate::validator::Validator]) -> String {
+    vs.iter()
+        .map(|v| {
+            format!("validator_id={} power={} pubkey={}", v.id, v.power, crate::hash::hex(&v.pubkey))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// M83: `GET /validators?format=json` — the JSON sibling of [`format_validator_listing`].
+/// A JSON **array** of objects (`[]` when the set is empty, mirroring `json_lock_listing`).
+fn json_validator_listing(vs: &[crate::validator::Validator]) -> String {
+    let items = vs
+        .iter()
+        .map(|v| {
+            format!(
+                "{{\"validator_id\":{},\"power\":{},\"pubkey\":{}}}",
+                json_u64(v.id),
+                json_u64(v.power),
+                json_str(&crate::hash::hex(&v.pubkey)),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+/// M84: render the account directory as grep-friendly `key=value` lines, one per account
+/// (empty string when there are none). Reuses `format_account` per item — same line shape
+/// as the single `/account/{id}` plain read.
+fn format_account_listing(accounts: &[(u64, Account)]) -> String {
+    accounts
+        .iter()
+        .map(|(id, a)| format_account(*id, a))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// M84: `GET /accounts?format=json` — the JSON sibling of [`format_account_listing`]. A
+/// JSON **array** of objects (`[]` when empty), reusing `json_account` per item.
+fn json_account_listing(accounts: &[(u64, Account)]) -> String {
+    let items = accounts
+        .iter()
+        .map(|(id, a)| json_account(*id, a))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+/// M85: render the reviewer directory as grep-friendly `key=value` lines, one per reviewer
+/// (empty string when there are none). Reuses `format_entity` per item — same line shape as
+/// the single `/reviewer/{id}` plain read.
+fn format_reviewer_listing(reviewers: &[(u64, f32)]) -> String {
+    reviewers
+        .iter()
+        .map(|&(id, reputation)| format_entity(&EntityView::Reviewer { id, reputation }))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// M85: `GET /reviewers?format=json` — the JSON sibling of [`format_reviewer_listing`]. A
+/// JSON **array** of objects (`[]` when empty), reusing `json_entity` per item.
+fn json_reviewer_listing(reviewers: &[(u64, f32)]) -> String {
+    let items = reviewers
+        .iter()
+        .map(|&(id, reputation)| json_entity(&EntityView::Reviewer { id, reputation }))
         .collect::<Vec<_>>()
         .join(",");
     format!("[{items}]")
@@ -2918,6 +3116,25 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
         }
     };
 
+    // M82: Accept-Charset negotiation (RFC 7231 §5.3.3). We emit UTF-8 only; a header that
+    // rules it out ⇒ 406 with a machine-readable list of the charsets we can emit. Checked
+    // after Accept and before routing, so it gates every method uniformly (an absent header
+    // is unconstrained, keeping no-header requests unchanged).
+    if !charset_acceptable(head) {
+        let _ = stream
+            .write_all(
+                http_response_ct(
+                    "406 Not Acceptable",
+                    "application/json",
+                    &not_acceptable_charset_json(),
+                )
+                .as_bytes(),
+            )
+            .await;
+        let _ = stream.flush().await;
+        return;
+    }
+
     // M58: read-class GET routes. Each read routes through the single-owner actor via
     // the same local-oneshot pattern as the POST path below; a send failure (actor
     // stopped) reports 503. Unrecognized GET paths stay a 200 health probe.
@@ -3058,6 +3275,96 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                                 fmt,
                                 &format_page(&format_lock_listing(page), total, next),
                                 &json_page(&json_lock_listing(page), total, next),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Validators => {
+                // M83: plain validator-set directory — always a (possibly empty) `200`.
+                // Reuses the whole M72/M79/M81 pagination stack verbatim, the second
+                // consumer after `/bridge/locks` (proving the renderers are generic).
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryValidators { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
+                            let total = listing.len();
+                            let page = paginate(&listing, offset, limit);
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_validator_listing(page), total, next),
+                                &json_page(&json_validator_listing(page), total, next),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Accounts => {
+                // M84: plain account/balances directory — always a (possibly empty) `200`.
+                // Third consumer of the pagination stack (after `/bridge/locks` and
+                // `/validators`), reusing `format_account`/`json_account` per item.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryAccounts { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
+                            let total = listing.len();
+                            let page = paginate(&listing, offset, limit);
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_account_listing(page), total, next),
+                                &json_page(&json_account_listing(page), total, next),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Reviewers => {
+                // M85: plain reviewer directory — always a (possibly empty) `200`. Fourth
+                // consumer of the pagination stack (after `/bridge/locks`, `/validators`,
+                // `/accounts`), reusing `format_entity`/`json_entity` per item.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryReviewers { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
+                            let total = listing.len();
+                            let page = paginate(&listing, offset, limit);
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_reviewer_listing(page), total, next),
+                                &json_page(&json_reviewer_listing(page), total, next),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -5171,6 +5478,237 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_validators_list_over_tcp() {
+        // M83: the validator-set directory over real TCP — the second list endpoint,
+        // reusing the whole M72/M79/M81 pagination stack. Unlike `/bridge/locks` on a
+        // live chain, the set is non-empty (the single genesis validator), so this
+        // exercises the populated listing + envelope end to end.
+        let dir = tmp_dir("rpc-validators-list");
+        let mut cfg = node_config(24, 20111, &[24], dir.clone());
+        let rpc_addr = "127.0.0.1:20121";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(24, kp(24).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(24))).await.expect("start node");
+
+        // Wait for a certified head (the route is reachable regardless, but this keeps
+        // the setup symmetric with the bridge-locks test).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+        let pubkey_hex = crate::hash::hex(&kp(24).public());
+
+        // Plain directory → 200 with the single genesis validator.
+        let resp = get(rpc_addr, "/validators").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "validators status: {resp}");
+        assert_eq!(
+            body_of(&resp),
+            format!("total=1\nvalidator_id=24 power=1 pubkey={pubkey_hex}"),
+            "single-validator text envelope"
+        );
+
+        // JSON representation → the `total`/`next`/`items` envelope with the validator.
+        let as_json = get(rpc_addr, "/validators?format=json").await;
+        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "validators json status: {as_json}");
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert_eq!(
+            body_of(&as_json),
+            format!(
+                "{{\"total\":\"1\",\"next\":null,\"items\":\
+                 [{{\"validator_id\":\"24\",\"power\":\"1\",\"pubkey\":\"{pubkey_hex}\"}}]}}"
+            ),
+            "single-validator JSON envelope"
+        );
+
+        // `?offset=1` windows past the only validator → empty page, no `next` (end reached).
+        let past = get(rpc_addr, "/validators?offset=1").await;
+        assert!(past.starts_with("HTTP/1.1 200 OK"), "offset status: {past}");
+        assert_eq!(body_of(&past), "total=1", "offset past end → total=1, empty page");
+
+        // `?limit=0` is an explicit empty page, but another page remains → `next=0`.
+        let empty = get(rpc_addr, "/validators?limit=0").await;
+        assert!(empty.starts_with("HTTP/1.1 200 OK"), "limit=0 status: {empty}");
+        assert_eq!(body_of(&empty), "total=1\nnext=0", "limit=0 → empty page with next=0");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_accounts_list_over_tcp() {
+        // M84: the account/balances directory over real TCP — the third list endpoint,
+        // reusing the pagination stack + the existing `format_account`/`json_account`
+        // per-item renderers. A one-account genesis gives a populated, deterministic body.
+        let dir = tmp_dir("rpc-accounts-list");
+        let mut cfg = node_config(25, 20251, &[25], dir.clone());
+        let rpc_addr = "127.0.0.1:20261";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(25, kp(25).public(), 1)]; // quorum 1 ⇒ self-commit
+        genesis.accounts = vec![(1, 50 * crate::MICRO, kp(1).public())];
+        genesis.reviewers = vec![];
+        let node = Node::start(cfg, genesis, Some(kp(25))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // The single genesis account, balance == its endowment, zeroed stats.
+        let want = Account {
+            pubkey: kp(1).public(),
+            balance: 50 * crate::MICRO,
+            staked_total: 0,
+            earned_total: 0,
+            slashed_total: 0,
+            submissions: 0,
+            accepted: 0,
+        };
+
+        // Plain directory → 200 with the single account.
+        let resp = get(rpc_addr, "/accounts").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "accounts status: {resp}");
+        assert_eq!(
+            body_of(&resp),
+            format!("total=1\n{}", format_account(1, &want)),
+            "single-account text envelope"
+        );
+
+        // JSON representation → the `total`/`next`/`items` envelope with the account.
+        let as_json = get(rpc_addr, "/accounts?format=json").await;
+        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "accounts json status: {as_json}");
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert_eq!(
+            body_of(&as_json),
+            format!("{{\"total\":\"1\",\"next\":null,\"items\":[{}]}}", json_account(1, &want)),
+            "single-account JSON envelope"
+        );
+
+        // `?offset=1` windows past the only account → empty page, no `next`.
+        let past = get(rpc_addr, "/accounts?offset=1").await;
+        assert!(past.starts_with("HTTP/1.1 200 OK"), "offset status: {past}");
+        assert_eq!(body_of(&past), "total=1", "offset past end → total=1, empty page");
+
+        // `?limit=0` is an explicit empty page, but another page remains → `next=0`.
+        let empty = get(rpc_addr, "/accounts?limit=0").await;
+        assert!(empty.starts_with("HTTP/1.1 200 OK"), "limit=0 status: {empty}");
+        assert_eq!(body_of(&empty), "total=1\nnext=0", "limit=0 → empty page with next=0");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_reviewers_list_over_tcp() {
+        // M85: the reviewer directory over real TCP — the fourth list endpoint, reusing the
+        // pagination stack + the existing `format_entity`/`json_entity` per-item renderers.
+        // `test_genesis` carries three reviewers (10,11,12 @ rep 1.0), a populated body.
+        let dir = tmp_dir("rpc-reviewers-list");
+        let mut cfg = node_config(26, 20271, &[26], dir.clone());
+        let rpc_addr = "127.0.0.1:20281";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(26, kp(26).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(26))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // The three id-sorted genesis reviewers, each at reputation 1.0.
+        let want = [(10u64, 1.0f32), (11, 1.0), (12, 1.0)];
+        let text_lines = want
+            .iter()
+            .map(|&(id, reputation)| format_entity(&EntityView::Reviewer { id, reputation }))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let json_items = want
+            .iter()
+            .map(|&(id, reputation)| json_entity(&EntityView::Reviewer { id, reputation }))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // Plain directory → 200 with all three reviewers (id order).
+        let resp = get(rpc_addr, "/reviewers").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "reviewers status: {resp}");
+        assert_eq!(body_of(&resp), format!("total=3\n{text_lines}"), "reviewer text envelope");
+
+        // JSON representation → the `total`/`next`/`items` envelope with the reviewers.
+        let as_json = get(rpc_addr, "/reviewers?format=json").await;
+        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "reviewers json status: {as_json}");
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert_eq!(
+            body_of(&as_json),
+            format!("{{\"total\":\"3\",\"next\":null,\"items\":[{json_items}]}}"),
+            "reviewer JSON envelope"
+        );
+
+        // `?offset=1&limit=1` windows the middle reviewer, with a `next` cursor.
+        let mid = get(rpc_addr, "/reviewers?offset=1&limit=1").await;
+        assert!(mid.starts_with("HTTP/1.1 200 OK"), "offset status: {mid}");
+        assert_eq!(
+            body_of(&mid),
+            format!("total=3\nnext=2\n{}", format_entity(&EntityView::Reviewer { id: 11, reputation: 1.0 })),
+            "middle window → total=3, next=2, one line"
+        );
+
+        // `?offset=3` windows past the last reviewer → empty page, no `next`.
+        let past = get(rpc_addr, "/reviewers?offset=3").await;
+        assert!(past.starts_with("HTTP/1.1 200 OK"), "offset-past status: {past}");
+        assert_eq!(body_of(&past), "total=3", "offset past end → total=3, empty page");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_plain_entities_over_tcp() {
         // M65: plain reviewer/validator/graph reads over real TCP. Unlike bridge locks,
         // `test_genesis` carries real reviewers (10,11,12), validators (21-24), and a
@@ -5491,15 +6029,45 @@ mod tests {
     }
 
     #[test]
+    fn charset_negotiation_honors_utf8() {
+        // M82: we emit UTF-8 only. `charset_q` scores a concrete charset against an
+        // Accept-Charset value — exact (case-insensitive) beats `*`, which beats no match.
+        assert_eq!(charset_q("utf-8", "utf-8"), 1000);
+        assert_eq!(charset_q("UTF-8", "utf-8"), 1000); // case-insensitive
+        assert_eq!(charset_q("*", "utf-8"), 1000); // wildcard covers it
+        assert_eq!(charset_q("iso-8859-1", "utf-8"), 0); // unmentioned, no `*`
+        assert_eq!(charset_q("utf-8;q=0.5", "utf-8"), 500);
+        assert_eq!(charset_q("utf-8;q=0, *", "utf-8"), 0); // exact (q=0) beats `*`
+
+        // `charset_acceptable` reads the header off the raw block: absent ⇒ unconstrained.
+        let head = |ac: &str| format!("GET / HTTP/1.1\r\nHost: x\r\nAccept-Charset: {ac}\r\n\r\n");
+        assert!(charset_acceptable("GET / HTTP/1.1\r\nHost: x\r\n\r\n")); // absent ⇒ true
+        assert!(charset_acceptable(&head("utf-8")));
+        assert!(charset_acceptable(&head("UTF-8"))); // case-insensitive name
+        assert!(charset_acceptable(&head("*")));
+        assert!(charset_acceptable(&head("iso-8859-1, *;q=0.5"))); // via `*`
+        assert!(!charset_acceptable(&head("utf-8;q=0"))); // explicit rejection
+        assert!(!charset_acceptable(&head("iso-8859-1"))); // omits utf-8 and `*`
+        assert!(!charset_acceptable(&head("utf-8;q=0, *"))); // exact beats `*`
+
+        // The 406 body is a machine-readable list of the charsets we can emit.
+        assert_eq!(
+            not_acceptable_charset_json(),
+            "{\"error\":\"not_acceptable\",\"available_charsets\":[\"utf-8\"]}"
+        );
+    }
+
+    #[test]
     fn http_response_sets_vary_accept() {
-        // M71: every RPC response advertises `Vary: Accept` (RFC 7231 §7.1.4) so
-        // shared caches key on the Accept header, through the single builder.
+        // M71/M82: every RPC response advertises `Vary: Accept, Accept-Charset`
+        // (RFC 7231 §7.1.4) so shared caches key on both negotiation inputs, through
+        // the single builder.
         let text = http_response("200 OK", "x");
-        assert!(text.contains("\r\nVary: Accept\r\n"), "text: {text}");
+        assert!(text.contains("\r\nVary: Accept, Accept-Charset\r\n"), "text: {text}");
         assert!(text.starts_with("HTTP/1.1 200 OK"), "text status: {text}");
         assert!(text.contains("Content-Type: text/plain; charset=utf-8\r\n"), "text ct: {text}");
         let json = http_response_ct("200 OK", "application/json", "{}");
-        assert!(json.contains("\r\nVary: Accept\r\n"), "json: {json}");
+        assert!(json.contains("\r\nVary: Accept, Accept-Charset\r\n"), "json: {json}");
         assert!(json.starts_with("HTTP/1.1 200 OK"), "json status: {json}");
         assert!(json.contains("Content-Type: application/json\r\n"), "json ct: {json}");
     }
@@ -5560,6 +6128,104 @@ mod tests {
         assert!(j.starts_with("[{\"lock_id\":\"1\",\"height\":\"5\","), "{j}");
         assert!(j.contains("\"amount\":\"18446744073709551615\""), "{j}");
         assert!(j.contains("\"nonce\":\"2\"}]"), "{j}");
+    }
+
+    #[test]
+    fn validator_listing_renders() {
+        // M83: the empty set renders `""` (text) / `[]` (json) like the lock listing;
+        // two validators render one grep-friendly `key=value` line each (text) and a
+        // two-object array (json), with the pubkey as lowercase hex.
+        use crate::validator::Validator;
+        assert_eq!(format_validator_listing(&[]), "");
+        assert_eq!(json_validator_listing(&[]), "[]");
+
+        let vs = vec![
+            Validator { id: 21, pubkey: [0xAB; 32], power: 5 },
+            Validator { id: 22, pubkey: [0x01; 32], power: u64::MAX },
+        ];
+        let hex_ab = crate::hash::hex(&[0xABu8; 32]);
+        let hex_01 = crate::hash::hex(&[0x01u8; 32]);
+
+        let t = format_validator_listing(&vs);
+        assert_eq!(
+            t,
+            format!(
+                "validator_id=21 power=5 pubkey={hex_ab}\n\
+                 validator_id=22 power=18446744073709551615 pubkey={hex_01}"
+            ),
+        );
+
+        let j = json_validator_listing(&vs);
+        assert_eq!(
+            j,
+            format!(
+                "[{{\"validator_id\":\"21\",\"power\":\"5\",\"pubkey\":\"{hex_ab}\"}},\
+                 {{\"validator_id\":\"22\",\"power\":\"18446744073709551615\",\"pubkey\":\"{hex_01}\"}}]"
+            ),
+        );
+    }
+
+    #[test]
+    fn account_listing_renders() {
+        // M84: the empty directory renders `""` (text) / `[]` (json); two accounts render
+        // one `format_account`-shaped line each (text) and a two-object array (json),
+        // reusing the exact single-item renderers.
+        assert_eq!(format_account_listing(&[]), "");
+        assert_eq!(json_account_listing(&[]), "[]");
+
+        let a1 = Account {
+            pubkey: [0xab; 32],
+            balance: 12,
+            staked_total: 3,
+            earned_total: 4,
+            slashed_total: 5,
+            submissions: 6,
+            accepted: 7,
+        };
+        let a2 = Account {
+            pubkey: [0x01; 32],
+            balance: u64::MAX,
+            staked_total: 0,
+            earned_total: 0,
+            slashed_total: 0,
+            submissions: 0,
+            accepted: 0,
+        };
+        let accounts = vec![(1u64, a1.clone()), (2u64, a2.clone())];
+
+        // Text listing is exactly the per-item lines joined by `\n`.
+        assert_eq!(
+            format_account_listing(&accounts),
+            format!("{}\n{}", format_account(1, &a1), format_account(2, &a2)),
+        );
+        // JSON listing is exactly the per-item objects wrapped in an array.
+        assert_eq!(
+            json_account_listing(&accounts),
+            format!("[{},{}]", json_account(1, &a1), json_account(2, &a2)),
+        );
+    }
+
+    #[test]
+    fn reviewer_listing_renders() {
+        // M85: the empty directory renders `""` (text) / `[]` (json); two reviewers render
+        // one `format_entity`-shaped line each (text) and a two-object array (json), reusing
+        // the exact single-item `EntityView::Reviewer` renderers.
+        assert_eq!(format_reviewer_listing(&[]), "");
+        assert_eq!(json_reviewer_listing(&[]), "[]");
+
+        let reviewers = vec![(10u64, 1.0f32), (11u64, 0.5f32)];
+        let ev = |id, reputation| EntityView::Reviewer { id, reputation };
+
+        // Text listing is exactly the per-item lines joined by `\n`.
+        assert_eq!(
+            format_reviewer_listing(&reviewers),
+            format!("{}\n{}", format_entity(&ev(10, 1.0)), format_entity(&ev(11, 0.5))),
+        );
+        // JSON listing is exactly the per-item objects wrapped in an array.
+        assert_eq!(
+            json_reviewer_listing(&reviewers),
+            format!("[{},{}]", json_entity(&ev(10, 1.0)), json_entity(&ev(11, 0.5))),
+        );
     }
 
     #[test]
@@ -5687,6 +6353,44 @@ mod tests {
         // M63 single-lock route still resolves to its own variant (no regression).
         assert!(matches!(route_get("/bridge/lock/0/proof"), GetRoute::BridgeLock(0)));
         assert!(matches!(route_get("/bridge/lock/0"), GetRoute::NotFound));
+    }
+
+    #[test]
+    fn route_get_parses_validators() {
+        // M83: `/validators` is a plain directory read — an exact match, distinct from
+        // the M60/M65 `/validator/{id}` prefix route (char after `…validator` is `s`,
+        // not `/`). A trailing slash is not the directory, so it falls through to the
+        // M58 health liveness fallback like any unknown path.
+        assert!(matches!(route_get("/validators"), GetRoute::Validators));
+        assert!(matches!(route_get("/validators/"), GetRoute::Health));
+        // M60/M65 single-validator routes still resolve to their own variants.
+        assert!(matches!(route_get("/validator/21"), GetRoute::Plain(ProofKind::Validator, 21)));
+        assert!(matches!(route_get("/validator/21/proof"), GetRoute::Proof(ProofKind::Validator, 21)));
+    }
+
+    #[test]
+    fn route_get_parses_accounts() {
+        // M84: `/accounts` is a plain directory read — an exact match, distinct from the
+        // M58/M59 `/account/{id}` prefix route (char after `…account` is `s`, not `/`). A
+        // trailing slash is not the directory, so it falls through to the M58 health
+        // liveness fallback like any unknown path.
+        assert!(matches!(route_get("/accounts"), GetRoute::Accounts));
+        assert!(matches!(route_get("/accounts/"), GetRoute::Health));
+        // M58/M59 single-account routes still resolve to their own variants.
+        assert!(matches!(route_get("/account/7"), GetRoute::Account(7)));
+        assert!(matches!(route_get("/account/7/proof"), GetRoute::AccountProof(7)));
+    }
+
+    #[test]
+    fn route_get_parses_reviewers() {
+        // M85: `/reviewers` is a plain directory read — an exact match, distinct from the
+        // M60/M65 `/reviewer/{id}` prefix route (char after `…reviewer` is `s`, not `/`). A
+        // trailing slash is not the directory, so it falls through to the health fallback.
+        assert!(matches!(route_get("/reviewers"), GetRoute::Reviewers));
+        assert!(matches!(route_get("/reviewers/"), GetRoute::Health));
+        // M65/M60 single-reviewer routes still resolve to their own variants.
+        assert!(matches!(route_get("/reviewer/10"), GetRoute::Plain(ProofKind::Reviewer, 10)));
+        assert!(matches!(route_get("/reviewer/10/proof"), GetRoute::Proof(ProofKind::Reviewer, 10)));
     }
 
     #[test]
@@ -5911,8 +6615,8 @@ mod tests {
         let h = get(rpc_addr, "/height?format=json").await;
         assert!(h.starts_with("HTTP/1.1 200 OK"), "height: {h}");
         assert!(h.contains("Content-Type: application/json\r\n"), "height ct: {h}");
-        // M71: representation-selected responses advertise `Vary: Accept` for caches.
-        assert!(h.contains("Vary: Accept\r\n"), "height vary: {h}");
+        // M71/M82: representation-selected responses advertise `Vary: Accept, Accept-Charset`.
+        assert!(h.contains("Vary: Accept, Accept-Charset\r\n"), "height vary: {h}");
         assert!(body_of(&h).starts_with("{\"height\":\""), "height body: {h}");
 
         let a = get(rpc_addr, "/account/1?format=json").await;
@@ -5941,8 +6645,8 @@ mod tests {
         // the pre-M66 plaintext response (text/plain, bare decimal height).
         let plain = get(rpc_addr, "/height").await;
         assert!(plain.contains("Content-Type: text/plain; charset=utf-8\r\n"), "plain ct: {plain}");
-        // M71: the text representation also carries `Vary: Accept`.
-        assert!(plain.contains("Vary: Accept\r\n"), "plain vary: {plain}");
+        // M71/M82: the text representation also carries `Vary: Accept, Accept-Charset`.
+        assert!(plain.contains("Vary: Accept, Accept-Charset\r\n"), "plain vary: {plain}");
         assert!(body_of(&plain).chars().all(|c| c.is_ascii_digit()), "plain body: {plain}");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -6056,8 +6760,8 @@ mod tests {
         let x = get(rpc_addr, "/height", Some("application/xml")).await;
         assert!(x.starts_with("HTTP/1.1 406 Not Acceptable"), "xml: {x}");
         assert!(x.contains("Content-Type: application/json\r\n"), "xml ct: {x}");
-        // M71: the negotiated-error path varies by `Accept` too.
-        assert!(x.contains("Vary: Accept\r\n"), "xml vary: {x}");
+        // M71/M82: the negotiated-error path varies by `Accept, Accept-Charset` too.
+        assert!(x.contains("Vary: Accept, Accept-Charset\r\n"), "xml vary: {x}");
         assert!(body_of(&x).contains("\"error\":\"not_acceptable\""), "xml body is JSON error: {x}");
         assert!(body_of(&x).contains("application/json"), "xml body lists json: {x}");
         assert!(body_of(&x).contains("text/plain"), "xml body lists text: {x}");
@@ -6081,6 +6785,70 @@ mod tests {
         assert!(q.contains("Content-Type: application/json\r\n"), "query-wins ct: {q}");
 
         // Head invariant: no Accept header ⇒ byte-identical plaintext (never 406).
+        let plain = get(rpc_addr, "/height", None).await;
+        assert!(plain.starts_with("HTTP/1.1 200 OK"), "plain: {plain}");
+        assert!(plain.contains("Content-Type: text/plain; charset=utf-8\r\n"), "plain ct: {plain}");
+        assert!(body_of(&plain).chars().all(|c| c.is_ascii_digit()), "plain body: {plain}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_charset_406_over_tcp() {
+        // M82: Accept-Charset negotiation (RFC 7231 §5.3.3). We emit UTF-8 only, so a header
+        // that accepts utf-8 (or `*`) is served, one that rules it out answers 406 with a
+        // machine-readable charset list, and a missing header stays plaintext (never 406).
+        let dir = tmp_dir("rpc-charset-406");
+        let mut cfg = node_config(23, 20231, &[23], dir.clone());
+        let rpc_addr = "127.0.0.1:20241";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(23, kp(23).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(23))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str, charset: Option<&str>) -> String {
+            let charset_line = charset.map(|c| format!("Accept-Charset: {c}\r\n")).unwrap_or_default();
+            let req = format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\n{charset_line}Connection: close\r\n\r\n"
+            );
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.rsplit("\r\n\r\n").next().unwrap_or("")
+        }
+
+        // Accept-Charset: utf-8 ⇒ 200, our only charset.
+        let ok = get(rpc_addr, "/height", Some("utf-8")).await;
+        assert!(ok.starts_with("HTTP/1.1 200 OK"), "utf-8: {ok}");
+        assert!(ok.contains("Content-Type: text/plain; charset=utf-8\r\n"), "utf-8 ct: {ok}");
+
+        // A charset that rules out utf-8 ⇒ 406 with a machine-readable charset list.
+        let bad = get(rpc_addr, "/height", Some("iso-8859-1")).await;
+        assert!(bad.starts_with("HTTP/1.1 406 Not Acceptable"), "iso: {bad}");
+        assert!(bad.contains("Content-Type: application/json\r\n"), "iso ct: {bad}");
+        assert!(bad.contains("Vary: Accept, Accept-Charset\r\n"), "iso vary: {bad}");
+        assert!(body_of(&bad).contains("\"error\":\"not_acceptable\""), "iso body: {bad}");
+        assert!(body_of(&bad).contains("utf-8"), "iso body lists utf-8: {bad}");
+
+        // An explicit utf-8;q=0 is also a rejection ⇒ 406.
+        let q0 = get(rpc_addr, "/height", Some("utf-8;q=0")).await;
+        assert!(q0.starts_with("HTTP/1.1 406 Not Acceptable"), "q0: {q0}");
+        assert!(q0.contains("Content-Type: application/json\r\n"), "q0 ct: {q0}");
+
+        // Head invariant: no Accept-Charset header ⇒ byte-identical plaintext (never 406).
         let plain = get(rpc_addr, "/height", None).await;
         assert!(plain.starts_with("HTTP/1.1 200 OK"), "plain: {plain}");
         assert!(plain.contains("Content-Type: text/plain; charset=utf-8\r\n"), "plain ct: {plain}");
