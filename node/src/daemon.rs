@@ -434,6 +434,42 @@ enum Cmd {
     QueryReviewers {
         reply: oneshot::Sender<Vec<(u64, f32)>>,
     },
+    /// M86: list all cognitive-graph nodes (node_id + domain + embedding) for the plain
+    /// read-class RPC directory — the list sibling of the single `/graph/{id}` plain read.
+    /// Always a (possibly empty) list.
+    QueryGraphNodes {
+        reply: oneshot::Sender<Vec<crate::engine::GraphNode>>,
+    },
+    /// M87: list every validator's bonded stake (validator_id + bonded micro-$COG) for
+    /// the plain read-class RPC directory — a read sibling of `/validators` exposing the
+    /// raw stake that backs voting power. Always a (possibly empty) list.
+    QueryBonds {
+        reply: oneshot::Sender<Vec<(u64, u64)>>,
+    },
+    /// M88: list the unbonding-delay queue (account + amount + mature height) for the
+    /// plain read-class RPC directory — a read sibling of `/bonds` on the stake
+    /// lifecycle. Always a (possibly empty) list.
+    QueryUnbonding {
+        reply: oneshot::Sender<Vec<crate::UnbondingEntry>>,
+    },
+    /// M89: list the pending stake-op pool (staged for the next proposed block) for the
+    /// plain read-class RPC directory — the first pending-pool read. Always a (possibly
+    /// empty) list.
+    QueryStakeOps {
+        reply: oneshot::Sender<Vec<crate::StakeOp>>,
+    },
+    /// M90: list the pending slashing-evidence pool (staged for the next proposed block)
+    /// for the plain read-class RPC directory — a pending-pool read sibling of
+    /// `/stake-ops`. Always a (possibly empty) list.
+    QueryEvidence {
+        reply: oneshot::Sender<Vec<crate::SlashEvidence>>,
+    },
+    /// M91: list the connected-peer directory (peer id + known listen address) for the
+    /// plain read-class RPC. A daemon-level read built from the actor's `outbound` +
+    /// `addrs` maps. Always a (possibly empty) list, id-sorted.
+    QueryPeers {
+        reply: oneshot::Sender<Vec<(u64, Option<String>)>>,
+    },
     /// M61: serve a heterogeneous proof batch + the certified head it verifies
     /// against, for the verifiable batch read RPC. `None` ⇒ `serve_batch` rejected
     /// (over `MAX_BATCH_ITEMS` or a degenerate Diff range) or no certified head
@@ -1113,6 +1149,39 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 let reviewers =
                     actor.node.chain.state.reviewers.iter().map(|(&id, &r)| (id, r)).collect();
                 let _ = reply.send(reviewers);
+            }
+            Cmd::QueryGraphNodes { reply } => {
+                // M86: snapshot the insertion-ordered graph node vector (node_id == index).
+                let _ = reply.send(actor.node.chain.state.graph.nodes.clone());
+            }
+            Cmd::QueryBonds { reply } => {
+                // M87: snapshot the id-sorted per-validator bonded-stake map for the directory.
+                let bonds =
+                    actor.node.chain.state.bonds.iter().map(|(&id, &amt)| (id, amt)).collect();
+                let _ = reply.send(bonds);
+            }
+            Cmd::QueryUnbonding { reply } => {
+                // M88: snapshot the unbonding-delay queue (insertion order) for the directory.
+                let _ = reply.send(actor.node.chain.state.unbonding.clone());
+            }
+            Cmd::QueryStakeOps { reply } => {
+                // M89: snapshot the pending stake-op pool staged for the next block.
+                let _ = reply.send(actor.node.pending_stake_ops().to_vec());
+            }
+            Cmd::QueryEvidence { reply } => {
+                // M90: snapshot the pending slashing-evidence pool staged for the next block.
+                let _ = reply.send(actor.node.pending_evidence().to_vec());
+            }
+            Cmd::QueryPeers { reply } => {
+                // M91: snapshot the connected-peer directory (id-sorted), pairing each
+                // outbound peer id with its known listen address (M39 address book), if any.
+                let mut peers: Vec<(u64, Option<String>)> = actor
+                    .outbound
+                    .keys()
+                    .map(|&id| (id, actor.addrs.get(&id).cloned()))
+                    .collect();
+                peers.sort_by_key(|&(id, _)| id);
+                let _ = reply.send(peers);
             }
             Cmd::QueryBatch { items, reply } => {
                 let _ = reply.send(actor.node.batch(items));
@@ -1837,6 +1906,39 @@ fn http_response_ct(status_line: &str, content_type: &str, body: &str) -> String
     )
 }
 
+/// M92: RFC 9110 §9.3.2 — a `HEAD` response carries the identical header block to the `GET`
+/// it mirrors (same status line, `Content-Type`, `Content-Length`, `Vary`) but MUST NOT
+/// send a message body. Given a fully-rendered `GET` response, return just its header block
+/// (through the blank line terminating the headers), dropping the body; `Content-Length`
+/// still advertises the body the GET would have sent. `is_head == false` returns the
+/// response unchanged. Pure (no I/O) for direct unit testing.
+fn maybe_head(is_head: bool, resp: String) -> String {
+    if !is_head {
+        return resp;
+    }
+    match resp.find("\r\n\r\n") {
+        Some(i) => resp[..i + 4].to_string(),
+        None => resp,
+    }
+}
+
+/// M93: the HTTP methods this RPC server serves, in a canonical `Allow`-header order.
+/// Single source of truth for the `OPTIONS` response (RFC 9110 §9.3.7 / §10.2.1).
+const ALLOWED_METHODS: &str = "GET, HEAD, OPTIONS, POST";
+
+/// M93: RFC 9110 §9.3.7 — an `OPTIONS` response advertises the server's capabilities via an
+/// `Allow` header and carries no body (`204 No Content`, which by definition has no message
+/// body, so no `Content-Length` is sent). Pure (no I/O) for direct unit testing.
+fn options_response() -> String {
+    format!(
+        "HTTP/1.1 204 No Content\r\n\
+         Allow: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        ALLOWED_METHODS,
+    )
+}
+
 /// M70: the representations this RPC server can emit, in negotiation-preference
 /// order (named JSON wins the q-tie, so it is listed first). Used to build the
 /// `406 Not Acceptable` body per RFC 7231 §6.5.6.
@@ -1885,8 +1987,13 @@ async fn run_rpc(listener: TcpListener, my_id: u64, cmd: mpsc::UnboundedSender<C
 }
 
 /// Serve one ingress request. Reads the request headers (bounded), then:
-/// - a non-`POST` method (e.g. `GET`/`HEAD`) returns `200 OK`/`"ok"` — doubling
-///   as a health probe;
+/// - a `GET` method routes through the read-class routes ([`route_get`]); an
+///   unrecognized path falls back to a `200 OK`/`"ok"` health probe. M92: a `HEAD`
+///   mirrors the matching `GET` — identical headers (status, `Content-Type`,
+///   `Content-Length`, `Vary`), no body (RFC 9110 §9.3.2);
+/// - M93: an `OPTIONS` returns `204 No Content` with an `Allow` header advertising the
+///   served methods (RFC 9110 §9.3.7), answered before content negotiation;
+/// - any other non-`POST` method returns the `200 OK`/`"ok"` health probe;
 /// - a `POST` reads the body (bounded by `Content-Length`, capped at
 ///   [`MAX_RPC_BODY`]), decodes it as raw `codec::encode_tx` bytes, and submits
 ///   it through the actor: `200`/hash on admission, `400` on a decode error,
@@ -1925,6 +2032,29 @@ enum GetRoute {
     /// M85: `GET /reviewers` — the plain (unverified) reviewer directory (id + reputation),
     /// the list sibling of `Plain(Reviewer, id)`.
     Reviewers,
+    /// M86: `GET /graph` — the plain (unverified) cognitive-graph directory (node_id +
+    /// domain + embedding), the list sibling of `Plain(GraphNode, id)`.
+    GraphNodes,
+    /// M87: `GET /bonds` — the per-validator bonded-stake directory (validator_id +
+    /// bonded micro-$COG), a read sibling of `/validators` that exposes the raw stake
+    /// backing voting power rather than the power itself. No single-read sibling.
+    Bonds,
+    /// M88: `GET /unbonding` — the unbonding-delay queue (account + amount + mature
+    /// height), the withdrawals awaiting return to balances after `UNBONDING_PERIOD`.
+    /// A read sibling of `/bonds` on the stake lifecycle; no single-read sibling.
+    Unbonding,
+    /// M89: `GET /stake-ops` — the pending stake-op pool (account + bond/unbond + amount
+    /// + signature) staged for the next proposed block. The first *pending-pool* read
+    /// (mempool-side, not committed state); no single-read sibling.
+    StakeOps,
+    /// M90: `GET /evidence` — the pending slashing-evidence pool (pairs of conflicting
+    /// precommit votes) staged for the next proposed block. A pending-pool read sibling
+    /// of `/stake-ops`; no single-read sibling.
+    Evidence,
+    /// M91: `GET /peers` — the connected-peer directory (peer id + known listen address).
+    /// A daemon-level read (peers live on the actor, not in chain state); no single-read
+    /// sibling. Closes the read-surface basket of list endpoints.
+    Peers,
     NotFound,
 }
 
@@ -2180,6 +2310,25 @@ fn route_get(path: &str) -> GetRoute {
         // M85: the plain reviewer directory. Exact-match here, so it never collides with
         // the M60/M65 `/reviewer/` prefix below (`…reviewer` + `s`, not `…reviewer` + `/`).
         "/reviewers" => GetRoute::Reviewers,
+        // M86: the plain cognitive-graph directory. Exact-match; the `/graph/` prefix
+        // (single reads/proofs) is handled in the fallthrough arm below, where `/graph/`
+        // with an empty id already resolves to `NotFound`.
+        "/graph" => GetRoute::GraphNodes,
+        // M87: the per-validator bonded-stake directory. Exact-match; there is no
+        // `/bond/` single-read prefix, so `/bonds/` simply falls through to `Health`.
+        "/bonds" => GetRoute::Bonds,
+        // M88: the unbonding-delay queue. Exact-match; there is no `/unbonding/` single-read
+        // prefix, so `/unbonding/` simply falls through to `Health`.
+        "/unbonding" => GetRoute::Unbonding,
+        // M89: the pending stake-op pool. Exact-match; there is no `/stake-op/` single-read
+        // prefix, so `/stake-ops/` simply falls through to `Health`.
+        "/stake-ops" => GetRoute::StakeOps,
+        // M90: the pending slashing-evidence pool. Exact-match; there is no `/evidence/`
+        // single-read prefix, so `/evidence/` simply falls through to `Health`.
+        "/evidence" => GetRoute::Evidence,
+        // M91: the connected-peer directory. Exact-match; there is no `/peer/` single-read
+        // prefix, so `/peers/` simply falls through to `Health`.
+        "/peers" => GetRoute::Peers,
         p => {
             if let Some(rest) = p.strip_prefix("/account/") {
                 // M59: `{id}/proof` is the verifiable read; a bare `{id}` is the M58
@@ -2556,6 +2705,218 @@ fn json_reviewer_listing(reviewers: &[(u64, f32)]) -> String {
         .map(|&(id, reputation)| json_entity(&EntityView::Reviewer { id, reputation }))
         .collect::<Vec<_>>()
         .join(",");
+    format!("[{items}]")
+}
+
+/// M86: render the cognitive-graph directory as grep-friendly `key=value` lines, one per
+/// node (empty string when there are none). Reuses `format_entity` per item — same line
+/// shape as the single `/graph/{id}` plain read; nodes are in insertion order (node_id).
+fn format_graph_listing(nodes: &[crate::engine::GraphNode]) -> String {
+    nodes
+        .iter()
+        .map(|n| {
+            format_entity(&EntityView::GraphNode {
+                node_id: n.node_id,
+                domain: n.domain,
+                embedding: n.embedding,
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// M86: `GET /graph?format=json` — the JSON sibling of [`format_graph_listing`]. A JSON
+/// **array** of objects (`[]` when empty), reusing `json_entity` per item.
+fn json_graph_listing(nodes: &[crate::engine::GraphNode]) -> String {
+    let items = nodes
+        .iter()
+        .map(|n| {
+            json_entity(&EntityView::GraphNode {
+                node_id: n.node_id,
+                domain: n.domain,
+                embedding: n.embedding,
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+/// M87: render one validator's bonded stake as a grep-friendly `key=value` line
+/// (`kind=bond validator_id=… bonded=…`). Standalone (no `EntityView` — a bond is a
+/// plain state value, not a merkle-proof entity). Pure for direct unit testing.
+fn format_bond(id: u64, bonded: u64) -> String {
+    format!("kind=bond validator_id={id} bonded={bonded}")
+}
+
+/// M87: the JSON sibling of [`format_bond`] — a single object with lossless quoted-u64
+/// scalars, matching the `kind`-tagged shape of the other list-read items.
+fn json_bond(id: u64, bonded: u64) -> String {
+    format!(
+        "{{\"kind\":\"bond\",\"validator_id\":{},\"bonded\":{}}}",
+        json_u64(id),
+        json_u64(bonded),
+    )
+}
+
+/// M87: render the per-validator bonded-stake directory as grep-friendly lines, one per
+/// validator (empty string when there are none). Reuses `format_bond` per item.
+fn format_bond_listing(bonds: &[(u64, u64)]) -> String {
+    bonds
+        .iter()
+        .map(|&(id, bonded)| format_bond(id, bonded))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// M87: `GET /bonds?format=json` — the JSON sibling of [`format_bond_listing`]. A JSON
+/// **array** of objects (`[]` when empty), reusing `json_bond` per item.
+fn json_bond_listing(bonds: &[(u64, u64)]) -> String {
+    let items = bonds
+        .iter()
+        .map(|&(id, bonded)| json_bond(id, bonded))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+/// M88: render one unbonding-queue entry as a grep-friendly `key=value` line
+/// (`kind=unbonding account=… amount=… mature_height=…`). Standalone (no `EntityView` —
+/// a queue entry is a plain state value, not a merkle-proof entity). Pure for testing.
+fn format_unbonding(e: &crate::UnbondingEntry) -> String {
+    format!(
+        "kind=unbonding account={} amount={} mature_height={}",
+        e.account, e.amount, e.mature_height
+    )
+}
+
+/// M88: the JSON sibling of [`format_unbonding`] — a single object with lossless
+/// quoted-u64 scalars, matching the `kind`-tagged shape of the other list-read items.
+fn json_unbonding(e: &crate::UnbondingEntry) -> String {
+    format!(
+        "{{\"kind\":\"unbonding\",\"account\":{},\"amount\":{},\"mature_height\":{}}}",
+        json_u64(e.account),
+        json_u64(e.amount),
+        json_u64(e.mature_height),
+    )
+}
+
+/// M88: render the unbonding-delay queue as grep-friendly lines, one per entry (empty
+/// string when the queue is empty). Reuses `format_unbonding` per item; insertion order.
+fn format_unbonding_listing(queue: &[crate::UnbondingEntry]) -> String {
+    queue.iter().map(format_unbonding).collect::<Vec<_>>().join("\n")
+}
+
+/// M88: `GET /unbonding?format=json` — the JSON sibling of [`format_unbonding_listing`].
+/// A JSON **array** of objects (`[]` when empty), reusing `json_unbonding` per item.
+fn json_unbonding_listing(queue: &[crate::UnbondingEntry]) -> String {
+    let items = queue.iter().map(json_unbonding).collect::<Vec<_>>().join(",");
+    format!("[{items}]")
+}
+
+/// M89: render one pending stake op as a grep-friendly `key=value` line, mirroring the
+/// fields of [`json_stake_op`] (`account` + `kind` bond/unbond discriminator + `amount`
+/// + `signature` hex). Standalone (a stake op is a pending-pool value, not a merkle-proof
+/// entity). Pure for direct unit testing.
+fn format_stake_op(op: &crate::StakeOp) -> String {
+    let kind = match op.kind {
+        crate::BondKind::Bond => "bond",
+        crate::BondKind::Unbond => "unbond",
+    };
+    format!(
+        "account={} kind={kind} amount={} signature={}",
+        op.account,
+        op.amount,
+        crate::hash::hex(&op.signature)
+    )
+}
+
+/// M89: render the pending stake-op pool as grep-friendly lines, one per op (empty string
+/// when the pool is empty). Reuses `format_stake_op` per item; staging order.
+fn format_stakeop_listing(ops: &[crate::StakeOp]) -> String {
+    ops.iter().map(format_stake_op).collect::<Vec<_>>().join("\n")
+}
+
+/// M89: `GET /stake-ops?format=json` — the JSON sibling of [`format_stakeop_listing`]. A
+/// JSON **array** of objects (`[]` when empty), reusing the existing `json_stake_op` per item.
+fn json_stakeop_listing(ops: &[crate::StakeOp]) -> String {
+    let items = ops.iter().map(json_stake_op).collect::<Vec<_>>().join(",");
+    format!("[{items}]")
+}
+
+/// M90: render one consensus vote as grep-friendly `<prefix>key=value` pairs, mirroring
+/// the fields of [`json_vote`]. The `prefix` namespaces the two votes of a slash-evidence
+/// pair (`vote_a.` / `vote_b.`) on one flat line. Pure for direct unit testing.
+fn format_vote(prefix: &str, v: &crate::consensus::Vote) -> String {
+    let vote_type = match v.vote_type {
+        crate::consensus::VoteType::Prevote => "prevote",
+        crate::consensus::VoteType::Precommit => "precommit",
+    };
+    format!(
+        "{p}validator={} {p}height={} {p}round={} {p}block_hash={} {p}vote_type={vote_type} {p}signature={}",
+        v.validator,
+        v.height,
+        v.round,
+        crate::hash::hex(&v.block_hash),
+        crate::hash::hex(&v.signature),
+        p = prefix,
+    )
+}
+
+/// M90: render one pending slashing-evidence entry as a grep-friendly `key=value` line —
+/// the two conflicting votes flattened under `vote_a.`/`vote_b.` prefixes, mirroring the
+/// nested shape of [`json_slash_evidence`]. Standalone (a pending-pool value, not a
+/// merkle-proof entity). Pure for direct unit testing.
+fn format_slash_evidence(e: &crate::SlashEvidence) -> String {
+    format!(
+        "kind=evidence {} {}",
+        format_vote("vote_a.", &e.vote_a),
+        format_vote("vote_b.", &e.vote_b)
+    )
+}
+
+/// M90: render the pending slashing-evidence pool as grep-friendly lines, one per entry
+/// (empty string when the pool is empty). Reuses `format_slash_evidence`; staging order.
+fn format_evidence_listing(evidence: &[crate::SlashEvidence]) -> String {
+    evidence.iter().map(format_slash_evidence).collect::<Vec<_>>().join("\n")
+}
+
+/// M90: `GET /evidence?format=json` — the JSON sibling of [`format_evidence_listing`]. A
+/// JSON **array** of objects (`[]` when empty), reusing the existing `json_slash_evidence`.
+fn json_evidence_listing(evidence: &[crate::SlashEvidence]) -> String {
+    let items = evidence.iter().map(json_slash_evidence).collect::<Vec<_>>().join(",");
+    format!("[{items}]")
+}
+
+/// M91: render one connected peer as a grep-friendly `key=value` line (`kind=peer id=…
+/// addr=…`). The listen address is the M39 address-book entry; an unknown address renders
+/// as the literal `unknown`. Standalone (a daemon-level value, not a chain entity). Pure.
+fn format_peer(id: u64, addr: &Option<String>) -> String {
+    let addr = addr.as_deref().unwrap_or("unknown");
+    format!("kind=peer id={id} addr={addr}")
+}
+
+/// M91: the JSON sibling of [`format_peer`] — a single object with a lossless quoted-u64
+/// `id` and an `addr` that is a JSON string when known or bare `null` when unknown
+/// (mirroring the `next=null` convention of the page envelope).
+fn json_peer(id: u64, addr: &Option<String>) -> String {
+    let addr = match addr {
+        Some(a) => json_str(a),
+        None => "null".to_string(),
+    };
+    format!("{{\"kind\":\"peer\",\"id\":{},\"addr\":{}}}", json_u64(id), addr)
+}
+
+/// M91: render the connected-peer directory as grep-friendly lines, one per peer (empty
+/// string when none are connected). Reuses `format_peer` per item; id order.
+fn format_peer_listing(peers: &[(u64, Option<String>)]) -> String {
+    peers.iter().map(|(id, addr)| format_peer(*id, addr)).collect::<Vec<_>>().join("\n")
+}
+
+/// M91: `GET /peers?format=json` — the JSON sibling of [`format_peer_listing`]. A JSON
+/// **array** of objects (`[]` when empty), reusing `json_peer` per item.
+fn json_peer_listing(peers: &[(u64, Option<String>)]) -> String {
+    let items = peers.iter().map(|(id, addr)| json_peer(*id, addr)).collect::<Vec<_>>().join(",");
     format!("[{items}]")
 }
 
@@ -3093,6 +3454,10 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
         return;
     };
     let method = head.split_whitespace().next().unwrap_or("");
+    // M92: RFC 9110 §9.3.2 — HEAD mirrors GET's headers but sends no body. Captured once
+    // here so every write site below (the two negotiation `406`s and the read-route block)
+    // can strip the body uniformly via `maybe_head`.
+    let is_head = method.eq_ignore_ascii_case("HEAD");
     let target = head.split_whitespace().nth(1).unwrap_or("");
     // M66: split any `?query` off the request target before routing, then read the
     // optional `?format=json`. A query-less target leaves `path` byte-identical, so
@@ -3100,6 +3465,14 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
     // `Accept` header when no `?format=` is present (query still wins). M69: honor
     // RFC 7231 §5.3 q-values and answer `406` when the client accepts neither type.
     let (path, query) = split_query(target);
+    // M93: RFC 9110 §9.3.7 — `OPTIONS` advertises the methods this server serves via an
+    // `Allow` header and sends no body. Answered here, before `Accept`/`Accept-Charset`
+    // negotiation, since OPTIONS returns no representation and so has nothing to negotiate.
+    if method.eq_ignore_ascii_case("OPTIONS") {
+        let _ = stream.write_all(options_response().as_bytes()).await;
+        let _ = stream.flush().await;
+        return;
+    }
     let fmt = match resolve_format(query, head) {
         Some(f) => f,
         None => {
@@ -3107,8 +3480,11 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
             // what we *can* emit (RFC 7231 §6.5.6) as a machine-readable JSON object.
             let _ = stream
                 .write_all(
-                    http_response_ct("406 Not Acceptable", "application/json", &not_acceptable_json())
-                        .as_bytes(),
+                    maybe_head(
+                        is_head,
+                        http_response_ct("406 Not Acceptable", "application/json", &not_acceptable_json()),
+                    )
+                    .as_bytes(),
                 )
                 .await;
             let _ = stream.flush().await;
@@ -3123,10 +3499,13 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
     if !charset_acceptable(head) {
         let _ = stream
             .write_all(
-                http_response_ct(
-                    "406 Not Acceptable",
-                    "application/json",
-                    &not_acceptable_charset_json(),
+                maybe_head(
+                    is_head,
+                    http_response_ct(
+                        "406 Not Acceptable",
+                        "application/json",
+                        &not_acceptable_charset_json(),
+                    ),
                 )
                 .as_bytes(),
             )
@@ -3371,9 +3750,195 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                     }
                 }
             }
+            GetRoute::GraphNodes => {
+                // M86: plain cognitive-graph directory — always a (possibly empty) `200`.
+                // Fifth consumer of the pagination stack (after `/bridge/locks`,
+                // `/validators`, `/accounts`, `/reviewers`), reusing `format_entity`/
+                // `json_entity` per item.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryGraphNodes { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
+                            let total = listing.len();
+                            let page = paginate(&listing, offset, limit);
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_graph_listing(page), total, next),
+                                &json_page(&json_graph_listing(page), total, next),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Bonds => {
+                // M87: per-validator bonded-stake directory — always a (possibly empty)
+                // `200`. Sixth consumer of the pagination stack (after `/bridge/locks`,
+                // `/validators`, `/accounts`, `/reviewers`, `/graph`), reusing
+                // `format_bond`/`json_bond` per item.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryBonds { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
+                            let total = listing.len();
+                            let page = paginate(&listing, offset, limit);
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_bond_listing(page), total, next),
+                                &json_page(&json_bond_listing(page), total, next),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Unbonding => {
+                // M88: unbonding-delay queue — always a (possibly empty) `200`. Seventh
+                // consumer of the pagination stack (after `/bridge/locks`, `/validators`,
+                // `/accounts`, `/reviewers`, `/graph`, `/bonds`), reusing
+                // `format_unbonding`/`json_unbonding` per item.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryUnbonding { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
+                            let total = listing.len();
+                            let page = paginate(&listing, offset, limit);
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_unbonding_listing(page), total, next),
+                                &json_page(&json_unbonding_listing(page), total, next),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::StakeOps => {
+                // M89: pending stake-op pool — always a (possibly empty) `200`. Eighth
+                // consumer of the pagination stack and the first pending-pool read (after the
+                // committed-state lists `/validators`, `/accounts`, `/reviewers`, `/graph`,
+                // `/bonds`, `/unbonding`), reusing `format_stake_op`/`json_stake_op` per item.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryStakeOps { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
+                            let total = listing.len();
+                            let page = paginate(&listing, offset, limit);
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_stakeop_listing(page), total, next),
+                                &json_page(&json_stakeop_listing(page), total, next),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Evidence => {
+                // M90: pending slashing-evidence pool — always a (possibly empty) `200`. Ninth
+                // consumer of the pagination stack and the second pending-pool read (after
+                // `/stake-ops`), reusing `format_slash_evidence`/`json_slash_evidence` per item.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryEvidence { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
+                            let total = listing.len();
+                            let page = paginate(&listing, offset, limit);
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_evidence_listing(page), total, next),
+                                &json_page(&json_evidence_listing(page), total, next),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Peers => {
+                // M91: connected-peer directory — always a (possibly empty) `200`. Tenth
+                // consumer of the pagination stack and the first daemon-level read (peers live
+                // on the actor, not chain state), reusing `format_peer`/`json_peer` per item.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryPeers { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
+                            let total = listing.len();
+                            let page = paginate(&listing, offset, limit);
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_peer_listing(page), total, next),
+                                &json_page(&json_peer_listing(page), total, next),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
             GetRoute::Health => http_response("200 OK", "ok"),
             GetRoute::NotFound => http_response("404 Not Found", "not found"),
         };
+        // M92: HEAD mirrors the GET header block but drops the body (RFC 9110 §9.3.2).
+        let resp = maybe_head(is_head, resp);
         let _ = stream.write_all(resp.as_bytes()).await;
         let _ = stream.flush().await;
         return;
@@ -5709,6 +6274,483 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_graph_list_over_tcp() {
+        // M86: the cognitive-graph directory over real TCP — the fifth list endpoint, reusing
+        // the pagination stack + the existing `format_entity`/`json_entity` per-item
+        // renderers. `test_genesis` seeds one graph node (node_id 0), a populated body.
+        let dir = tmp_dir("rpc-graph-list");
+        let mut cfg = node_config(27, 20291, &[27], dir.clone());
+        let rpc_addr = "127.0.0.1:20301";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(27, kp(27).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(27))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // The single seeded graph node (node_id 0, domain 0, unit embedding). Rendered by
+        // the same `/graph/0` single-read path, so the listing line is byte-identical.
+        let want = EntityView::GraphNode { node_id: 0, domain: 0, embedding: unit(0) };
+
+        // Plain directory → 200 with the single node.
+        let resp = get(rpc_addr, "/graph").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "graph status: {resp}");
+        assert_eq!(body_of(&resp), format!("total=1\n{}", format_entity(&want)), "graph text envelope");
+
+        // JSON representation → the `total`/`next`/`items` envelope with the node.
+        let as_json = get(rpc_addr, "/graph?format=json").await;
+        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "graph json status: {as_json}");
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert_eq!(
+            body_of(&as_json),
+            format!("{{\"total\":\"1\",\"next\":null,\"items\":[{}]}}", json_entity(&want)),
+            "graph JSON envelope"
+        );
+
+        // `?offset=1` windows past the only node → empty page, no `next`.
+        let past = get(rpc_addr, "/graph?offset=1").await;
+        assert!(past.starts_with("HTTP/1.1 200 OK"), "offset status: {past}");
+        assert_eq!(body_of(&past), "total=1", "offset past end → total=1, empty page");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_bonds_list_over_tcp() {
+        // M87: the per-validator bonded-stake directory over real TCP — the sixth list
+        // endpoint, reusing the pagination stack + the new `format_bond`/`json_bond` per-item
+        // renderers. Genesis seeds the validator set directly (power, not bonds), and bonds
+        // only grow via on-chain `StakeOp`s, so a fresh chain's `/bonds` is live-but-empty —
+        // exactly the state this asserts end to end (route → Cmd → `state.bonds` → envelope).
+        let dir = tmp_dir("rpc-bonds-list");
+        let mut cfg = node_config(28, 20311, &[28], dir.clone());
+        let rpc_addr = "127.0.0.1:20321";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(28, kp(28).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(28))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // Plain directory → 200 with an empty page (no bonds at genesis, only the `total` head).
+        let resp = get(rpc_addr, "/bonds").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "bonds status: {resp}");
+        assert_eq!(body_of(&resp), "total=0", "bonds text envelope (empty directory)");
+
+        // JSON representation → the `total`/`next`/`items` envelope with an empty array.
+        let as_json = get(rpc_addr, "/bonds?format=json").await;
+        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "bonds json status: {as_json}");
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert_eq!(
+            body_of(&as_json),
+            "{\"total\":\"0\",\"next\":null,\"items\":[]}",
+            "bonds JSON envelope (empty directory)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_unbonding_list_over_tcp() {
+        // M88: the unbonding-delay queue over real TCP — the seventh list endpoint, reusing
+        // the pagination stack + the new `format_unbonding`/`json_unbonding` per-item
+        // renderers. The queue only fills when an `Unbond` `StakeOp` schedules a withdrawal,
+        // so a fresh chain's `/unbonding` is live-but-empty — asserted end to end
+        // (route → Cmd → `state.unbonding` → envelope).
+        let dir = tmp_dir("rpc-unbonding-list");
+        let mut cfg = node_config(29, 20331, &[29], dir.clone());
+        let rpc_addr = "127.0.0.1:20341";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(29, kp(29).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(29))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // Plain directory → 200 with an empty page (no queued withdrawals at genesis).
+        let resp = get(rpc_addr, "/unbonding").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "unbonding status: {resp}");
+        assert_eq!(body_of(&resp), "total=0", "unbonding text envelope (empty queue)");
+
+        // JSON representation → the `total`/`next`/`items` envelope with an empty array.
+        let as_json = get(rpc_addr, "/unbonding?format=json").await;
+        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "unbonding json status: {as_json}");
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert_eq!(
+            body_of(&as_json),
+            "{\"total\":\"0\",\"next\":null,\"items\":[]}",
+            "unbonding JSON envelope (empty queue)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_stake_ops_list_over_tcp() {
+        // M89: the pending stake-op pool over real TCP — the eighth list endpoint and the
+        // first pending-pool read, reusing the pagination stack + `format_stake_op`/
+        // `json_stake_op`. The pool only fills when a signed `StakeOp` is staged for the next
+        // block, so a fresh chain's `/stake-ops` is live-but-empty — asserted end to end
+        // (route → Cmd → `pending_stake_ops()` → envelope).
+        let dir = tmp_dir("rpc-stake-ops-list");
+        let mut cfg = node_config(30, 20351, &[30], dir.clone());
+        let rpc_addr = "127.0.0.1:20361";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(30, kp(30).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(30))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // Plain directory → 200 with an empty page (no staged stake ops at genesis).
+        let resp = get(rpc_addr, "/stake-ops").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "stake-ops status: {resp}");
+        assert_eq!(body_of(&resp), "total=0", "stake-ops text envelope (empty pool)");
+
+        // JSON representation → the `total`/`next`/`items` envelope with an empty array.
+        let as_json = get(rpc_addr, "/stake-ops?format=json").await;
+        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "stake-ops json status: {as_json}");
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert_eq!(
+            body_of(&as_json),
+            "{\"total\":\"0\",\"next\":null,\"items\":[]}",
+            "stake-ops JSON envelope (empty pool)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_evidence_list_over_tcp() {
+        // M90: the pending slashing-evidence pool over real TCP — the ninth list endpoint and
+        // the second pending-pool read, reusing the pagination stack + `format_slash_evidence`/
+        // `json_slash_evidence`. The pool only fills when equivocation evidence is staged, so a
+        // fresh chain's `/evidence` is live-but-empty — asserted end to end
+        // (route → Cmd → `pending_evidence()` → envelope).
+        let dir = tmp_dir("rpc-evidence-list");
+        let mut cfg = node_config(31, 20371, &[31], dir.clone());
+        let rpc_addr = "127.0.0.1:20391";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(31, kp(31).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(31))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // Plain directory → 200 with an empty page (no staged evidence at genesis).
+        let resp = get(rpc_addr, "/evidence").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "evidence status: {resp}");
+        assert_eq!(body_of(&resp), "total=0", "evidence text envelope (empty pool)");
+
+        // JSON representation → the `total`/`next`/`items` envelope with an empty array.
+        let as_json = get(rpc_addr, "/evidence?format=json").await;
+        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "evidence json status: {as_json}");
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert_eq!(
+            body_of(&as_json),
+            "{\"total\":\"0\",\"next\":null,\"items\":[]}",
+            "evidence JSON envelope (empty pool)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_peers_list_over_tcp() {
+        // M91: the connected-peer directory over real TCP — the tenth list endpoint and the
+        // first daemon-level read (peers live on the actor, not chain state), reusing the
+        // pagination stack + `format_peer`/`json_peer`. A single-node localnet has no
+        // configured peers, so `outbound` is empty and `/peers` is live-but-empty — asserted
+        // end to end (route → Cmd → actor `outbound`/`addrs` → envelope).
+        let dir = tmp_dir("rpc-peers-list");
+        // node_config derives the p2p listen port as `port_base + (id-21)` = 20401+11 = 20412;
+        // keep the RPC port clear of it.
+        let mut cfg = node_config(32, 20401, &[32], dir.clone());
+        let rpc_addr = "127.0.0.1:20421";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(32, kp(32).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(32))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // Plain directory → 200 with an empty page (no connected peers on a solo node).
+        let resp = get(rpc_addr, "/peers").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "peers status: {resp}");
+        assert_eq!(body_of(&resp), "total=0", "peers text envelope (no peers)");
+
+        // JSON representation → the `total`/`next`/`items` envelope with an empty array.
+        let as_json = get(rpc_addr, "/peers?format=json").await;
+        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "peers json status: {as_json}");
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert_eq!(
+            body_of(&as_json),
+            "{\"total\":\"0\",\"next\":null,\"items\":[]}",
+            "peers JSON envelope (no peers)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_head_mirrors_get_without_body() {
+        // M92: a HEAD request mirrors the matching GET — same status + headers (crucially the
+        // GET body's Content-Length) but no body (RFC 9110 §9.3.2). Exercised end to end over
+        // real TCP against both a scalar read (`/height`) and a list read (`/accounts`).
+        let dir = tmp_dir("rpc-head");
+        // node_config derives the p2p listen port as `port_base + (id-21)` = 20431+12 = 20443;
+        // keep the RPC port clear of it.
+        let mut cfg = node_config(33, 20431, &[33], dir.clone());
+        let rpc_addr = "127.0.0.1:20451";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(33, kp(33).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(33))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn req(addr: &str, method: &str, path: &str) -> String {
+            let r = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(r.as_bytes()).await.expect("send");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn split(resp: &str) -> (&str, &str) {
+            resp.split_once("\r\n\r\n").unwrap_or((resp, ""))
+        }
+
+        for path in ["/height", "/accounts"] {
+            let get = req(rpc_addr, "GET", path).await;
+            let head = req(rpc_addr, "HEAD", path).await;
+            let (get_headers, get_body) = split(&get);
+            let (head_headers, head_body) = split(&head);
+
+            // Same status + headers (incl. the GET body's Content-Length), byte-identical.
+            assert!(get.starts_with("HTTP/1.1 200 OK"), "GET {path} status: {get}");
+            assert!(head.starts_with("HTTP/1.1 200 OK"), "HEAD {path} status: {head}");
+            assert_eq!(head_headers, get_headers, "HEAD {path} must mirror GET headers");
+            assert!(
+                head_headers.contains(&format!("Content-Length: {}\r\n", get_body.len())),
+                "HEAD {path} Content-Length must advertise the GET body ({} bytes): {head_headers}",
+                get_body.len()
+            );
+            // GET carries the body; HEAD does not.
+            assert!(!get_body.is_empty(), "GET {path} should have a body");
+            assert_eq!(head_body, "", "HEAD {path} must not send a body");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_options_over_tcp() {
+        // M93: OPTIONS over real TCP — 204 No Content + an `Allow` header listing the served
+        // methods, no body, on both a read path and the root.
+        let dir = tmp_dir("rpc-options");
+        // node_config p2p listen = 20461 + (34-21) = 20474; keep the RPC port clear.
+        let mut cfg = node_config(34, 20461, &[34], dir.clone());
+        let rpc_addr = "127.0.0.1:20481";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(34, kp(34).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(34))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn req(addr: &str, method: &str, path: &str, extra: &str) -> String {
+            let r = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n{extra}Connection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(r.as_bytes()).await.expect("send");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        for path in ["/accounts", "/"] {
+            let resp = req(rpc_addr, "OPTIONS", path, "").await;
+            assert!(resp.starts_with("HTTP/1.1 204 No Content\r\n"), "OPTIONS {path}: {resp}");
+            assert!(resp.contains("Allow: GET, HEAD, OPTIONS, POST\r\n"), "OPTIONS {path} Allow: {resp}");
+            assert_eq!(body_of(&resp), "", "OPTIONS {path} must not send a body");
+        }
+
+        // OPTIONS is answered before content negotiation: a hostile `Accept` that would make a
+        // GET return `406` still yields the 204 capabilities response.
+        let hostile = req(rpc_addr, "OPTIONS", "/accounts", "Accept: application/xml\r\n").await;
+        assert!(hostile.starts_with("HTTP/1.1 204 No Content\r\n"), "OPTIONS ignores Accept: {hostile}");
+        assert!(hostile.contains("Allow: GET, HEAD, OPTIONS, POST\r\n"), "{hostile}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_unsupported_method_is_health_probe() {
+        // M93: OPTIONS is the only non-GET/HEAD/POST method given special handling. Other
+        // methods (e.g. PUT) deliberately keep the pre-existing `200 OK`/`"ok"` health-probe
+        // fallback — exercised here so that intentional behavior can't regress silently.
+        let dir = tmp_dir("rpc-unsupported-method");
+        // node_config p2p listen = 20491 + (35-21) = 20505; keep the RPC port clear.
+        let mut cfg = node_config(35, 20491, &[35], dir.clone());
+        let rpc_addr = "127.0.0.1:20511";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(35, kp(35).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(35))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let r = "PUT /accounts HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        let mut s = TcpStream::connect(rpc_addr).await.expect("connect rpc");
+        s.write_all(r.as_bytes()).await.expect("send");
+        let mut resp = Vec::new();
+        s.read_to_end(&mut resp).await.expect("read response");
+        let resp = String::from_utf8_lossy(&resp);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "PUT falls back to health probe: {resp}");
+        assert_eq!(resp.split_once("\r\n\r\n").map(|(_, b)| b), Some("ok"), "probe body: {resp}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_plain_entities_over_tcp() {
         // M65: plain reviewer/validator/graph reads over real TCP. Unlike bridge locks,
         // `test_genesis` carries real reviewers (10,11,12), validators (21-24), and a
@@ -6229,6 +7271,36 @@ mod tests {
     }
 
     #[test]
+    fn graph_listing_renders() {
+        // M86: the empty directory renders `""` (text) / `[]` (json); two graph nodes render
+        // one `format_entity`-shaped line each (text) and a two-object array (json), reusing
+        // the exact single-item `EntityView::GraphNode` renderers (node_id order).
+        assert_eq!(format_graph_listing(&[]), "");
+        assert_eq!(json_graph_listing(&[]), "[]");
+
+        let mut e0 = [0.0f32; crate::DIM];
+        e0[0] = 1.0;
+        let mut e1 = [0.0f32; crate::DIM];
+        e1[1] = 1.0;
+        let nodes = vec![
+            crate::engine::GraphNode { node_id: 0, embedding: e0, domain: 7 },
+            crate::engine::GraphNode { node_id: 1, embedding: e1, domain: 9 },
+        ];
+        let ev = |node_id, embedding, domain| EntityView::GraphNode { node_id, domain, embedding };
+
+        // Text listing is exactly the per-item lines joined by `\n`.
+        assert_eq!(
+            format_graph_listing(&nodes),
+            format!("{}\n{}", format_entity(&ev(0, e0, 7)), format_entity(&ev(1, e1, 9))),
+        );
+        // JSON listing is exactly the per-item objects wrapped in an array.
+        assert_eq!(
+            json_graph_listing(&nodes),
+            format!("[{},{}]", json_entity(&ev(0, e0, 7)), json_entity(&ev(1, e1, 9))),
+        );
+    }
+
+    #[test]
     fn error_body_renders() {
         // M67: `error_body` is status-agnostic — Text is the bare message with a
         // text/plain type; Json is {"error":"<msg>"} with application/json, the message
@@ -6391,6 +7463,301 @@ mod tests {
         // M65/M60 single-reviewer routes still resolve to their own variants.
         assert!(matches!(route_get("/reviewer/10"), GetRoute::Plain(ProofKind::Reviewer, 10)));
         assert!(matches!(route_get("/reviewer/10/proof"), GetRoute::Proof(ProofKind::Reviewer, 10)));
+    }
+
+    #[test]
+    fn route_get_parses_graph() {
+        // M86: `/graph` is a plain directory read — an exact match, distinct from the
+        // M60/M65 `/graph/{id}` prefix route. `/graph/` (empty id) already resolves to
+        // `NotFound` in the fallthrough arm, so it is *not* the directory.
+        assert!(matches!(route_get("/graph"), GetRoute::GraphNodes));
+        assert!(matches!(route_get("/graph/"), GetRoute::NotFound));
+        // M65/M60 single-node routes still resolve to their own variants.
+        assert!(matches!(route_get("/graph/0"), GetRoute::Plain(ProofKind::GraphNode, 0)));
+        assert!(matches!(route_get("/graph/0/proof"), GetRoute::Proof(ProofKind::GraphNode, 0)));
+    }
+
+    #[test]
+    fn route_get_parses_bonds() {
+        // M87: `/bonds` is a plain directory read — an exact match. There is no `/bond/`
+        // single-read prefix, so a trailing slash simply falls through to the health
+        // fallback (not `NotFound`, unlike `/graph/`).
+        assert!(matches!(route_get("/bonds"), GetRoute::Bonds));
+        assert!(matches!(route_get("/bonds/"), GetRoute::Health));
+        // Sibling list reads still resolve to their own variants (no collision).
+        assert!(matches!(route_get("/validators"), GetRoute::Validators));
+        assert!(matches!(route_get("/accounts"), GetRoute::Accounts));
+    }
+
+    #[test]
+    fn bond_listing_renders() {
+        // M87: two validators' bonds render one grep-friendly line each (id order) and a
+        // JSON array of `kind=bond` objects with lossless quoted-u64 scalars; the empty
+        // set yields an empty text body and `[]`.
+        let bonds = vec![(7u64, 3_000_000u64), (9u64, 500_000u64)];
+        let text = format_bond_listing(&bonds);
+        assert_eq!(
+            text,
+            "kind=bond validator_id=7 bonded=3000000\nkind=bond validator_id=9 bonded=500000"
+        );
+        let json = json_bond_listing(&bonds);
+        assert_eq!(
+            json,
+            "[{\"kind\":\"bond\",\"validator_id\":\"7\",\"bonded\":\"3000000\"},\
+{\"kind\":\"bond\",\"validator_id\":\"9\",\"bonded\":\"500000\"}]"
+        );
+        // Single-item renderers match what the listing emits per entry.
+        assert_eq!(format_bond(7, 3_000_000), "kind=bond validator_id=7 bonded=3000000");
+        assert_eq!(
+            json_bond(9, 500_000),
+            "{\"kind\":\"bond\",\"validator_id\":\"9\",\"bonded\":\"500000\"}"
+        );
+        // Empty set ⇒ empty text, `[]` JSON.
+        assert_eq!(format_bond_listing(&[]), "");
+        assert_eq!(json_bond_listing(&[]), "[]");
+    }
+
+    #[test]
+    fn route_get_parses_unbonding() {
+        // M88: `/unbonding` is a plain directory read — an exact match. There is no
+        // `/unbonding/` single-read prefix, so a trailing slash falls through to the health
+        // fallback (like `/bonds/`, not `NotFound`).
+        assert!(matches!(route_get("/unbonding"), GetRoute::Unbonding));
+        assert!(matches!(route_get("/unbonding/"), GetRoute::Health));
+        // Sibling list reads still resolve to their own variants (no collision).
+        assert!(matches!(route_get("/bonds"), GetRoute::Bonds));
+        assert!(matches!(route_get("/validators"), GetRoute::Validators));
+    }
+
+    #[test]
+    fn unbonding_listing_renders() {
+        // M88: two queued withdrawals render one grep-friendly line each (insertion order)
+        // and a JSON array of `kind=unbonding` objects with lossless quoted-u64 scalars; the
+        // empty queue yields an empty text body and `[]`.
+        let queue = vec![
+            crate::UnbondingEntry { account: 7, amount: 3_000_000, mature_height: 12 },
+            crate::UnbondingEntry { account: 9, amount: 500_000, mature_height: 15 },
+        ];
+        let text = format_unbonding_listing(&queue);
+        assert_eq!(
+            text,
+            "kind=unbonding account=7 amount=3000000 mature_height=12\n\
+kind=unbonding account=9 amount=500000 mature_height=15"
+        );
+        let json = json_unbonding_listing(&queue);
+        assert_eq!(
+            json,
+            "[{\"kind\":\"unbonding\",\"account\":\"7\",\"amount\":\"3000000\",\"mature_height\":\"12\"},\
+{\"kind\":\"unbonding\",\"account\":\"9\",\"amount\":\"500000\",\"mature_height\":\"15\"}]"
+        );
+        // Single-item renderers match what the listing emits per entry.
+        assert_eq!(format_unbonding(&queue[0]), "kind=unbonding account=7 amount=3000000 mature_height=12");
+        assert_eq!(
+            json_unbonding(&queue[1]),
+            "{\"kind\":\"unbonding\",\"account\":\"9\",\"amount\":\"500000\",\"mature_height\":\"15\"}"
+        );
+        // Empty queue ⇒ empty text, `[]` JSON.
+        assert_eq!(format_unbonding_listing(&[]), "");
+        assert_eq!(json_unbonding_listing(&[]), "[]");
+    }
+
+    #[test]
+    fn route_get_parses_stake_ops() {
+        // M89: `/stake-ops` is a plain directory read — an exact match. There is no
+        // `/stake-op/` single-read prefix, so a trailing slash falls through to the health
+        // fallback (like `/bonds/` and `/unbonding/`, not `NotFound`).
+        assert!(matches!(route_get("/stake-ops"), GetRoute::StakeOps));
+        assert!(matches!(route_get("/stake-ops/"), GetRoute::Health));
+        // Sibling list reads still resolve to their own variants (no collision).
+        assert!(matches!(route_get("/unbonding"), GetRoute::Unbonding));
+        assert!(matches!(route_get("/bonds"), GetRoute::Bonds));
+    }
+
+    #[test]
+    fn stakeop_listing_renders() {
+        // M89: two pending stake ops render one grep-friendly line each (staging order) and a
+        // JSON array reusing `json_stake_op`; the empty pool yields an empty text body and `[]`.
+        let ops = vec![
+            crate::StakeOp {
+                account: 7,
+                kind: crate::BondKind::Bond,
+                amount: 3_000_000,
+                signature: [0u8; 64],
+            },
+            crate::StakeOp {
+                account: 9,
+                kind: crate::BondKind::Unbond,
+                amount: 500_000,
+                signature: [0u8; 64],
+            },
+        ];
+        let sig_hex = crate::hash::hex(&[0u8; 64]);
+        let text = format_stakeop_listing(&ops);
+        assert_eq!(
+            text,
+            format!(
+                "account=7 kind=bond amount=3000000 signature={sig_hex}\n\
+account=9 kind=unbond amount=500000 signature={sig_hex}"
+            )
+        );
+        // The listing's JSON items are byte-identical to the existing single-op renderer.
+        let json = json_stakeop_listing(&ops);
+        assert_eq!(
+            json,
+            format!("[{},{}]", json_stake_op(&ops[0]), json_stake_op(&ops[1]))
+        );
+        // Single-item text renderer matches what the listing emits per entry.
+        assert_eq!(
+            format_stake_op(&ops[0]),
+            format!("account=7 kind=bond amount=3000000 signature={sig_hex}")
+        );
+        // Empty pool ⇒ empty text, `[]` JSON.
+        assert_eq!(format_stakeop_listing(&[]), "");
+        assert_eq!(json_stakeop_listing(&[]), "[]");
+    }
+
+    #[test]
+    fn route_get_parses_evidence() {
+        // M90: `/evidence` is a plain directory read — an exact match. There is no
+        // `/evidence/` single-read prefix, so a trailing slash falls through to the health
+        // fallback (like `/stake-ops/`, not `NotFound`).
+        assert!(matches!(route_get("/evidence"), GetRoute::Evidence));
+        assert!(matches!(route_get("/evidence/"), GetRoute::Health));
+        // Sibling list reads still resolve to their own variants (no collision).
+        assert!(matches!(route_get("/stake-ops"), GetRoute::StakeOps));
+        assert!(matches!(route_get("/unbonding"), GetRoute::Unbonding));
+    }
+
+    #[test]
+    fn evidence_listing_renders() {
+        // M90: one pending evidence entry renders a grep-friendly line with both votes
+        // flattened under `vote_a.`/`vote_b.`, and a JSON array reusing `json_slash_evidence`;
+        // the empty pool yields an empty text body and `[]`.
+        let vote = |block_hash: crate::Hash, vt| crate::consensus::Vote {
+            validator: 5,
+            height: 9,
+            round: 2,
+            block_hash,
+            vote_type: vt,
+            signature: [0u8; 64],
+        };
+        let ev = crate::SlashEvidence {
+            vote_a: vote([0xaa; 32], crate::consensus::VoteType::Precommit),
+            vote_b: vote([0xbb; 32], crate::consensus::VoteType::Precommit),
+        };
+        let a_h = crate::hash::hex(&[0xaa; 32]);
+        let b_h = crate::hash::hex(&[0xbb; 32]);
+        let sig = crate::hash::hex(&[0u8; 64]);
+        let text = format_evidence_listing(std::slice::from_ref(&ev));
+        assert_eq!(
+            text,
+            format!(
+                "kind=evidence \
+vote_a.validator=5 vote_a.height=9 vote_a.round=2 vote_a.block_hash={a_h} vote_a.vote_type=precommit vote_a.signature={sig} \
+vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b.vote_type=precommit vote_b.signature={sig}"
+            )
+        );
+        // The listing's JSON items are byte-identical to the existing single-evidence renderer.
+        let json = json_evidence_listing(std::slice::from_ref(&ev));
+        assert_eq!(json, format!("[{}]", json_slash_evidence(&ev)));
+        // Empty pool ⇒ empty text, `[]` JSON.
+        assert_eq!(format_evidence_listing(&[]), "");
+        assert_eq!(json_evidence_listing(&[]), "[]");
+    }
+
+    #[test]
+    fn route_get_parses_peers() {
+        // M91: `/peers` is a plain directory read — an exact match. There is no `/peer/`
+        // single-read prefix, so a trailing slash falls through to the health fallback
+        // (like `/evidence/`, not `NotFound`).
+        assert!(matches!(route_get("/peers"), GetRoute::Peers));
+        assert!(matches!(route_get("/peers/"), GetRoute::Health));
+        // Sibling list reads still resolve to their own variants (no collision).
+        assert!(matches!(route_get("/evidence"), GetRoute::Evidence));
+        assert!(matches!(route_get("/stake-ops"), GetRoute::StakeOps));
+    }
+
+    #[test]
+    fn peer_listing_renders() {
+        // M91: two connected peers render one grep-friendly line each (id order); a known
+        // address renders verbatim, an unknown one as `unknown` in text and `null` in JSON.
+        // The empty directory yields an empty text body and `[]`.
+        let peers = vec![(7u64, Some("127.0.0.1:9000".to_string())), (9u64, None)];
+        let text = format_peer_listing(&peers);
+        assert_eq!(
+            text,
+            "kind=peer id=7 addr=127.0.0.1:9000\nkind=peer id=9 addr=unknown"
+        );
+        let json = json_peer_listing(&peers);
+        assert_eq!(
+            json,
+            "[{\"kind\":\"peer\",\"id\":\"7\",\"addr\":\"127.0.0.1:9000\"},\
+{\"kind\":\"peer\",\"id\":\"9\",\"addr\":null}]"
+        );
+        // Single-item renderers match what the listing emits per entry.
+        assert_eq!(format_peer(7, &Some("127.0.0.1:9000".to_string())), "kind=peer id=7 addr=127.0.0.1:9000");
+        assert_eq!(json_peer(9, &None), "{\"kind\":\"peer\",\"id\":\"9\",\"addr\":null}");
+        // Empty directory ⇒ empty text, `[]` JSON.
+        assert_eq!(format_peer_listing(&[]), "");
+        assert_eq!(json_peer_listing(&[]), "[]");
+    }
+
+    #[test]
+    fn maybe_head_strips_body_keeps_headers() {
+        // M92: HEAD mirrors GET's header block (status + Content-Type + Content-Length + Vary)
+        // but drops the body (RFC 9110 §9.3.2). `Content-Length` still advertises the GET body.
+        let get = http_response_ct("200 OK", "application/json", "{\"total\":\"3\"}");
+        // Sanity: the GET response carries the body and a matching Content-Length.
+        assert!(get.ends_with("{\"total\":\"3\"}"));
+        assert!(get.contains("Content-Length: 13\r\n"));
+
+        let head = maybe_head(true, get.clone());
+        // Header block is byte-identical up to and including the blank-line terminator…
+        assert_eq!(head, get.split_once("\r\n\r\n").map(|(h, _)| format!("{h}\r\n\r\n")).unwrap());
+        // …so the status, Content-Type, the GET's Content-Length, and Vary all survive…
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(head.contains("Content-Type: application/json\r\n"));
+        assert!(head.contains("Content-Length: 13\r\n"));
+        assert!(head.contains("Vary: Accept, Accept-Charset\r\n"));
+        // …but no body follows the terminator.
+        assert!(head.ends_with("\r\n\r\n"));
+        assert!(!head.contains("{\"total\":\"3\"}"));
+
+        // `is_head == false` is the identity (GET path unchanged, byte-for-byte).
+        assert_eq!(maybe_head(false, get.clone()), get);
+    }
+
+    #[test]
+    fn maybe_head_strips_negotiation_406_body() {
+        // M92: the two content-negotiation `406` write sites also route through `maybe_head`,
+        // so a HEAD that fails `Accept`/`Accept-Charset` negotiation still gets the full `406`
+        // header block (status + machine-readable Content-Type + Content-Length) but no body.
+        for body in [not_acceptable_json(), not_acceptable_charset_json()] {
+            let full = http_response_ct("406 Not Acceptable", "application/json", &body);
+            let head = maybe_head(true, full.clone());
+            assert!(head.starts_with("HTTP/1.1 406 Not Acceptable\r\n"), "{head}");
+            assert!(head.contains("Content-Type: application/json\r\n"), "{head}");
+            assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())), "{head}");
+            assert!(head.ends_with("\r\n\r\n"), "{head}");
+            assert!(!head.contains(&body), "406 HEAD must not send a body: {head}");
+        }
+    }
+
+    #[test]
+    fn options_response_advertises_allow() {
+        // M93: RFC 9110 §9.3.7 — OPTIONS returns 204 No Content with an `Allow` header listing
+        // the served methods, and no body.
+        let resp = options_response();
+        assert!(resp.starts_with("HTTP/1.1 204 No Content\r\n"), "{resp}");
+        assert!(resp.contains(&format!("Allow: {ALLOWED_METHODS}\r\n")), "{resp}");
+        // The advertised set is exactly the methods the server handles.
+        for m in ["GET", "HEAD", "OPTIONS", "POST"] {
+            assert!(ALLOWED_METHODS.contains(m), "Allow must list {m}: {ALLOWED_METHODS}");
+        }
+        // 204 carries no body (and thus no Content-Length) — the headers end the response.
+        assert!(resp.ends_with("\r\n\r\n"), "{resp}");
+        assert!(!resp.contains("Content-Length"), "204 has no body: {resp}");
+        assert_eq!(resp.split_once("\r\n\r\n").map(|(_, b)| b), Some(""), "no body: {resp}");
     }
 
     #[test]

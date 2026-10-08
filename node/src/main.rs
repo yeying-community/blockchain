@@ -235,11 +235,16 @@ fn main() {
         "bridge" => cmd_bridge(),
         "redeem" => cmd_redeem(),
         "run" => cmd_run(config_arg(&args)),
+        "check-config" => cmd_check_config(config_arg(&args)),
+        "genesis-hash" => cmd_genesis_hash(config_arg(&args)),
+        "inspect-tx" => cmd_inspect_tx(&args),
+        "pubkey" => cmd_pubkey(&args),
         "submit-tx" => cmd_submit_tx(config_arg(&args), tx_arg(&args)),
         "encode-tx" => cmd_encode_tx(&args),
         "keygen" => cmd_keygen(&args),
         "localnet" => cmd_localnet(),
         "status" => cmd_status(dir_arg(&args)),
+        "inspect-block" => cmd_inspect_block(&args),
         "certs" => cmd_certs(dir_arg(&args)),
         "-h" | "--help" | "help" => usage(),
         other => {
@@ -311,11 +316,17 @@ fn usage() {
     eprintln!("  node bridge             trustless bridge: chain A locks to chain B, relayer ferries a cert-signed envelope, B's endpoint verifies + credits — no relayer trust");
     eprintln!("  node redeem             consensus-level redeem: B's producer follows A on-chain and mints from a source lock inside its state machine — the mint is BFT-enforced, not off-chain");
     eprintln!("  node run    --config F  run the networked BFT daemon (tokio TCP P2P): load config/genesis/validator key, gossip votes + sync/verify over sockets");
+    eprintln!("  node check-config --config F  dry-run: load + validate config, its genesis, and validator key (if any) without starting the daemon; print a summary or the first error");
+    eprintln!("  node genesis-hash --config F  print the chain identity derived from the config's genesis: genesis_hash + initial state_root + validator count (compare across operators before joining)");
     eprintln!("  node submit-tx --config F --tx F  submit a codec-encoded tx to a running daemon's [rpc] ingress endpoint; print accepted hash or reject reason");
     eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--config F]  author+sign a tx offline into a submit-tx file; print its hash");
+    eprintln!("  node inspect-tx --tx F [--pubkey HEX]  decode a codec-encoded tx file and print its fields + content hash; with --pubkey, also verify the signature (the read-side companion to encode-tx)");
     eprintln!("  node keygen --out F [--seed HEX]  generate (or derive from a 64-hex seed) an ed25519 keypair; write the seed file (for encode-tx --key-file) and print the pubkey");
+    eprintln!("  node keygen ... --genesis-id N [--balance MICRO] [--power P]  also print a ready-to-paste genesis [[accounts]] (and, with --power, [[validators]]) entry");
+    eprintln!("  node pubkey (--key-file F | --seed HEX) [--genesis-id N ...]  derive + print the pubkey for an existing seed WITHOUT writing a file (read-only; pairs with inspect-tx --pubkey)");
     eprintln!("  node localnet           spin up an in-process tokio testnet (4 validators, no sequencer) and show all nodes converge via distributed BFT voting over real sockets");
     eprintln!("  node status --dir DIR   replay the block log and print state");
+    eprintln!("  node inspect-block --dir DIR [--height N]  read the persisted block log and print a per-block summary, or (with --height) one block's header + contents + tx hashes");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
 }
 
@@ -2719,6 +2730,211 @@ use zhixing_node::light::ProofKind;
 /// no sequencer) from the `[validator]` section, builds a multi-thread tokio
 /// runtime, and blocks on `daemon::run` until Ctrl-C. `main()` stays sync so the
 /// ~20 in-memory demo commands are unaffected by the async runtime.
+/// M96: load + fully validate a node config and its referenced genesis — the same
+/// load/parse/convert/key-derive steps [`cmd_run`] performs, minus binding any socket or
+/// starting the actor. Returns a human-readable summary on success, or the first typed
+/// [`config::ConfigError`]. Pure (reads only the referenced files; no process exit, no
+/// network, no state) so it is unit-testable; [`cmd_check_config`] is the thin CLI shell.
+fn check_config(config_path: &str) -> Result<String, config::ConfigError> {
+    let cfg = config::load_node_config(config_path)?;
+    let gcfg = config::load_genesis(&cfg.genesis)?;
+    let genesis = gcfg.to_genesis()?;
+    // Validate the validator key material too (an enabled `[validator]` section) — a bad key
+    // should fail the dry-run, not first surface when `run` tries to vote.
+    let role = match cfg.validator.as_ref() {
+        Some(vc) if vc.enabled => {
+            vc.keypair()?;
+            "validator"
+        }
+        _ => "follower",
+    };
+    Ok(format!(
+        "ok config {config_path}\nnode id {}\nrole {role}\ngenesis {}\naccounts {}\nreviewers {}\nvalidators {}\npeers {}",
+        cfg.node.id,
+        cfg.genesis,
+        genesis.accounts.len(),
+        genesis.reviewers.len(),
+        genesis.validators.len(),
+        cfg.peers.len(),
+    ))
+}
+
+/// M96: `node check-config --config F` — dry-run config/genesis validation. Prints the
+/// [`check_config`] summary on success, or the typed error + exit 2 (the CLI idiom). Binds
+/// no socket and starts no actor, so it is safe to run against a production config anywhere.
+fn cmd_check_config(config_path: String) {
+    match check_config(&config_path) {
+        Ok(summary) => println!("{summary}"),
+        Err(e) => fail_msg("check-config", &e),
+    }
+}
+
+/// M97: derive the chain identity from a config's genesis — the `genesis_hash` (the head
+/// every honest node starts from), the initial `state_root`, and the genesis validator
+/// count. Two operators comparing these three before joining can confirm they agree on
+/// genesis byte-for-byte (a mismatched genesis means incompatible chains / failed sync).
+/// Loads + converts the genesis exactly as `cmd_run` does, then stamps it via
+/// [`ChainState::genesis`] — no socket, no actor. Pure for unit testing.
+fn genesis_identity(config_path: &str) -> Result<String, config::ConfigError> {
+    let cfg = config::load_node_config(config_path)?;
+    let genesis = config::load_genesis(&cfg.genesis)?.to_genesis()?;
+    let (state, gh) = ChainState::genesis(genesis);
+    Ok(format!(
+        "genesis_hash {}\nstate_root {}\nvalidators {}",
+        hex(&gh),
+        hex(&state.state_root()),
+        state.validators.validators().len(),
+    ))
+}
+
+/// M97: `node genesis-hash --config F` — print the chain identity for the config's genesis,
+/// or the typed error + exit 2. Reads only the referenced files; binds nothing.
+fn cmd_genesis_hash(config_path: String) {
+    match genesis_identity(&config_path) {
+        Ok(summary) => println!("{summary}"),
+        Err(e) => fail_msg("genesis-hash", &e),
+    }
+}
+
+/// M98: decode a `codec::encode_tx` file and render its fields + content hash in human form
+/// — the read-side companion to `encode-tx`. With `pubkey_hex` present, also verify the
+/// ed25519 signature over `tx_signing_bytes` against that account key (a tx file carries no
+/// pubkey; the chain looks it up by `author`, so verification needs the key supplied). The
+/// hash is what the mempool dedups on, so an operator can confirm a file matches an on-chain
+/// tx. Pure (decode/verify only) for unit testing; `cmd_inspect_tx` is the file-reading shell.
+fn inspect_tx(bytes: &[u8], pubkey_hex: Option<&str>) -> Result<String, String> {
+    let tx = zhixing_node::codec::decode_tx(bytes).map_err(|e| format!("decode tx: {e}"))?;
+    let mut out = format!(
+        "hash {}\nauthor {}\ndomain {}\nstake {}\nreviews {}\nrepl {}/{}\ntimestamp_days {}\nembedding_dim {}\nsignature {}\n",
+        hex(&tx.hash()),
+        tx.author,
+        tx.domain,
+        tx.stake,
+        tx.reviews.len(),
+        tx.repl_success,
+        tx.repl_total,
+        tx.timestamp_days,
+        tx.embedding.len(),
+        hex(&tx.signature),
+    );
+    match pubkey_hex {
+        Some(h) => {
+            let pk = config::decode_pubkey(h.trim(), "--pubkey").map_err(|e| format!("{e}"))?;
+            let ok = zhixing_node::crypto::verify(&pk, &zhixing_node::codec::tx_signing_bytes(&tx), &tx.signature);
+            out.push_str(&format!("signature_valid {ok}"));
+        }
+        None => out.push_str("signature_valid unknown (pass --pubkey <hex> to verify)"),
+    }
+    Ok(out)
+}
+
+/// M98: `node inspect-tx --tx F [--pubkey HEX]` — print a decoded tx file (and optionally
+/// verify its signature). Reads only the `--tx` file; binds nothing.
+fn cmd_inspect_tx(args: &[String]) {
+    let tx_path = tx_arg(args);
+    let bytes = std::fs::read(&tx_path).unwrap_or_else(|e| fail("read tx file", e));
+    match inspect_tx(&bytes, opt_arg(args, "--pubkey")) {
+        Ok(summary) => println!("{summary}"),
+        Err(e) => fail_msg("inspect-tx", &e),
+    }
+}
+
+/// M99: derive the ed25519 public-key hex from a 64-hex seed (the format `keygen` writes and
+/// `encode-tx --key-file` consumes). Reuses `config::decode_seed` for identical parsing +
+/// `BadHex` errors. Pure for unit testing.
+fn derive_pubkey(seed_hex: &str, field: &str) -> Result<String, config::ConfigError> {
+    let seed = config::decode_seed(seed_hex.trim(), field)?;
+    Ok(hex(&Keypair::from_seed(seed).public()))
+}
+
+/// M99: `node pubkey (--key-file F | --seed HEX) [--genesis-id N ...]` — derive and print the
+/// pubkey for an existing seed **without writing any file** (unlike `keygen`, which recovers a
+/// pubkey only as a side effect of writing a seed file). Read-only; pairs with
+/// `inspect-tx --pubkey`. With `--genesis-id`, also prints the M95 genesis entry.
+fn cmd_pubkey(args: &[String]) {
+    let (seed_hex, field) = if let Some(s) = opt_arg(args, "--seed") {
+        (s.to_string(), "--seed")
+    } else if let Some(path) = opt_arg(args, "--key-file") {
+        (std::fs::read_to_string(path).unwrap_or_else(|e| fail("read key file", e)), "--key-file")
+    } else {
+        fail_msg("pubkey", &"requires --key-file <path> or --seed <64hex>");
+    };
+    let pub_hex = derive_pubkey(&seed_hex, field).unwrap_or_else(|e| fail_msg("pubkey", &e));
+    println!("pubkey {pub_hex}");
+    if let Some(entries) = keygen_genesis_entries(args, &pub_hex) {
+        print!("{entries}");
+    }
+}
+
+/// M100: render a persisted block log for offline inspection — the read-side companion to
+/// `inspect-tx`, one level up (a block instead of a loose tx). `height == None` lists every
+/// block with its body counts; `Some(h)` prints one block's header (hash, prev, roots,
+/// timestamp) + contents counts + each tx's hash/author. Blocks are matched by their own
+/// `height` field (authoritative), not log index. Pure for unit testing; `cmd_inspect_block`
+/// is the log-reading shell.
+fn inspect_block(blocks: &[Block], height: Option<u64>) -> Result<String, String> {
+    match height {
+        None => {
+            let mut out = format!("blocks {}", blocks.len());
+            for b in blocks {
+                out.push_str(&format!(
+                    "\nheight {} txs {} stake_ops {} evidence {} validator_updates {}",
+                    b.height,
+                    b.txs.len(),
+                    b.stake_ops.len(),
+                    b.slashing_evidence.len(),
+                    b.validator_updates.len(),
+                ));
+            }
+            Ok(out)
+        }
+        Some(h) => {
+            let b = blocks
+                .iter()
+                .find(|b| b.height == h)
+                .ok_or_else(|| format!("no block at height {h} (log has {} block(s))", blocks.len()))?;
+            let mut out = format!(
+                "height {}\nhash {}\nprev_hash {}\ntimestamp_days {}\nstate_root {}\naccounts_root {}\ngraph_root {}\nnext_validators_root {}\n\
+txs {}\nstake_ops {}\nslashing_evidence {}\nvalidator_updates {}\nbridge_locks {}\nbridge_headers {}\nbridge_redeems {}",
+                b.height,
+                hex(&b.hash()),
+                hex(&b.prev_hash),
+                b.timestamp_days,
+                hex(&b.state_root),
+                hex(&b.accounts_root),
+                hex(&b.graph_root),
+                hex(&b.next_validators_root),
+                b.txs.len(),
+                b.stake_ops.len(),
+                b.slashing_evidence.len(),
+                b.validator_updates.len(),
+                b.bridge_locks.len(),
+                b.bridge_headers.len(),
+                b.bridge_redeems.len(),
+            );
+            for (i, tx) in b.txs.iter().enumerate() {
+                out.push_str(&format!("\ntx {i} hash {} author {}", hex(&tx.hash()), tx.author));
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// M100: `node inspect-block --dir DIR [--height N]` — read `{dir}/blocks.log` and print the
+/// [`inspect_block`] rendering. Read-only (opens the log, binds nothing).
+fn cmd_inspect_block(args: &[String]) {
+    let dir = dir_arg(args);
+    let path = format!("{dir}/blocks.log");
+    let log = BlockLog::open(&path).unwrap_or_else(|e| fail("open log", e));
+    let blocks = log.read_all().unwrap_or_else(|e| fail("read log", e));
+    let height = opt_arg(args, "--height")
+        .map(|h| h.parse::<u64>().unwrap_or_else(|_| fail_msg("--height", &format!("`{h}` is not a u64"))));
+    match inspect_block(&blocks, height) {
+        Ok(s) => println!("{s}"),
+        Err(e) => fail_msg("inspect-block", &e),
+    }
+}
+
 fn cmd_run(config_path: String) {
     // M44: load the config first, then install the subscriber from its optional
     // `[logging]` section (absent ⇒ the M37 default). Config-load errors print via
@@ -2959,9 +3175,72 @@ fn keygen_derive(seed: [u8; 32]) -> (String, String) {
     (hex(&seed), hex(&kp.public()))
 }
 
+/// M95: render a ready-to-paste genesis `[[accounts]]` TOML entry. Field names mirror
+/// [`config::AccountConfig`] exactly (`id`/`balance_micro`/`pubkey_hex`), so the output
+/// parses straight back through [`config::load_genesis`]. Pure for direct unit testing.
+fn genesis_account_toml(id: u64, balance_micro: u64, pubkey_hex: &str) -> String {
+    format!("[[accounts]]\nid = {id}\nbalance_micro = {balance_micro}\npubkey_hex = \"{pubkey_hex}\"\n")
+}
+
+/// M95: render a ready-to-paste genesis `[[validators]]` TOML entry, mirroring
+/// [`config::ValidatorConfig`] (`id`/`pubkey_hex`/`power`). Pure for direct unit testing.
+fn genesis_validator_toml(id: u64, pubkey_hex: &str, power: u64) -> String {
+    format!("[[validators]]\nid = {id}\npubkey_hex = \"{pubkey_hex}\"\npower = {power}\n")
+}
+
+/// M95: optional genesis-entry emission for `cmd_keygen`. When `--genesis-id <id>` is
+/// given, build the `[[accounts]]` block (`--balance <micro>`, default 0) and, if
+/// `--power <p>` is also given, the `[[validators]]` block. Returns `None` when
+/// `--genesis-id` is absent (keygen keeps its original output). Pure for unit testing
+/// (parsing is isolated here; `cmd_keygen` only prints the result).
+fn keygen_genesis_entries(args: &[String], pubkey_hex: &str) -> Option<String> {
+    let id = opt_arg(args, "--genesis-id")?;
+    let id = id.parse::<u64>().unwrap_or_else(|_| fail_msg("--genesis-id", &format!("`{id}` is not a u64")));
+    let balance = match opt_arg(args, "--balance") {
+        Some(b) => b.parse::<u64>().unwrap_or_else(|_| fail_msg("--balance", &format!("`{b}` is not a u64"))),
+        None => 0,
+    };
+    let mut out = String::from("# genesis entry (paste into genesis.toml)\n");
+    out.push_str(&genesis_account_toml(id, balance, pubkey_hex));
+    if let Some(p) = opt_arg(args, "--power") {
+        let power = p.parse::<u64>().unwrap_or_else(|_| fail_msg("--power", &format!("`{p}` is not a u64")));
+        out.push('\n');
+        out.push_str(&genesis_validator_toml(id, pubkey_hex, power));
+    }
+    Some(out)
+}
+
+/// M94: write a private-key seed file with owner-only (`0600`) permissions. A key seed must
+/// never be world-readable: on Unix the file is *created* with mode `0600` (via
+/// `OpenOptionsExt::mode`, so there is no world-readable window between create and chmod),
+/// and `0600` is re-asserted afterwards to cover the case where the path already existed with
+/// wider bits (where the creation `mode` is a no-op). On non-Unix targets it falls back to a
+/// plain write (the platform has no POSIX mode to set).
+#[cfg(unix)]
+fn write_key_file(path: &str, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(contents.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_key_file(path: &str, contents: &str) -> std::io::Result<()> {
+    std::fs::write(path, contents)
+}
+
 /// M73: generate (or derive from `--seed <64hex>`) an ed25519 keypair offline.
 /// Writes the 64-hex seed to `--out` (consumable by `encode-tx --key-file`) and
 /// prints the derived pubkey hex (paste into a genesis `accounts` entry).
+/// M94: the seed file is written `0600` (owner-only) — see [`write_key_file`].
+/// M95: with `--genesis-id <id>` (+ optional `--balance`/`--power`), also print a
+/// ready-to-paste genesis `[[accounts]]` (and `[[validators]]`) TOML entry.
 fn cmd_keygen(args: &[String]) {
     let out_path = req_arg(args, "--out");
 
@@ -2978,9 +3257,12 @@ fn cmd_keygen(args: &[String]) {
     };
 
     let (seed_hex, pub_hex) = keygen_derive(seed);
-    std::fs::write(out_path, &seed_hex).unwrap_or_else(|e| fail("write key file", e));
+    write_key_file(out_path, &seed_hex).unwrap_or_else(|e| fail("write key file", e));
     println!("pubkey {pub_hex}");
     println!("out {out_path}");
+    if let Some(entries) = keygen_genesis_entries(args, &pub_hex) {
+        print!("{entries}");
+    }
 }
 
 /// End-to-end showcase on the production path: launch a small tokio testnet
@@ -3395,5 +3677,386 @@ mod tests {
         assert_eq!(keygen_derive(seed), (seed_hex, pub_hex));
         // Distinct seeds ⇒ distinct pubkeys.
         assert_ne!(keygen_derive(seed_for(7)).1, keygen_derive(seed_for(8)).1);
+    }
+
+    // M94: a unique temp path per test case (no external tempfile dependency).
+    #[cfg(unix)]
+    fn tmp_key_path(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("zx-keyfile-{}-{}-{tag}", std::process::id(), line!()));
+        p
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_file_is_written_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_key_path("fresh");
+        let p = path.to_str().unwrap();
+        let _ = std::fs::remove_file(p);
+        write_key_file(p, "deadbeef").expect("write");
+        // A freshly created key file is owner-rw only (no group/other bits).
+        let mode = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "fresh key file must be 0600, got {mode:o}");
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "deadbeef");
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_file_overwrite_retightens_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_key_path("overwrite");
+        let p = path.to_str().unwrap();
+        // Pre-create a world-readable file: the creation `mode` would be a no-op, so the
+        // explicit re-assert is what must re-tighten it to 0600.
+        std::fs::write(p, "old").unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_key_file(p, "cafe").expect("overwrite");
+        let mode = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "overwrite must re-tighten to 0600, got {mode:o}");
+        // Content is fully replaced (truncated), not appended.
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "cafe");
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_file_round_trips_through_seed_decoder() {
+        // The 0600-written seed hex is still consumable by the `--seed` / `--key-file` decoder.
+        let path = tmp_key_path("roundtrip");
+        let p = path.to_str().unwrap();
+        let _ = std::fs::remove_file(p);
+        let seed = seed_for(42);
+        let (seed_hex, _pub_hex) = keygen_derive(seed);
+        write_key_file(p, &seed_hex).expect("write");
+        let read_back = std::fs::read_to_string(p).unwrap();
+        assert_eq!(config::decode_seed(read_back.trim(), "--seed").expect("decode"), seed);
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn genesis_entry_toml_renders_expected() {
+        // M95: the emitted fragments use the exact field names the genesis parser expects.
+        assert_eq!(
+            genesis_account_toml(7, 1_000_000, "ab12"),
+            "[[accounts]]\nid = 7\nbalance_micro = 1000000\npubkey_hex = \"ab12\"\n"
+        );
+        assert_eq!(
+            genesis_validator_toml(7, "ab12", 5),
+            "[[validators]]\nid = 7\npubkey_hex = \"ab12\"\npower = 5\n"
+        );
+    }
+
+    #[test]
+    fn keygen_genesis_entries_gated_on_id() {
+        // M95: no `--genesis-id` ⇒ no genesis output (keygen keeps its original two lines).
+        let none: Vec<String> = vec!["--out".into(), "k".into()];
+        assert_eq!(keygen_genesis_entries(&none, "ab12"), None);
+
+        // `--genesis-id` alone ⇒ an accounts block (balance defaults to 0), no validators.
+        let acct: Vec<String> = vec!["--genesis-id".into(), "7".into()];
+        let out = keygen_genesis_entries(&acct, "ab12").expect("some");
+        assert!(out.contains("[[accounts]]\nid = 7\nbalance_micro = 0\npubkey_hex = \"ab12\"\n"), "{out}");
+        assert!(!out.contains("[[validators]]"), "no power ⇒ no validator block: {out}");
+
+        // `--balance` + `--power` ⇒ both blocks, with the given values.
+        let full: Vec<String> =
+            vec!["--genesis-id".into(), "7".into(), "--balance".into(), "42".into(), "--power".into(), "9".into()];
+        let out = keygen_genesis_entries(&full, "ab12").expect("some");
+        assert!(out.contains("balance_micro = 42"), "{out}");
+        assert!(out.contains("[[validators]]\nid = 7\npubkey_hex = \"ab12\"\npower = 9\n"), "{out}");
+    }
+
+    #[test]
+    fn keygen_genesis_entry_round_trips_through_loader() {
+        // M95: a complete genesis built from the emitted entries parses back through
+        // `config::load_genesis` → `to_genesis`, recovering the id/balance/pubkey/power.
+        let (_seed_hex, pub_hex) = keygen_derive(seed_for(11));
+        let args: Vec<String> =
+            vec!["--genesis-id".into(), "3".into(), "--balance".into(), "500".into(), "--power".into(), "2".into()];
+        let entries = keygen_genesis_entries(&args, &pub_hex).expect("some");
+        let toml = format!("base_emission_micro = 1000\nslash_bps = 500\n{entries}");
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("zx-genesis-{}-{}.toml", std::process::id(), line!()));
+        let p = path.to_str().unwrap();
+        std::fs::write(p, &toml).unwrap();
+        let g = config::load_genesis(p).expect("load_genesis").to_genesis().expect("to_genesis");
+        let _ = std::fs::remove_file(p);
+
+        assert_eq!(g.accounts.len(), 1);
+        assert_eq!(g.accounts[0].0, 3);
+        assert_eq!(g.accounts[0].1, 500);
+        assert_eq!(hex(&g.accounts[0].2), pub_hex);
+        assert_eq!(g.validators.len(), 1);
+        assert_eq!(g.validators[0].0, 3);
+        assert_eq!(hex(&g.validators[0].1), pub_hex);
+        assert_eq!(g.validators[0].2, 2);
+    }
+
+    // M96: write a (genesis.toml, node config) pair into a unique temp dir; return the
+    // config path. `genesis` is an absolute path so the load is CWD-independent.
+    fn write_check_config_fixture(tag: &str, genesis_body: &str, validator_section: &str) -> (String, std::path::PathBuf) {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("zx-checkcfg-{}-{}-{tag}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gpath = dir.join("genesis.toml");
+        std::fs::write(&gpath, genesis_body).unwrap();
+        let cfg = format!(
+            "genesis = \"{}\"\n[node]\nid = 1\nlisten = \"127.0.0.1:9021\"\ndata_dir = \"{}/data\"\n{validator_section}",
+            gpath.to_str().unwrap(),
+            dir.to_str().unwrap(),
+        );
+        let cpath = dir.join("node.toml");
+        std::fs::write(&cpath, cfg).unwrap();
+        (cpath.to_str().unwrap().to_string(), dir)
+    }
+
+    fn valid_genesis_body(pub_hex: &str) -> String {
+        format!(
+            "base_emission_micro = 1000\nslash_bps = 500\n\
+[[accounts]]\nid = 1\nbalance_micro = 1000000\npubkey_hex = \"{pub_hex}\"\n\
+[[validators]]\nid = 1\npubkey_hex = \"{pub_hex}\"\npower = 1\n"
+        )
+    }
+
+    #[test]
+    fn check_config_ok_for_follower() {
+        // M96: a valid config with no `[validator]` section ⇒ Ok, role "follower", with the
+        // genesis entity counts summarized.
+        let (seed_hex, pub_hex) = keygen_derive(seed_for(1));
+        let _ = seed_hex;
+        let (cpath, dir) = write_check_config_fixture("follower", &valid_genesis_body(&pub_hex), "");
+        let summary = check_config(&cpath).expect("valid config");
+        assert!(summary.starts_with("ok config "), "{summary}");
+        assert!(summary.contains("\nrole follower\n"), "{summary}");
+        assert!(summary.contains("\naccounts 1\n"), "{summary}");
+        assert!(summary.contains("\nvalidators 1"), "{summary}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_config_ok_for_validator() {
+        // M96: an enabled `[validator]` with a valid seed ⇒ Ok, role "validator" (the key
+        // material is decoded as part of the dry-run).
+        let (seed_hex, pub_hex) = keygen_derive(seed_for(1));
+        let vsec = format!("[validator]\nenabled = true\nseed_hex = \"{seed_hex}\"\n");
+        let (cpath, dir) = write_check_config_fixture("validator", &valid_genesis_body(&pub_hex), &vsec);
+        let summary = check_config(&cpath).expect("valid validator config");
+        assert!(summary.contains("\nrole validator\n"), "{summary}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_config_surfaces_bad_genesis() {
+        // M96: a malformed genesis (non-hex pubkey) ⇒ Err, returned (not a panic/exit) so the
+        // dry-run reports the typed error rather than failing at daemon start.
+        let bad = "base_emission_micro = 1000\nslash_bps = 500\n\
+[[accounts]]\nid = 1\nbalance_micro = 1\npubkey_hex = \"nothex\"\n";
+        let (cpath, dir) = write_check_config_fixture("badgenesis", bad, "");
+        assert!(check_config(&cpath).is_err(), "bad genesis pubkey must fail the dry-run");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn genesis_hash_is_deterministic_and_matches_chainstate() {
+        // M97: the printed genesis_hash equals what `ChainState::genesis` stamps, and the same
+        // genesis yields the same identity every time.
+        let (_seed_hex, pub_hex) = keygen_derive(seed_for(1));
+        let body = valid_genesis_body(&pub_hex);
+        let (cpath, dir) = write_check_config_fixture("gh", &body, "");
+        let out = genesis_identity(&cpath).expect("valid genesis");
+
+        // Independently stamp the same genesis and confirm the hash line matches.
+        let genesis = config::load_genesis(&format!("{}/genesis.toml", dir.to_str().unwrap()))
+            .expect("load")
+            .to_genesis()
+            .expect("to_genesis");
+        let (_state, gh) = ChainState::genesis(genesis);
+        assert!(out.contains(&format!("genesis_hash {}\n", hex(&gh))), "{out}");
+        assert!(out.contains("\nvalidators 1"), "{out}");
+        // Deterministic: a second run over the same config prints identical output.
+        assert_eq!(genesis_identity(&cpath).expect("again"), out);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn genesis_hash_differs_for_different_genesis() {
+        // M97: changing the genesis (a different account pubkey) changes the genesis_hash —
+        // the identity is a function of the genesis contents.
+        let (_s1, pub_a) = keygen_derive(seed_for(1));
+        let (_s2, pub_b) = keygen_derive(seed_for(2));
+        let (cpath_a, dir_a) = write_check_config_fixture("gha", &valid_genesis_body(&pub_a), "");
+        let (cpath_b, dir_b) = write_check_config_fixture("ghb", &valid_genesis_body(&pub_b), "");
+        let a = genesis_identity(&cpath_a).expect("a");
+        let b = genesis_identity(&cpath_b).expect("b");
+        assert_ne!(a, b, "distinct genesis ⇒ distinct identity");
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
+    fn genesis_hash_surfaces_bad_genesis() {
+        // M97: a malformed genesis is reported as a typed error (not a panic/exit).
+        let bad = "base_emission_micro = 1000\nslash_bps = 500\n\
+[[accounts]]\nid = 1\nbalance_micro = 1\npubkey_hex = \"nothex\"\n";
+        let (cpath, dir) = write_check_config_fixture("ghbad", bad, "");
+        assert!(genesis_identity(&cpath).is_err(), "bad genesis must fail");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // M98: build a signed tx and its canonical encoding for inspect-tx tests.
+    fn signed_tx_bytes(author: u64, kp: &Keypair) -> Vec<u8> {
+        let tx = SubmissionTx {
+            author,
+            embedding: [0.0f32; DIM],
+            domain: 2,
+            stake: 1000,
+            reviews: vec![],
+            repl_success: 1,
+            repl_total: 2,
+            timestamp_days: 10.0,
+            signature: [0u8; 64],
+        }
+        .signed(kp);
+        zhixing_node::codec::encode_tx(&tx)
+    }
+
+    #[test]
+    fn inspect_tx_renders_fields_and_hash() {
+        // M98: a decoded tx prints its fields + content hash; without a pubkey the signature
+        // validity is reported as unknown (a tx file carries no key).
+        let kp = Keypair::from_seed(seed_for(1));
+        let bytes = signed_tx_bytes(5, &kp);
+        let out = inspect_tx(&bytes, None).expect("decode");
+        assert!(out.contains("author 5\n"), "{out}");
+        assert!(out.contains("domain 2\n"), "{out}");
+        assert!(out.contains("stake 1000\n"), "{out}");
+        assert!(out.contains(&format!("embedding_dim {DIM}\n")), "{out}");
+        // The printed hash matches the tx's own content hash.
+        let tx = zhixing_node::codec::decode_tx(&bytes).unwrap();
+        assert!(out.contains(&format!("hash {}\n", hex(&tx.hash()))), "{out}");
+        assert!(out.contains("signature_valid unknown"), "{out}");
+    }
+
+    #[test]
+    fn inspect_tx_verifies_signature_with_pubkey() {
+        // M98: with the author's pubkey, the correct key verifies true and a wrong key false.
+        let kp = Keypair::from_seed(seed_for(1));
+        let bytes = signed_tx_bytes(5, &kp);
+        let good = inspect_tx(&bytes, Some(&hex(&kp.public()))).expect("decode");
+        assert!(good.contains("signature_valid true"), "{good}");
+        let wrong = Keypair::from_seed(seed_for(2));
+        let bad = inspect_tx(&bytes, Some(&hex(&wrong.public()))).expect("decode");
+        assert!(bad.contains("signature_valid false"), "{bad}");
+    }
+
+    #[test]
+    fn inspect_tx_surfaces_decode_and_pubkey_errors() {
+        // M98: undecodable bytes ⇒ Err; a decodable tx with a malformed --pubkey ⇒ Err.
+        assert!(inspect_tx(b"not a tx", None).is_err(), "garbage must fail to decode");
+        let kp = Keypair::from_seed(seed_for(1));
+        let bytes = signed_tx_bytes(5, &kp);
+        assert!(inspect_tx(&bytes, Some("nothex")).is_err(), "bad pubkey must error");
+    }
+
+    #[test]
+    fn derive_pubkey_matches_keygen() {
+        // M99: deriving the pubkey from a seed hex equals both the direct Keypair API and the
+        // keygen path's pubkey for the same seed.
+        let seed = seed_for(5);
+        let (seed_hex, pub_hex) = keygen_derive(seed);
+        assert_eq!(derive_pubkey(&seed_hex, "--seed").expect("derive"), pub_hex);
+        assert_eq!(derive_pubkey(&seed_hex, "--seed").expect("derive"), hex(&Keypair::from_seed(seed).public()));
+        // A trailing newline (as a key file carries) is tolerated.
+        assert_eq!(derive_pubkey(&format!("{seed_hex}\n"), "--key-file").expect("derive"), pub_hex);
+    }
+
+    #[test]
+    fn derive_pubkey_surfaces_bad_seed() {
+        // M99: a non-hex / wrong-length seed is a typed error (not a panic).
+        assert!(derive_pubkey("nothex", "--seed").is_err());
+        assert!(derive_pubkey("abcd", "--seed").is_err(), "too short must fail");
+    }
+
+    #[test]
+    fn derive_pubkey_reads_keygen_written_file() {
+        // M99: the pubkey derived from a seed file written by `write_key_file` (the keygen
+        // path) matches the expected pubkey — `node pubkey --key-file` round-trips keygen's out.
+        let seed = seed_for(9);
+        let (seed_hex, pub_hex) = keygen_derive(seed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("zx-pubkey-{}-{}.key", std::process::id(), line!()));
+        let p = path.to_str().unwrap();
+        write_key_file(p, &seed_hex).expect("write");
+        let contents = std::fs::read_to_string(p).unwrap();
+        assert_eq!(derive_pubkey(&contents, "--key-file").expect("derive"), pub_hex);
+        let _ = std::fs::remove_file(p);
+    }
+
+    // M100: a block with zeroed roots + empty body vectors, carrying `txs`, for inspect-block.
+    fn test_block(height: u64, txs: Vec<SubmissionTx>) -> Block {
+        Block {
+            height,
+            prev_hash: [0u8; 32],
+            timestamp_days: 0.0,
+            next_validators_root: [0u8; 32],
+            state_root: [height as u8; 32],
+            accounts_root: [0u8; 32],
+            graph_root: [0u8; 32],
+            bridge_root: [0u8; 32],
+            txs,
+            validator_updates: vec![],
+            stake_ops: vec![],
+            slashing_evidence: vec![],
+            bridge_locks: vec![],
+            bridge_headers: vec![],
+            bridge_redeems: vec![],
+        }
+    }
+
+    fn test_tx(author: u64) -> SubmissionTx {
+        SubmissionTx {
+            author,
+            embedding: [0.0f32; DIM],
+            domain: 1,
+            stake: 100,
+            reviews: vec![],
+            repl_success: 0,
+            repl_total: 0,
+            timestamp_days: 0.0,
+            signature: [0u8; 64],
+        }
+        .signed(&Keypair::from_seed(seed_for(author)))
+    }
+
+    #[test]
+    fn inspect_block_lists_all_blocks() {
+        // M100: with no --height, a one-line summary per block (body counts) + a header count.
+        let blocks = vec![test_block(1, vec![test_tx(5)]), test_block(2, vec![])];
+        let out = inspect_block(&blocks, None).expect("list");
+        assert!(out.starts_with("blocks 2\n"), "{out}");
+        assert!(out.contains("height 1 txs 1 stake_ops 0 evidence 0 validator_updates 0"), "{out}");
+        assert!(out.contains("height 2 txs 0 stake_ops 0 evidence 0 validator_updates 0"), "{out}");
+    }
+
+    #[test]
+    fn inspect_block_detail_prints_header_and_txs() {
+        // M100: --height prints the block's header (hash/prev/roots) + contents + each tx.
+        let tx = test_tx(5);
+        let b = test_block(1, vec![tx.clone()]);
+        let out = inspect_block(std::slice::from_ref(&b), Some(1)).expect("detail");
+        assert!(out.starts_with("height 1\n"), "{out}");
+        assert!(out.contains(&format!("hash {}\n", hex(&b.hash()))), "{out}");
+        assert!(out.contains("txs 1\n"), "{out}");
+        assert!(out.contains(&format!("tx 0 hash {} author 5", hex(&tx.hash()))), "{out}");
+    }
+
+    #[test]
+    fn inspect_block_missing_height_errors() {
+        // M100: a height with no block is a returned error (not a panic).
+        let blocks = vec![test_block(1, vec![])];
+        assert!(inspect_block(&blocks, Some(99)).is_err(), "missing height must error");
     }
 }

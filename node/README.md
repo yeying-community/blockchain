@@ -879,6 +879,195 @@ M84 用 `/accounts` 把通用分页栈接到**第三个**消费者。M85 加**�
 
 **已知边界（顺延至 M86+）**：读面篮子剩余：其余列表读（graph nodes、unbonding、bonds、pending txs/evidence、peers）、游标分页、`Accept-Encoding`（压缩须引新依赖）；keygen 篮子（助记词 / BIP-39、口令 keystore、现成 genesis 条目、密钥轮换、keyfile `0600`）；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放；连同运维篮子：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图。
 
+## 认知图节点列表 `GET /graph`（Milestone 86）
+
+M85 用 `/reviewers` 把通用分页栈接到**第四个**消费者。M86 加**第五个**分页列表读——`GET /graph`——未验证的认知图目录（node_id + domain + embedding），是 `/graph/{id}` plain 单读（M65）的 list 兄弟，也是读面篮子里 graph nodes 一项、且代码最少：单项渲染器 `format_entity`/`json_entity`（`EntityView::GraphNode`）**早已存在**，M86 只加一条路由臂、一个 `Cmd`、一个 actor handler、两个薄列表包装。无 listing 之外的新读语义、**无新依赖**（JSON 仍手搓无 `serde_json`）、无 wire/共识/状态变更，`[rpc]`/`localnet` head 不变量（`44309755…ea04ba`，RPC 默认关）不受影响——纯读面。
+
+- **路由**：`enum GetRoute` 加 `GraphNodes`；`route_get` 在 `/reviewers` 臂之后加精确臂 `"/graph" => GetRoute::GraphNodes`。`/graph/`（单读/证明）仍走 fallthrough 的 `/graph/` 前缀臂——`/graph/`（空 id）在那里 `"".parse::<u64>()` 失败即 `NotFound`（与 M85 `/reviewers/` 落 `Health` 的差异：graph 有前缀臂先接管尾斜杠），既有 `route_get("/graph/")` ⇒ `NotFound` 测无回归。
+- **Cmd + actor**：`Cmd::QueryGraphNodes { reply: oneshot::Sender<Vec<crate::engine::GraphNode>> }`，actor 直读 state——快照 `actor.node.chain.state.graph.nodes`（插入序 `Vec<GraphNode>`，M25 不变量下 `node_id == 索引`、单调且不可变），无需新 `net.rs` accessor。
+- **渲染器**：薄包装把既有单项渲染器 map 过一页——`format_graph_listing` 每节点一行 `format_entity`（`kind=graph node_id=… domain=… dim=… embedding=…`，空集 ⇒ `""`）；`json_graph_listing` 一个 JSON 数组对象（空集 ⇒ `[]`），镜像 lock/validator/account/reviewer 列表、与单读 `/graph/{id}` 逐字节同形。
+- **Handler**：`GetRoute::GraphNodes` 臂是 `Reviewers` 的近逐字拷贝——发 `Cmd::QueryGraphNodes`，同一 `offset`/`limit`/`total`/`page`/`next` 块，收尾 `ok_body(fmt, &format_page(&format_graph_listing(page), …), &json_page(&json_graph_listing(page), …))`。
+- **测试（+3 → 427）**：新纯 `route_get_parses_graph`（`/graph` ⇒ `GraphNodes`、`/graph/` ⇒ `NotFound`、`/graph/0`·`/graph/0/proof` 无回归）、新纯 `graph_listing_renders`（两节点 + 空集，断言精确文本行与 JSON 数组、embedding 数组、复用 `EntityView::GraphNode`），新 TCP `rpc_graph_list_over_tcp`（`test_genesis` 单 seed 节点 node_id 0 @ `unit(0)`：`/graph` ⇒ `total=1` + 一行；`?format=json` ⇒ `{"total":"1","next":null,"items":[…]}`；`?offset=1` ⇒ `total=1` 空页）。
+- **不变量保持**：纯列表渲染增量、无 `serde_json`、无引擎 / codec / crypto / wire / 共识变更、无新依赖，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M87+）**：读面篮子剩余：其余列表读（unbonding、bonds、pending txs/evidence、peers）、游标分页、`Accept-Encoding`（压缩须引新依赖）；keygen 篮子（助记词 / BIP-39、口令 keystore、现成 genesis 条目、密钥轮换、keyfile `0600`）；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放；连同运维篮子：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图。
+
+## 验证人质押列表 `GET /bonds`（Milestone 87）
+
+M83–M86 把通用分页栈接到 `/validators`、`/accounts`、`/reviewers`、`/graph` 四个消费者；M87 加**第六个**分页列表读——`GET /bonds`——每验证人的**绑定质押**目录（validator_id + bonded micro-$COG）。它是 `/validators`（M83）的读兄弟但**不是** list 兄弟：`/validators` 读的是**投票权**（`power`），`/bonds` 读的是支撑该权重的**原始质押额**（`state.bonds`，恒等映射 `power == bonded`，但语义层不同——前者是共识视角、后者是资金视角）；无单读兄弟（不存在 `/bond/{id}`）。读面篮子里 bonds 一项就此落地。与 M84–M86 复用既有单项渲染器不同，bond 是**普通状态值**而非 merkle 证明实体，故不进 `EntityView`，而新增一对**独立**单项渲染器。无 listing 之外的新读语义、**无新依赖**（JSON 仍手搓无 `serde_json`）、无 wire/共识/状态变更，`[rpc]`/`localnet` head 不变量（`44309755…ea04ba`，RPC 默认关）不受影响——纯读面。
+
+- **路由**：`enum GetRoute` 加 `Bonds`；`route_get` 在 `/graph` 臂之后加精确臂 `"/bonds" => GetRoute::Bonds`。无 `/bond/` 单读前缀，故 `/bonds/`（尾斜杠）简单回落 `Health`（与 `/accounts/`、`/reviewers/` 同，而非 `/graph/` 的 `NotFound`——后者有 `/graph/` 前缀臂先接管）。
+- **Cmd + actor**：`Cmd::QueryBonds { reply: oneshot::Sender<Vec<(u64, u64)>> }`，actor 直读 state——快照 `actor.node.chain.state.bonds`（`BTreeMap<u64, u64>`，id 升序，validator_id → 绑定 micro-$COG）为 `Vec<(u64, u64)>`，无需新 `net.rs` accessor。
+- **渲染器**：新增**独立**单项渲染器 `format_bond`（`kind=bond validator_id=… bonded=…`）/`json_bond`（`{"kind":"bond","validator_id":…,"bonded":…}`，lossless 引号 u64），`kind=` 标签与其余列表读项同形但不复用 `format_entity`（bond 非证明实体）；薄包装 `format_bond_listing`（空集 ⇒ `""`）/`json_bond_listing`（空集 ⇒ `[]`）把单项 map 过一页。
+- **Handler**：`GetRoute::Bonds` 臂是 `GraphNodes` 的近逐字拷贝——发 `Cmd::QueryBonds`，同一 `offset`/`limit`/`total`/`page`/`next` 块，收尾 `ok_body(fmt, &format_page(&format_bond_listing(page), …), &json_page(&json_bond_listing(page), …))`。
+- **测试（+3 → 430）**：新纯 `route_get_parses_bonds`（`/bonds` ⇒ `Bonds`、`/bonds/` ⇒ `Health`、`/validators`·`/accounts` 无回归）、新纯 `bond_listing_renders`（两验证人 + 空集，断言精确文本行、JSON 数组、单项渲染器一致、空集 `""`/`[]`），新 TCP `rpc_bonds_list_over_tcp`——创世只直接置验证人集（给 `power` 而非 `bonds`），`state.bonds` 仅由链上 `StakeOp` 生长，故新链 `/bonds` 是 **live-but-empty**：端到端断言 `/bonds` ⇒ `total=0` 空体、`?format=json` ⇒ `{"total":"0","next":null,"items":[]}`（路由 → Cmd → `state.bonds` 快照 → 分页信封 → 内容协商全程走通，只是目录恰为空）。
+- **不变量保持**：纯列表渲染增量、无 `serde_json`、无引擎 / codec / crypto / wire / 共识变更、无新依赖，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M88+）**：读面篮子剩余：其余列表读（unbonding、pending txs/evidence、peers）、游标分页、`Accept-Encoding`（压缩须引新依赖）；keygen 篮子（助记词 / BIP-39、口令 keystore、现成 genesis 条目、密钥轮换、keyfile `0600`）；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放；连同运维篮子：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图。
+
+## 解绑队列列表 `GET /unbonding`（Milestone 88）
+
+M87 用 `/bonds` 读到验证人的**在押**质押；M88 加**第七个**分页列表读——`GET /unbonding`——质押生命周期的**另一端**：解绑延迟队列（account + amount + mature_height）。`Unbond` 质押 op 不立即返还资金，而是排进一条时间锁提款队列（`UNBONDING_PERIOD = 3` 个高度，资金留池、期间仍可被罚没、到期才返还余额）；`/unbonding` 把这条队列读出来，是 `/bonds`（M87）在质押生命周期上的读兄弟、无单读兄弟。读面篮子里 unbonding 一项就此落地。与 M87 一样，解绑条目是**普通状态值**而非 merkle 证明实体，故不进 `EntityView`，新增一对**独立**单项渲染器。无 listing 之外的新读语义、**无新依赖**（JSON 仍手搓无 `serde_json`）、无 wire/共识/状态变更，`[rpc]`/`localnet` head 不变量（`44309755…ea04ba`，RPC 默认关）不受影响——纯读面。
+
+- **路由**：`enum GetRoute` 加 `Unbonding`；`route_get` 在 `/bonds` 臂之后加精确臂 `"/unbonding" => GetRoute::Unbonding`。无 `/unbonding/` 单读前缀，故 `/unbonding/`（尾斜杠）回落 `Health`（与 `/bonds/`、`/accounts/` 同）。
+- **Cmd + actor**：`Cmd::QueryUnbonding { reply: oneshot::Sender<Vec<crate::UnbondingEntry>> }`，actor 直读 state——快照 `actor.node.chain.state.unbonding`（`Vec<UnbondingEntry>`，入列序），无需新 `net.rs` accessor。
+- **渲染器**：新增**独立**单项渲染器 `format_unbonding`（`kind=unbonding account=… amount=… mature_height=…`）/`json_unbonding`（`{"kind":"unbonding","account":…,"amount":…,"mature_height":…}`，lossless 引号 u64）；薄包装 `format_unbonding_listing`（空集 ⇒ `""`）/`json_unbonding_listing`（空集 ⇒ `[]`）把单项 map 过一页。
+- **Handler**：`GetRoute::Unbonding` 臂是 `Bonds` 的近逐字拷贝——发 `Cmd::QueryUnbonding`，同一 `offset`/`limit`/`total`/`page`/`next` 块，收尾 `ok_body(fmt, &format_page(&format_unbonding_listing(page), …), &json_page(&json_unbonding_listing(page), …))`。
+- **测试（+3 → 433）**：新纯 `route_get_parses_unbonding`（`/unbonding` ⇒ `Unbonding`、`/unbonding/` ⇒ `Health`、`/bonds`·`/validators` 无回归）、新纯 `unbonding_listing_renders`（两条队列项 + 空集，断言精确文本行、JSON 数组、单项渲染器一致、空集 `""`/`[]`），新 TCP `rpc_unbonding_list_over_tcp`——队列仅由链上 `Unbond` op 入列，故新链 `/unbonding` 是 **live-but-empty**：端到端断言 `/unbonding` ⇒ `total=0` 空体、`?format=json` ⇒ `{"total":"0","next":null,"items":[]}`。
+- **不变量保持**：纯列表渲染增量、无 `serde_json`、无引擎 / codec / crypto / wire / 共识变更、无新依赖，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M89+）**：读面篮子剩余：其余列表读（pending txs/evidence、peers）、游标分页、`Accept-Encoding`（压缩须引新依赖）；keygen 篮子（助记词 / BIP-39、口令 keystore、现成 genesis 条目、密钥轮换、keyfile `0600`）；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放；连同运维篮子：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图。
+
+## 待处理质押池列表 `GET /stake-ops`（Milestone 89）
+
+M83–M88 的七个列表读都读**已提交状态**（验证人集、账户、审阅人、图节点、绑定、解绑队列）；M89 加**第八个**分页列表读——`GET /stake-ops`——首个**待处理池**读：暂存于下一提议区块的待处理质押 op 池（`node.pending_stake_ops()`）。质押 op（`Bond`/`Unbond`）经 gossip 到达验证人后先入 `pending_stake_ops` 暂存池，出块时才折入区块；`/stake-ops` 把这个池读出来——`metrics` 早已以 `zhixing_pending_stake_ops` 计数暴露其**大小**，M89 让其**内容**可读。无单读兄弟。读面篮子里 pending 一项（stake ops 支）就此落地。无 listing 之外的新读语义、**无新依赖**（JSON 仍手搓无 `serde_json`）、无 wire/共识/状态变更，`[rpc]`/`localnet` head 不变量（`44309755…ea04ba`，RPC 默认关）不受影响——纯读面。
+
+- **路由**：`enum GetRoute` 加 `StakeOps`；`route_get` 在 `/unbonding` 臂之后加精确臂 `"/stake-ops" => GetRoute::StakeOps`。无 `/stake-op/` 单读前缀，故 `/stake-ops/`（尾斜杠）回落 `Health`（与 `/bonds/`、`/unbonding/` 同）。
+- **Cmd + actor**：`Cmd::QueryStakeOps { reply: oneshot::Sender<Vec<crate::StakeOp>> }`，actor 读 `actor.node.pending_stake_ops()`（既有 `&[StakeOp]` 只读视图，M35 起就有，metrics 已用）`.to_vec()` 快照，无需新 `net.rs` accessor。
+- **渲染器**：新增文本渲染器 `format_stake_op`（`account=… kind=bond|unbond amount=… signature=…`，逐字段镜像既有 `json_stake_op`——`kind` 是 bond/unbond 判别而非类型标签）；JSON 侧**直接复用**既有 `json_stake_op`（M78 已有）。薄包装 `format_stakeop_listing`（空集 ⇒ `""`）/`json_stakeop_listing`（空集 ⇒ `[]`）把单项 map 过一页。
+- **Handler**：`GetRoute::StakeOps` 臂是 `Unbonding` 的近逐字拷贝——发 `Cmd::QueryStakeOps`，同一 `offset`/`limit`/`total`/`page`/`next` 块，收尾 `ok_body(fmt, &format_page(&format_stakeop_listing(page), …), &json_page(&json_stakeop_listing(page), …))`。
+- **测试（+3 → 436）**：新纯 `route_get_parses_stake_ops`（`/stake-ops` ⇒ `StakeOps`、`/stake-ops/` ⇒ `Health`、`/unbonding`·`/bonds` 无回归）、新纯 `stakeop_listing_renders`（两条 op（bond+unbond）+ 空集，断言精确文本行、JSON 逐项等于 `json_stake_op`、空集 `""`/`[]`），新 TCP `rpc_stake_ops_list_over_tcp`——池仅由链上 `StakeOp` 暂存入列，故新链 `/stake-ops` 是 **live-but-empty**：端到端断言 `/stake-ops` ⇒ `total=0` 空体、`?format=json` ⇒ `{"total":"0","next":null,"items":[]}`。
+- **不变量保持**：纯列表渲染增量、无 `serde_json`、无引擎 / codec / crypto / wire / 共识变更、无新依赖，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M90+）**：读面篮子剩余：其余列表读（pending evidence、peers）、游标分页、`Accept-Encoding`（压缩须引新依赖）；keygen 篮子（助记词 / BIP-39、口令 keystore、现成 genesis 条目、密钥轮换、keyfile `0600`）；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放；连同运维篮子：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图。
+
+## 待处理罚没证据池列表 `GET /evidence`（Milestone 90）
+
+M89 读了待处理质押 op 池；M90 加**第九个**分页列表读——`GET /evidence`——第二个**待处理池**读：暂存于下一提议区块的待处理罚没证据池（`node.pending_evidence()`）。罚没证据（一对冲突的 precommit 投票，证明某验证人在同一 `(height, round)` 对两个不同区块哈希双签）经 gossip 到达验证人后先入 `pending_evidence` 暂存池，出块时才折入区块；`/evidence` 把这个池读出来——`metrics` 早已以 `zhixing_pending_evidence` 计数暴露其**大小**，M90 让其**内容**可读。无单读兄弟。读面篮子里 pending 一项（evidence 支）就此落地。无 listing 之外的新读语义、**无新依赖**（JSON 仍手搓无 `serde_json`）、无 wire/共识/状态变更，`[rpc]`/`localnet` head 不变量（`44309755…ea04ba`，RPC 默认关）不受影响——纯读面。
+
+- **路由**：`enum GetRoute` 加 `Evidence`；`route_get` 在 `/stake-ops` 臂之后加精确臂 `"/evidence" => GetRoute::Evidence`。无 `/evidence/` 单读前缀，故 `/evidence/`（尾斜杠）回落 `Health`（与 `/stake-ops/`、`/bonds/` 同）。
+- **Cmd + actor**：`Cmd::QueryEvidence { reply: oneshot::Sender<Vec<crate::SlashEvidence>> }`，actor 读 `actor.node.pending_evidence()`（既有 `&[SlashEvidence]` 只读视图，metrics 已用）`.to_vec()` 快照，无需新 `net.rs` accessor。
+- **渲染器**：新增文本渲染器 `format_vote`（`<prefix>validator=… height=… round=… block_hash=… vote_type=prevote|precommit signature=…`，逐字段镜像既有 `json_vote`，`prefix` 把一对投票命名空间化为 `vote_a.`/`vote_b.` 扁平在一行）+ `format_slash_evidence`（`kind=evidence` 后跟两票）；JSON 侧**直接复用**既有 `json_slash_evidence`（M78 已有，内部复用 `json_vote`）。薄包装 `format_evidence_listing`（空集 ⇒ `""`）/`json_evidence_listing`（空集 ⇒ `[]`）把单项 map 过一页。
+- **Handler**：`GetRoute::Evidence` 臂是 `StakeOps` 的近逐字拷贝——发 `Cmd::QueryEvidence`，同一 `offset`/`limit`/`total`/`page`/`next` 块，收尾 `ok_body(fmt, &format_page(&format_evidence_listing(page), …), &json_page(&json_evidence_listing(page), …))`。
+- **测试（+3 → 439）**：新纯 `route_get_parses_evidence`（`/evidence` ⇒ `Evidence`、`/evidence/` ⇒ `Health`、`/stake-ops`·`/unbonding` 无回归）、新纯 `evidence_listing_renders`（一条证据（两票）+ 空集，断言精确扁平文本行、JSON 逐项等于 `json_slash_evidence`、空集 `""`/`[]`），新 TCP `rpc_evidence_list_over_tcp`——池仅由等价双签证据暂存入列，故新链 `/evidence` 是 **live-but-empty**：端到端断言 `/evidence` ⇒ `total=0` 空体、`?format=json` ⇒ `{"total":"0","next":null,"items":[]}`（注意 p2p listen 端口由 `node_config` 按 `port_base + (id-21)` 推出，RPC 端口须避开——本测 `id=31` 故 RPC 用 20391 以免撞 p2p 的 20381）。
+- **不变量保持**：纯列表渲染增量、无 `serde_json`、无引擎 / codec / crypto / wire / 共识变更、无新依赖，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M91+）**：读面篮子剩余：其余列表读（peers）、游标分页、`Accept-Encoding`（压缩须引新依赖）；keygen 篮子（助记词 / BIP-39、口令 keystore、现成 genesis 条目、密钥轮换、keyfile `0600`）；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放；连同运维篮子：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图。
+
+## 连接节点列表 `GET /peers`（Milestone 91）
+
+M83–M90 的九个列表读都读**链内数据**（已提交状态 + 待处理池）；M91 加**第十个**分页列表读——`GET /peers`——首个**守护层**读：连接节点目录（peer id + 已知监听地址）。连接的对端不在链状态里，而活在 actor 的 `outbound`（id → gossip 发送端）与 `addrs`（M39 地址簿，id → "host:port"）两张图里；`/peers` 把 `outbound` 的对端枚举出来、各配其已知地址——`metrics` 早已以 `zhixing_peers`（= `outbound.len()`）暴露其**数量**，M91 让其**成员**可读。至此**读面列表端点篮子收口**（validators/accounts/reviewers/graph/bonds/unbonding/stake-ops/evidence/peers 九类目录 + bridge/locks）。无单读兄弟。无 listing 之外的新读语义、**无新依赖**（JSON 仍手搓无 `serde_json`）、无 wire/共识/状态变更，`[rpc]`/`localnet` head 不变量（`44309755…ea04ba`，RPC 默认关）不受影响——纯读面。
+
+- **路由**：`enum GetRoute` 加 `Peers`；`route_get` 在 `/evidence` 臂之后加精确臂 `"/peers" => GetRoute::Peers`。无 `/peer/` 单读前缀，故 `/peers/`（尾斜杠）回落 `Health`（与 `/evidence/`、`/stake-ops/` 同）。
+- **Cmd + actor**：`Cmd::QueryPeers { reply: oneshot::Sender<Vec<(u64, Option<String>)>> }`，actor 由 `outbound.keys()` 逐个配 `addrs.get(&id).cloned()` 构建、再 `sort_by_key(id)` 成 id 升序快照——不同于此前九个读**直读链状态**，这是首个从 actor 自身运行时字段构建的读（Cmd handler 本就在 actor 任务内，天然可读 `outbound`/`addrs`）。
+- **渲染器**：新增**独立**单项渲染器 `format_peer`（`kind=peer id=… addr=…`，已知地址逐字、未知渲染字面量 `unknown`）/`json_peer`（`{"kind":"peer","id":…,"addr":"host:port"|null}`——未知地址用裸 `null`，镜像页信封 `next=null` 约定）；薄包装 `format_peer_listing`（空集 ⇒ `""`）/`json_peer_listing`（空集 ⇒ `[]`）把单项 map 过一页。
+- **Handler**：`GetRoute::Peers` 臂是 `Evidence` 的近逐字拷贝——发 `Cmd::QueryPeers`，同一 `offset`/`limit`/`total`/`page`/`next` 块，收尾 `ok_body(fmt, &format_page(&format_peer_listing(page), …), &json_page(&json_peer_listing(page), …))`。
+- **测试（+3 → 442）**：新纯 `route_get_parses_peers`（`/peers` ⇒ `Peers`、`/peers/` ⇒ `Health`、`/evidence`·`/stake-ops` 无回归）、新纯 `peer_listing_renders`（两对端——一有地址、一未知 + 空集，断言精确文本行（`addr=unknown`）、JSON（`"addr":null`）、空集 `""`/`[]`），新 TCP `rpc_peers_list_over_tcp`——单节点 localnet 无配置对端故 `outbound` 空，新链 `/peers` 是 **live-but-empty**：端到端断言 `/peers` ⇒ `total=0` 空体、`?format=json` ⇒ `{"total":"0","next":null,"items":[]}`（`id=32`：`node_config` 推出 p2p listen `20401+(32-21)=20412`，RPC 用 20421 以免相撞）。
+- **不变量保持**：纯列表渲染增量、无 `serde_json`、无引擎 / codec / crypto / wire / 共识变更、无新依赖，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M92+）**：读面列表端点篮子至此收口；剩余：游标分页、`Accept-Encoding`（压缩须引新依赖）；keygen 篮子（助记词 / BIP-39、口令 keystore、现成 genesis 条目、密钥轮换、keyfile `0600`）；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放；连同运维篮子：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图。
+
+## HTTP `HEAD` 方法支持（Milestone 92）
+
+M83–M91 收口了读面列表端点篮子；M92 转向 **HTTP 语义补全**：补齐 `HEAD` 方法。自 M58 起读路由臂的门卫就写成 `if GET || HEAD`，于是 `HEAD /accounts` 一直**走到 GET 的渲染并把整个响应体写回**——违反 RFC 9110 §9.3.2（「HEAD 必须回与等价 GET 相同的首部字段、但不得发送消息体」）。M92 补齐这一语义：HEAD 回同样的状态行 + `Content-Type` + `Content-Length` + `Vary`，但 body 为空；`Content-Length` 仍广告 GET **本应**发送的 body 字节数——这正是 HEAD 的用途（客户端探体积/存在性而不取 body）。纯 HTTP 层改动、**无新依赖**、无 wire/共识/状态变更、无新读语义，`[rpc]`/`localnet` head 不变量（`44309755…ea04ba`，RPC 默认关）不受影响。
+
+- **纯函数**：新增 `maybe_head(is_head: bool, resp: String) -> String`——`is_head==false` 恒等返回（GET 路径逐字节不变）；`is_head==true` 在首部终止符 `\r\n\r\n` 处截断、只留首部块（含正确的 `Content-Length`），丢弃其后的 body。纯函数、可直接单测。
+- **一次求值、统一剥身**：在请求解析处（取出 `method` 后）一次性求出 `let is_head = method.eq_ignore_ascii_case("HEAD")`，三处响应写出点统一经 `maybe_head(is_head, …)` 剥身——`Accept` 协商失败的 `406`、`Accept-Charset` 协商失败的 `406`、以及读路由块（200/404/503 各支的 `resp`）。POST 路径不受影响（HEAD 只影响非 POST 读面）。
+- **路由不变**：`route_get` 与 `GetRoute` 一字未改——HEAD 复用 GET 的全部路由与渲染，只在写出前剥 body。未识别路径仍回落 `Health`（`HEAD /` 回 200 探针首部、无 body）。
+- **测试（+3 → 445）**：新纯 `maybe_head_strips_body_keeps_headers`（断言首部块逐字节保留、状态/`Content-Type`/`Content-Length`/`Vary` 齐备、`\r\n\r\n` 后无 body、`is_head==false` 恒等）、新纯 `maybe_head_strips_negotiation_406_body`（两个协商 `406` 经 `maybe_head` 后仍具完整首部但无 body），新 TCP `rpc_head_mirrors_get_without_body`（对 `/height` 标量读与 `/accounts` 列表读：HEAD 首部与 GET 逐字节相同、`Content-Length` 等于 GET body 长、GET 有 body 而 HEAD 无；`id=33`：`node_config` 推出 p2p listen `20431+(33-21)=20443`，RPC 用 20451 以免相撞）。
+- **不变量保持**：纯 HTTP 响应整形、无 `serde_json`、无引擎 / codec / crypto / wire / 共识 / 状态变更、无新依赖，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M93+）**：读面列表端点篮子已收口、HTTP `HEAD` 已补；剩余：游标分页、`Accept-Encoding`（压缩须引新依赖）；keygen 篮子（助记词 / BIP-39、口令 keystore、现成 genesis 条目、密钥轮换、keyfile `0600`）；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放；连同运维篮子：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图。
+
+## HTTP `OPTIONS` 方法支持（Milestone 93）
+
+M92 补了 `HEAD`；M93 续补 HTTP 方法语义——`OPTIONS`。此前 `OPTIONS` 不是 `GET`/`HEAD`/`POST`，落入「非 POST ⇒ 健康探针」回落、回 `200 OK`/`ok`——没有按 RFC 9110 §9.3.7 告知客户端本服务**支持哪些方法**。M93 补齐：`OPTIONS` 回 `204 No Content` + `Allow: GET, HEAD, OPTIONS, POST` 首部、无 body。纯 HTTP 层改动、**无新依赖**、无 wire/共识/状态变更、无新读语义，`[rpc]`/`localnet` head 不变量（`44309755…ea04ba`，RPC 默认关）不受影响。
+
+- **纯函数 + 单一真相源**：新增常量 `ALLOWED_METHODS = "GET, HEAD, OPTIONS, POST"`（`Allow` 首部的唯一真相源）+ 纯函数 `options_response()`——回 `204 No Content`（按定义无消息体，故不发 `Content-Length`）+ `Allow` 首部。纯函数、可直接单测。
+- **早于协商应答**：在请求解析处（拆出 `path`/`query` 后、`resolve_format` 协商**之前**）加 `if method == "OPTIONS"` 分支直接写 `options_response` 并返回——因为 OPTIONS 不返回任何表示，没有 `Accept`/`Accept-Charset` 可协商；带敌意 `Accept` 的 OPTIONS 也不应被打成 `406`，而应如实回能力集。
+- **其余路径不变**：`route_get`/`GetRoute` 一字未改；`GET`/`HEAD`（M92）/`POST` 路径逐字节不变；其余未知方法（`PUT`/`DELETE` 等）**刻意保留**此前的 `200`/`ok` 健康探针回落（任意方法可探活，是既有特性，不改）。OPTIONS 是唯一获特判的非 GET/HEAD/POST 方法。
+- **测试（+3 → 448）**：新纯 `options_response_advertises_allow`（断言 `204` 状态行、`Allow` 列全四法、无 `Content-Length`、无 body）、新 TCP `rpc_options_over_tcp`（`/accounts`·`/` 回 `204`+`Allow` 无 body；带 `Accept: application/xml` 的 OPTIONS 仍回 `204` 证明应答早于协商；`id=34`：p2p listen `20461+13=20474`、RPC 用 20481）、新 TCP `rpc_unsupported_method_is_health_probe`（`PUT /accounts` 仍回 `200`/`ok`，锁定刻意回落不回归；`id=35`：p2p listen `20491+14=20505`、RPC 用 20511）。
+- **不变量保持**：纯 HTTP 响应整形、无 `serde_json`、无引擎 / codec / crypto / wire / 共识 / 状态变更、无新依赖，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M94+）**：读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补；剩余：游标分页、`Accept-Encoding`（压缩须引新依赖）、未知方法 `405`（与健康探针语义取舍）；keygen 篮子（助记词 / BIP-39、口令 keystore、现成 genesis 条目、密钥轮换、keyfile `0600`）；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放；连同运维篮子：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图。
+
+## keygen 密钥文件 `0600` 权限（Milestone 94）
+
+M92/M93 补了 HTTP 方法语义；M94 转向 **keygen 篮子**的第一项——密钥文件权限。`node keygen` 把 64-hex 私钥种子以 `std::fs::write(out_path, …)` 落盘，用的是进程默认权限（典型 `0644`，**全局可读**）；私钥种子全局可读是实打实的安全隐患（同机任何用户可读走，派生出签名权）。M94 收紧为 `0600`（仅属主读写）。离线 CLI 工具（`main.rs`）改动，不触 RPC / 出块 / 重放路径，`localnet` head 不变量（`44309755…ea04ba`）天然不受影响。
+
+- **`write_key_file(path, contents)`**：Unix 上用 `OpenOptions` + `OpenOptionsExt::mode(0o600)` **在创建时即**把文件置为 owner-only——创建与 chmod 之间**无全局可读窗口**（不同于「先 write 后 chmod」的 TOCTOU 式裸露）；随后再 `File::set_permissions(0o600)` 复申一次，覆盖「路径已存在且权限更宽」的情形（此时创建用的 `mode` 是 no-op，须显式回紧）。非 Unix 目标回落 `std::fs::write`（平台无 POSIX mode 可设）。
+- **接线**：`cmd_keygen` 把 `std::fs::write(out_path, &seed_hex)` 换成 `write_key_file(out_path, &seed_hex)`，其余（种子来源 `--seed`/CSPRNG、派生、打印 pubkey）一字未改。种子格式仍是 `encode-tx --key-file`/`--seed` 解码器认的 64-hex，向后兼容。
+- **测试（+3 → 451）**：新单测（均 `#[cfg(unix)]`）`key_file_is_written_0600`（新建文件 mode & 0o777 == 0o600、内容正确）/`key_file_overwrite_retightens_to_0600`（预置 `0644` 文件覆盖后回紧到 0600、内容被截断替换而非追加——正是「复申」分支的覆盖）/`key_file_round_trips_through_seed_decoder`（0600 写出的种子读回后仍可被 `config::decode_seed` 消费，证明权限收紧不破坏格式）。测试在 bin 测试套件（`main.rs`），无外部 tempfile 依赖（自造唯一临时路径）。
+- **不变量保持**：纯 CLI 落盘权限改动、无 `serde_json`、无引擎 / codec / crypto / wire / 共识 / 状态变更、无新依赖，RPC 与出块路径一字未动，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M95+）**：keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、现成 genesis 条目生成、密钥轮换；读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补；剩余：游标分页、`Accept-Encoding`（压缩须引新依赖）、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放；连同运维篮子：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图。
+
+## keygen 现成 genesis 条目生成（Milestone 95）
+
+M94 收紧了密钥文件权限；M95 续补 keygen 篮子——**现成 genesis 条目生成**。`node keygen` 此前只打印 `pubkey <hex>`，把它放进 genesis 还得用户手拼一段 TOML（且字段名易错）。M95 让 keygen 在给出 `--genesis-id <id>` 时额外打印**可直接粘贴**进 `genesis.toml` 的条目。离线 CLI 工具（`main.rs`）纯字符串拼接，不触 RPC / 出块 / 重放路径，`localnet` head 不变量（`44309755…ea04ba`）天然不受影响。
+
+- **纯格式化函数**：`genesis_account_toml(id, balance_micro, pubkey_hex)` 渲染 `[[accounts]]` 块、`genesis_validator_toml(id, pubkey_hex, power)` 渲染 `[[validators]]` 块——字段名（`id`/`balance_micro`/`pubkey_hex`、`id`/`pubkey_hex`/`power`）**逐字镜像** `config::AccountConfig`/`ValidatorConfig` 的 serde 字段，故输出能被 `config::load_genesis` 原样读回。纯函数、可直接单测。
+- **参数解析隔离**：`keygen_genesis_entries(args, pubkey_hex) -> Option<String>`——`--genesis-id` 缺省 ⇒ `None`（keygen 保持原两行输出）；给了则恒出 `[[accounts]]`（`--balance <micro>` 默认 0），再给 `--power <p>` 则追加 `[[validators]]`。解析集中于此，`cmd_keygen` 只负责在拿到 pubkey 后打印其结果。
+- **接线**：`cmd_keygen` 在原 `pubkey`/`out` 两行之后，`if let Some(entries) = keygen_genesis_entries(args, &pub_hex) { print!("{entries}") }`。种子落盘（M94 的 `0600`）、派生、`--seed`/CSPRNG 来源一字未改，向后兼容（不传 `--genesis-id` 时逐字节同旧输出）。
+- **测试（+3 → 454）**：新纯 `genesis_entry_toml_renders_expected`（两个格式化函数的精确输出）/`keygen_genesis_entries_gated_on_id`（无 `--genesis-id` ⇒ `None`；仅 id ⇒ 账户块、balance 默认 0、无 validator；`--balance`+`--power` ⇒ 两块齐全带值）/`keygen_genesis_entry_round_trips_through_loader`（用生成条目拼出完整 genesis、经 `config::load_genesis`→`to_genesis` 还原 id/balance/pubkey/power）。测试在 bin 套件（`main.rs`）。
+- **不变量保持**：纯 CLI 字符串输出、无 `serde_json`、无引擎 / codec / crypto / wire / 共识 / 状态变更、无新依赖，RPC 与出块路径一字未动，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M96+）**：keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换（现成 genesis 条目已补、keyfile `0600` 已补）；读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补；剩余：游标分页、`Accept-Encoding`（压缩须引新依赖）、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放；连同运维篮子：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图。
+
+## `node check-config` 配置干跑校验（Milestone 96）
+
+M94/M95 补了 keygen 篮子；M96 转向**运维篮子**——部署前配置校验。此前没有「只校验不启动」的途径：config / genesis 里的错误（坏 pubkey、缺字段、验证人种子非法……）要到 `node run` 真正启动、甚至绑定端口后才暴露。M96 加 `node check-config --config F` 干跑：执行与 `cmd_run` **完全相同**的加载/解析/转换/密钥派生步骤，但**不绑定任何 socket、不启动 actor**。离线只读校验，不触 RPC / 出块 / 重放路径，`localnet` head 不变量（`44309755…ea04ba`）天然不受影响。
+
+- **纯函数**：`check_config(path) -> Result<String, config::ConfigError>`——`load_node_config` → `load_genesis(&cfg.genesis)` → `to_genesis()` →（若 `[validator]` enabled）`vc.keypair()`，与 `cmd_run` 的前半段逐行一致（减去 `init_tracing` 与 `daemon::run`）。成功返回人读摘要（`node id` / `role`（validator|follower）/ `genesis` 路径 / `accounts`·`reviewers`·`validators`·`peers` 计数），失败返回首个 typed `ConfigError`。只读引用文件、无进程退出 / 无网络 / 无状态，故可直接单测。
+- **薄 CLI 壳**：`cmd_check_config(path)` 把 `check_config` 的 `Ok` 打印到 stdout、`Err` 经 `fail_msg` + exit 2（CLI 惯用）。
+- **注册**：`main` 分发加 `"check-config" => cmd_check_config(config_arg(&args))`；`usage()` 加 `check-config` 行；顺手补上 M95 遗漏的 keygen `--genesis-id`/`--balance`/`--power` usage 行。
+- **验证人密钥也校验**：`[validator] enabled=true` 时解码 `seed_hex` 派生 `Keypair`——坏种子应在干跑时失败，而非 `run` 要投票时才炸。
+- **测试（+3 → 457）**：新单测 `check_config_ok_for_follower`（无 `[validator]` ⇒ role follower、计数正确）/`check_config_ok_for_validator`（enabled `[validator]` + 合法种子 ⇒ role validator）/`check_config_surfaces_bad_genesis`（非 hex pubkey ⇒ 返回 `Err` 而非 panic/exit）。各测写临时 `config+genesis` 夹具（`genesis` 用绝对路径、CWD 无关），bin 测试套件。
+- **不变量保持**：离线只读校验、无 `serde_json`、无引擎 / codec / crypto / wire / 共识 / 状态变更、无新依赖，不绑端口 / 不启 actor，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M97+）**：运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补、`check-config` 已补；剩余：游标分页、`Accept-Encoding`（压缩须引新依赖）、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
+
+## `node genesis-hash` 链身份派生（Milestone 97）
+
+M96 加了配置干跑校验；M97 续补运维篮子——**链身份派生**。两名运营者加入同一网络前，须确认彼此的 genesis 逐字节一致，否则各自长出**互不兼容的链**（同步会停在缺口而非污染状态，但徒耗运维）。M97 加 `node genesis-hash --config F`：从 config 的 genesis 派生并打印三元链身份——`genesis_hash`（每个诚实节点的起点 head）、初始 `state_root`、创世验证人数——三者一致即确认 genesis 相同。离线只读派生，不触 RPC / 出块 / 重放路径，`localnet` head 不变量（`44309755…ea04ba`）天然不受影响。
+
+- **纯函数**：`genesis_identity(path) -> Result<String, config::ConfigError>`——如 `cmd_run`/`check_config` 一样 `load_node_config` → `load_genesis(&cfg.genesis)` → `to_genesis()`，再经 `ChainState::genesis(g)` 盖章取 `(state, gh)`（这正是每个节点启动时落到的创世态与起点 head），格式化为 `genesis_hash <hex>` / `state_root <hex(state.state_root())>` / `validators <state.validators 数>`。只读引用文件、无退出 / 网络 / 状态，可直接单测。
+- **薄 CLI 壳**：`cmd_genesis_hash(path)` 打印 `Ok`、`Err` 经 `fail_msg` + exit 2。
+- **注册**：`main` 分发加 `"genesis-hash" => cmd_genesis_hash(config_arg(&args))`；`usage()` 加对应行。
+- **测试（+3 → 460）**：新单测 `genesis_hash_is_deterministic_and_matches_chainstate`（打印的 `genesis_hash` 等于独立调用 `ChainState::genesis` 盖章出的 `gh`、`validators 1`、同 config 幂等）/`genesis_hash_differs_for_different_genesis`（换一个账户 pubkey ⇒ `genesis_hash` 不同，证明身份是 genesis 内容的函数）/`genesis_hash_surfaces_bad_genesis`（坏 genesis ⇒ 返回 `Err`）。复用 M96 的 `write_check_config_fixture`/`valid_genesis_body` 夹具，bin 测试套件。
+- **不变量保持**：离线只读派生、无 `serde_json`、无引擎 / codec / crypto / wire / 共识 / 状态变更、无新依赖，不绑端口 / 不启 actor，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M98+）**：运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图（`check-config`/`genesis-hash` 已补）；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补；剩余：游标分页、`Accept-Encoding`（压缩须引新依赖）、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
+
+## `node inspect-tx` 交易文件检视（Milestone 98）
+
+M97 加了链身份派生；M98 补齐 `encode-tx` 的**读侧搭档**——交易文件检视。此前能用 `encode-tx` 造并签一个 tx 文件（`codec::encode_tx` 字节），却无从离线把它**读回人眼**确认内容对不对（提交前自查、或比对一个文件是否就是链上那笔 tx）。M98 加 `node inspect-tx --tx F [--pubkey HEX]`。离线只读检视，不触 RPC / 出块 / 重放路径，`localnet` head 不变量（`44309755…ea04ba`）天然不受影响。
+
+- **纯函数**：`inspect_tx(bytes, Option<pubkey_hex>) -> Result<String, String>`——`codec::decode_tx` 解码后人读打印 `hash`（内容哈希，正是 mempool 去重键）/`author`/`domain`/`stake`/`reviews`（条数）/`repl`（success/total）/`timestamp_days`/`embedding_dim`/`signature`。给了 `--pubkey <hex>` 则用 `crypto::verify` 对 `codec::tx_signing_bytes(&tx)` 验签、打印 `signature_valid true|false`；缺省打印 `signature_valid unknown`（tx 文件**不携带** pubkey——链按 `author` 查账户 key，故离线验签须外部给 key）。只读、无退出 / 网络 / 状态，可直接单测。
+- **薄 CLI 壳**：`cmd_inspect_tx(args)` 用既有 `tx_arg` 读 `--tx` 文件、`opt_arg` 取可选 `--pubkey`，`Ok` 打印、`Err` 经 `fail_msg` + exit 2。
+- **复用解码器**：把 `config::decode_pubkey`（64-hex → 32 字节、带 `BadHex` 错误）从私有提为 `pub`，使 CLI 与 genesis 加载器共用同一 pubkey-hex 格式与错误。
+- **注册**：`main` 分发加 `"inspect-tx" => cmd_inspect_tx(&args)`；`usage()` 加对应行。
+- **测试（+3 → 463）**：新单测 `inspect_tx_renders_fields_and_hash`（字段齐、打印 `hash` 等于 `tx.hash()`、无 pubkey ⇒ `unknown`）/`inspect_tx_verifies_signature_with_pubkey`（作者 key ⇒ `true`、他人 key ⇒ `false`）/`inspect_tx_surfaces_decode_and_pubkey_errors`（坏字节 ⇒ 解码 `Err`、坏 `--pubkey` ⇒ `Err`）。bin 测试套件，自造签名 tx（`SubmissionTx{…}.signed(&kp)` → `encode_tx`）。
+- **不变量保持**：离线只读检视、无 `serde_json`、无引擎 / codec / crypto / wire / 共识 / 状态变更（仅 `decode_pubkey` 可见性）、无新依赖，不绑端口 / 不启 actor，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M99+）**：运维 / 离线工具篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图（`check-config`/`genesis-hash`/`inspect-tx` 已补）；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补；剩余：游标分页、`Accept-Encoding`（压缩须引新依赖）、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
+
+## `node pubkey` 只读派生 pubkey（Milestone 99）
+
+M98 的 `inspect-tx --pubkey` 要外部给 pubkey 验签，而取 pubkey 这一步此前只能跑 `keygen --seed <hex> --out F`——它**会写一个文件**（哪怕你只想看 pubkey）。M99 加 `node pubkey (--key-file F | --seed HEX)`：只**读**种子、派生并打印 pubkey、**不写任何文件**。与 `inspect-tx --pubkey` 配对（先 `pubkey` 取 key、再 `inspect-tx` 验签），也补齐了 keygen/encode-tx/inspect-tx 这组离线密钥工具的读侧缺口。离线只读派生，不触 RPC / 出块 / 重放路径，`localnet` head 不变量（`44309755…ea04ba`）天然不受影响。
+
+- **纯函数**：`derive_pubkey(seed_hex, field) -> Result<String, config::ConfigError>`——`config::decode_seed(seed_hex.trim(), field)`（复用 keygen/encode-tx 同一解码器 + `BadHex` 错误、容忍尾换行）再 `hex(Keypair::from_seed(seed).public())`。只读、无退出 / 网络 / 状态，可直接单测。
+- **薄 CLI 壳**：`cmd_pubkey(args)` 解析种子来源——`--seed <hex>` 优先、否则 `--key-file <path>`（读文件内容），两者都缺 ⇒ `fail_msg("pubkey", "requires --key-file <path> or --seed <64hex>")` 清晰报错（不借用 `req_arg` 的 encode-tx 文案）；派生后 `println!("pubkey {}")`，并可复用 M95 `keygen_genesis_entries` 在 `--genesis-id` 时追加 genesis 条目。
+- **与 keygen 的区别**：`keygen` 以「写种子文件」为主、顺带打印 pubkey；`pubkey` 以「读已有种子、只打印 pubkey」为主、**绝不写盘**——适合核验一个 key 文件对应哪个 pubkey、或从离线种子取 pubkey 去验一笔 tx。
+- **注册**：`main` 分发加 `"pubkey" => cmd_pubkey(&args)`；`usage()` 加对应行。
+- **测试（+3 → 466）**：新单测 `derive_pubkey_matches_keygen`（等于直接 `Keypair` API 与 `keygen_derive` 路径、容忍尾换行）/`derive_pubkey_surfaces_bad_seed`（非 hex / 过短 ⇒ `Err`）/`derive_pubkey_reads_keygen_written_file`（读 `write_key_file`（M94 的 `0600`）写出的种子文件、派生出正确 pubkey——`node pubkey --key-file` 对 keygen `--out` 的往返）。bin 测试套件。
+- **不变量保持**：离线只读派生、无 `serde_json`、无引擎 / codec / crypto / wire / 共识 / 状态变更、无新依赖，不绑端口 / 不启 actor，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M100+）**：离线工具篮子（`check-config`/`genesis-hash`/`inspect-tx`/`pubkey` 已补）；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补；剩余：游标分页、`Accept-Encoding`（压缩须引新依赖）、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
+
+## `node inspect-block` 区块日志检视（Milestone 100）
+
+M98 的 `inspect-tx` 检视一笔**松散的 tx 文件**；M100 上一层——检视**持久化区块日志**里的块。此前 `status --dir` 只重放整条日志、打印**最终状态**（高度、各计数的汇总），无从逐块看「第 N 块里到底有什么」。M100 加 `node inspect-block --dir DIR [--height N]` 读 `{dir}/blocks.log` 做离线逐块检视。只读日志，不触 RPC / 出块 / 重放写入路径，`localnet` head 不变量（`44309755…ea04ba`）天然不受影响。
+
+- **纯函数**：`inspect_block(&[Block], Option<u64>) -> Result<String, String>`——`None` 列出每块一行（`height` + `txs`/`stake_ops`/`evidence`/`validator_updates` 计数）加 `blocks {n}` 头；`Some(h)` 打印该块 header（`hash`（即 `block.hash()`，cert 所签）/`prev_hash`/`state_root`/`accounts_root`/`graph_root`/`next_validators_root`/`timestamp_days`）+ 七类 body 向量计数（txs/stake_ops/slashing_evidence/validator_updates/bridge_locks/bridge_headers/bridge_redeems）+ 逐 tx 的 `hash`/`author`。块按其自身 `height` 字段（权威）匹配、非日志下标，缺块 ⇒ 返回 `Err`。只读、无退出 / 网络 / 状态，可直接单测。
+- **薄 CLI 壳**：`cmd_inspect_block(args)` 用既有 `dir_arg` 取 `--dir`、`BlockLog::open("{dir}/blocks.log")` + `read_all()`（与 `cmd_status` 同一读日志路径）取 `Vec<Block>`、`opt_arg("--height")` 解析可选高度，`Ok` 打印、`Err` 经 `fail_msg` + exit 2。
+- **与 `status` 的区别**：`status` 重放全链得到并打印**最终聚合状态**；`inspect-block` 不重放、直接**原样读每个落盘块**的 header 与 body——适合排障「某高度那块的 tx/质押/证据到底是什么」「落盘块的 `state_root` 对不对」。
+- **注册**：`main` 分发加 `"inspect-block" => cmd_inspect_block(&args)`；`usage()` 加对应行。
+- **测试（+3 → 469）**：新单测 `inspect_block_lists_all_blocks`（两块、`blocks 2` + 逐块计数行）/`inspect_block_detail_prints_header_and_txs`（`--height` 打印 `hash` 等于 `b.hash()`、`txs 1`、逐 tx `hash`/`author` 行）/`inspect_block_missing_height_errors`（不存在的高度 ⇒ `Err`）。用本地 `test_block`/`test_tx` 夹具（零 root + 空 body 向量，签名 tx），bin 测试套件。
+- **不变量保持**：离线只读检视、无 `serde_json`、无引擎 / codec / crypto / wire / 共识 / 状态变更、无新依赖，只读日志、不绑端口 / 不启 actor，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M101+）**：离线工具篮子（`check-config`/`genesis-hash`/`inspect-tx`/`pubkey`/`inspect-block` 已补）；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补；剩余：游标分页、`Accept-Encoding`（压缩须引新依赖）、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
+
 ## 持久化与重放（Milestone 7）
 
 节点状态不再只活在内存里：区块以**追加式日志**（`DIR/blocks.log`）落盘，重启后从创世**重放**日志即可重建**逐字节相同**的状态。
@@ -1644,5 +1833,20 @@ peer_exchange_disabled_stays_seeded                   同链拓扑关发现 → 
 - ~~M83 验证人列表 `GET /validators`——自 M72/M79/M81 起分页栈已通用但只有 `/bridge/locks` 一个消费者；M83 加第二个分页列表读 `GET /validators` 列出活跃验证人集（`validator_id`/`power`/`pubkey`），逐字复用分页栈 + M82 协商，仅加一路由臂（精确匹配不撞 `/validator/`）+ `Cmd::QueryValidators`（actor 直读 state）+ 两渲染器 `format_validator_listing`/`json_validator_listing`（空集 ⇒ `""`/`[]`），是 `/validator/{id}` 单读的 list 兄弟；新纯测 `route_get_parses_validators`/`validator_listing_renders` + TCP `rpc_validators_list_over_tcp`，共 418 测；纯列表渲染 + 一路由/一 Cmd/一 handler、无 `serde_json`/无新读语义/wire/共识/依赖、RPC 默认关故 head 不变~~ ✅
 - ~~M84 账户列表 `GET /accounts`——加第三个分页列表读 `GET /accounts` 未验证余额目录，是 `/account/{id}` 单读（M58）/`/account/{id}/proof` 证明读（M59）的 list 兄弟、代码最少（单项渲染器 `format_account`/`json_account` 早已存在），仅加一路由臂（`/accounts` 精确匹配置于 `/account/` 前缀臂之前不撞，`/accounts/` 落 `Health`）+ `Cmd::QueryAccounts`（actor 直读 `chain.state.accounts`）+ 两薄包装 `format_account_listing`/`json_account_listing`（空集 ⇒ `""`/`[]`），逐字复用 `total`/`next` 信封 + `Accept`/`Accept-Charset` 协商；新纯测 `route_get_parses_accounts`/`account_listing_renders` + TCP `rpc_accounts_list_over_tcp`，共 421 测、localnet head 不变~~ ✅
 - ~~M85 审阅人列表 `GET /reviewers`——加第四个分页列表读 `GET /reviewers` 未验证审阅人目录（id + reputation），是 `/reviewer/{id}` plain 单读（M65）的 list 兄弟、代码最少（复用单项渲染器 `format_entity`/`json_entity`（`EntityView::Reviewer`）早已存在），仅加一路由臂（`/reviewers` 精确匹配置于 `/reviewer/` 前缀臂之前不撞，`/reviewers/` 落 `Health`）+ `Cmd::QueryReviewers`（actor 直读 `chain.state.reviewers`）+ 两薄包装 `format_reviewer_listing`/`json_reviewer_listing`（空集 ⇒ `""`/`[]`），逐字复用 `total`/`next` 信封 + `Accept`/`Accept-Charset` 协商；新纯测 `route_get_parses_reviewers`/`reviewer_listing_renders` + TCP `rpc_reviewers_list_over_tcp`，共 424 测、localnet head 不变~~ ✅
+- ~~M86 认知图节点列表 `GET /graph`——加第五个分页列表读 `GET /graph` 未验证认知图目录（node_id + domain + embedding），是 `/graph/{id}` plain 单读（M65）的 list 兄弟、代码最少（复用单项渲染器 `format_entity`/`json_entity`（`EntityView::GraphNode`）早已存在），仅加一路由臂（`/graph` 精确匹配置于 `/graph/` 前缀臂之前不撞，`/graph/` 空 id 走前缀臂 `u64` 解析失败落 `NotFound`）+ `Cmd::QueryGraphNodes`（actor 直读 `chain.state.graph.nodes`，插入序 `node_id == 索引`）+ 两薄包装 `format_graph_listing`/`json_graph_listing`（空集 ⇒ `""`/`[]`），逐字复用 `total`/`next` 信封 + `Accept`/`Accept-Charset` 协商；新纯测 `route_get_parses_graph`/`graph_listing_renders` + TCP `rpc_graph_list_over_tcp`，共 427 测、localnet head 不变~~ ✅
+- ~~M87 验证人质押列表 `GET /bonds`——加第六个分页列表读 `GET /bonds` 每验证人绑定质押目录（validator_id + bonded micro-$COG），是 `/validators`（M83）的读兄弟、暴露支撑投票权的原始质押额而非权重本身、无单读兄弟；与 M84–M86 不同 bond 非 merkle 证明实体故不入 `EntityView`，新增独立单项渲染器 `format_bond`/`json_bond` + 两薄包装 `format_bond_listing`/`json_bond_listing`（空集 ⇒ `""`/`[]`），仅加一路由臂（`/bonds` 精确匹配；无 `/bond/` 前缀故 `/bonds/` 回落 `Health`）+ `Cmd::QueryBonds`（actor 直读 `chain.state.bonds`），逐字复用 `total`/`next` 信封 + `Accept`/`Accept-Charset` 协商；新纯测 `route_get_parses_bonds`/`bond_listing_renders` + TCP `rpc_bonds_list_over_tcp`（创世只置验证人集、bonds 仅由链上 `StakeOp` 生长故新链 `/bonds` live-but-empty，端到端断言空目录信封），共 430 测、localnet head 不变~~ ✅
+- ~~M88 解绑队列列表 `GET /unbonding`——加第七个分页列表读 `GET /unbonding` 解绑延迟队列（account + amount + mature_height），是 `/bonds`（M87）在质押生命周期上的读兄弟、经 `UNBONDING_PERIOD` 等待返还余额的在途提款、无单读兄弟；同 M87 解绑条目非 merkle 证明实体故不入 `EntityView`，新增独立单项渲染器 `format_unbonding`/`json_unbonding` + 两薄包装 `format_unbonding_listing`/`json_unbonding_listing`（空集 ⇒ `""`/`[]`），仅加一路由臂（`/unbonding` 精确匹配；无 `/unbonding/` 前缀故 `/unbonding/` 回落 `Health`）+ `Cmd::QueryUnbonding`（actor 直读 `chain.state.unbonding`），逐字复用 `total`/`next` 信封 + `Accept`/`Accept-Charset` 协商；新纯测 `route_get_parses_unbonding`/`unbonding_listing_renders` + TCP `rpc_unbonding_list_over_tcp`（队列仅由链上 `Unbond` op 入列故新链 `/unbonding` live-but-empty，端到端断言空队列信封），共 433 测、localnet head 不变~~ ✅
+- ~~M89 待处理质押池列表 `GET /stake-ops`——加第八个分页列表读 `GET /stake-ops` 暂存下一出块的待处理质押 op 池（account + bond/unbond + amount + signature），是首个待处理池读（mempool 侧、非已提交状态）、无单读兄弟；新增文本渲染器 `format_stake_op`（镜像既有 `json_stake_op` 字段）+ 两薄包装 `format_stakeop_listing`/`json_stakeop_listing`（JSON 逐项复用既有 `json_stake_op`、空集 ⇒ `""`/`[]`），仅加一路由臂（`/stake-ops` 精确匹配；无 `/stake-op/` 前缀故 `/stake-ops/` 回落 `Health`）+ `Cmd::QueryStakeOps`（actor 读既有 `node.pending_stake_ops()` 视图），逐字复用 `total`/`next` 信封 + `Accept`/`Accept-Charset` 协商；新纯测 `route_get_parses_stake_ops`/`stakeop_listing_renders` + TCP `rpc_stake_ops_list_over_tcp`（池仅由链上 `StakeOp` 暂存入列故新链 `/stake-ops` live-but-empty，端到端断言空池信封），共 436 测、localnet head 不变~~ ✅
+- ~~M90 待处理罚没证据池列表 `GET /evidence`——加第九个分页列表读 `GET /evidence` 暂存下一出块的待处理罚没证据池（成对冲突 precommit 投票），是 `/stake-ops`（M89）的待处理池读兄弟、无单读兄弟；新增文本渲染器 `format_vote`（`vote_a.`/`vote_b.` 前缀扁平化、镜像既有 `json_vote`）+ `format_slash_evidence` + 两薄包装 `format_evidence_listing`/`json_evidence_listing`（JSON 逐项复用既有 `json_slash_evidence`、空集 ⇒ `""`/`[]`），仅加一路由臂（`/evidence` 精确匹配；无 `/evidence/` 前缀故 `/evidence/` 回落 `Health`）+ `Cmd::QueryEvidence`（actor 读既有 `node.pending_evidence()` 视图），逐字复用 `total`/`next` 信封 + `Accept`/`Accept-Charset` 协商；新纯测 `route_get_parses_evidence`/`evidence_listing_renders` + TCP `rpc_evidence_list_over_tcp`（池仅由等价双签证据暂存入列故新链 `/evidence` live-but-empty，端到端断言空池信封），共 439 测、localnet head 不变~~ ✅
+- ~~M91 连接节点列表 `GET /peers`——加第十个分页列表读 `GET /peers` 连接节点目录（peer id + 已知监听地址），是守护层读（节点连接存于 actor、非链状态）、无单读兄弟、收口读面列表端点篮子；新增独立渲染器 `format_peer`/`json_peer`（已知地址逐字、未知地址文本 `unknown` / JSON `null`）+ 两薄包装 `format_peer_listing`/`json_peer_listing`（空集 ⇒ `""`/`[]`），仅加一路由臂（`/peers` 精确匹配；无 `/peer/` 前缀故 `/peers/` 回落 `Health`）+ `Cmd::QueryPeers`（actor 由 `outbound`+`addrs` 两图构建 id 升序快照），逐字复用 `total`/`next` 信封 + `Accept`/`Accept-Charset` 协商；新纯测 `route_get_parses_peers`/`peer_listing_renders` + TCP `rpc_peers_list_over_tcp`（单节点无配置对端故新链 `/peers` live-but-empty，端到端断言空目录信封），共 442 测、localnet head 不变~~ ✅
+- ~~M92 HTTP `HEAD` 方法支持——此前 `GET`/`HEAD` 共用一条读路由臂、HEAD 却返回整个响应体（违反 RFC 9110 §9.3.2）；M92 补齐——新增纯函数 `maybe_head(is_head, resp)` 在 `\r\n\r\n` 处截去 body 只留首部块（`Content-Length` 仍广告 GET body 字节数），`is_head==false` 为恒等（GET 逐字节不变），请求解析处一次性求出 `is_head`、三处写出点（两个协商 `406` + 读路由块）统一经 `maybe_head` 剥身；路由与 `GetRoute` 一字未改；新纯测 `maybe_head_strips_body_keeps_headers`/`maybe_head_strips_negotiation_406_body` + TCP `rpc_head_mirrors_get_without_body`（`/height` 标量读与 `/accounts` 列表读：HEAD 首部与 GET 逐字节同、`Content-Length` 等于 GET body 长、HEAD 无 body），共 445 测、localnet head 不变~~ ✅
+- ~~M93 HTTP `OPTIONS` 方法支持——此前 `OPTIONS` 落入「非 POST ⇒ 健康探针」回 `200`/`ok`、未告知所支持方法；M93 按 RFC 9110 §9.3.7 补齐——`OPTIONS` 回 `204 No Content` + `Allow: GET, HEAD, OPTIONS, POST` 首部、无 body，在 `Accept`/`Accept-Charset` 协商之前应答（无可协商表示），新增单一真相源常量 `ALLOWED_METHODS` + 纯函数 `options_response`；路由与 `GetRoute` 一字未改、GET/HEAD/POST 不受影响、其余未知方法刻意保留健康探针回落；新纯测 `options_response_advertises_allow` + TCP `rpc_options_over_tcp`（`/accounts`·`/` 回 204+Allow 无 body、敌意 `Accept` 仍回 204）+ TCP `rpc_unsupported_method_is_health_probe`（PUT 仍回 `200`/`ok`），共 448 测、localnet head 不变~~ ✅
+- ~~M94 keygen 密钥文件 `0600` 权限——`node keygen` 此前以 `std::fs::write` 默认权限（通常 `0644` 全局可读）落盘私钥种子（安全隐患）；M94 新增 `write_key_file`：Unix 上 `OpenOptionsExt::mode(0o600)` 创建时即置 owner-only（无全局可读窗口）+ `set_permissions(0o600)` 复申覆盖已存在文件，非 Unix 回落 `std::fs::write`，`cmd_keygen` 改调之、种子格式不变；新单测（`cfg(unix)`）`key_file_is_written_0600`/`key_file_overwrite_retightens_to_0600`/`key_file_round_trips_through_seed_decoder`，共 451 测、localnet head 不变~~ ✅
+- ~~M95 keygen 现成 genesis 条目生成——`node keygen` 此前只打印 pubkey、放进 genesis 须手拼 TOML；M95 在给出 `--genesis-id <id>`（+ 可选 `--balance`/`--power`）时额外打印可直接粘贴的 `[[accounts]]`（恒有）与 `[[validators]]`（有 `--power` 才加）条目；新增纯函数 `genesis_account_toml`/`genesis_validator_toml`（字段名逐字镜像 `config::AccountConfig`/`ValidatorConfig`）+ `keygen_genesis_entries`（`--genesis-id` 缺省 ⇒ `None`、keygen 原输出不变）；新单测 `genesis_entry_toml_renders_expected`/`keygen_genesis_entries_gated_on_id`/`keygen_genesis_entry_round_trips_through_loader`（经 `config::load_genesis`→`to_genesis` 还原），共 454 测、localnet head 不变~~ ✅
+- ~~M96 `node check-config` 配置干跑校验——部署前无从一处性校验 config/genesis（错误要到 `node run` 启动甚至绑端口才暴露）；M96 加 `node check-config --config F` 干跑：执行 `cmd_run` 完全相同的加载/解析/转换/密钥派生（`load_node_config`→`load_genesis`→`to_genesis`→（enabled 时）`keypair`）但不绑端口/不启 actor，成功打印摘要（id/role/genesis/accounts·reviewers·validators·peers 计数）、失败打印首个 typed `ConfigError` + exit 2；核心抽成纯函数 `check_config(path) -> Result<String, ConfigError>`、`cmd_check_config` 为薄壳，注册子命令 + usage（并补 M95 keygen `--genesis-id` usage）；新单测 `check_config_ok_for_follower`/`check_config_ok_for_validator`/`check_config_surfaces_bad_genesis`，共 457 测、localnet head 不变~~ ✅
+- ~~M97 `node genesis-hash` 链身份派生——运营者加入同一网络前须确认 genesis 逐字节一致（否则是互不兼容的链）；M97 加 `node genesis-hash --config F` 从 config 的 genesis 派生并打印 `genesis_hash`（起点 head）+ 初始 `state_root` + 创世验证人数；核心抽成纯函数 `genesis_identity(path) -> Result<String, ConfigError>`（`load_node_config`→`load_genesis`→`to_genesis`→`ChainState::genesis` 盖章）、`cmd_genesis_hash` 为薄壳，注册子命令 + usage、不绑端口/不启 actor；新单测 `genesis_hash_is_deterministic_and_matches_chainstate`/`genesis_hash_differs_for_different_genesis`/`genesis_hash_surfaces_bad_genesis`，共 460 测、localnet head 不变~~ ✅
+- ~~M98 `node inspect-tx` 交易文件检视——`encode-tx` 的读侧搭档，此前能造/签 tx 文件却无从离线检视；M98 加 `node inspect-tx --tx F [--pubkey HEX]` 解码并人读打印字段 + 内容哈希（hash 即 mempool 去重键），给 `--pubkey` 则用 `crypto::verify` 对 `tx_signing_bytes` 验签打印 `signature_valid true|false`、缺省 `unknown`（tx 文件不带 pubkey）；核心抽成纯函数 `inspect_tx(bytes, Option<pubkey_hex>) -> Result<String, String>`、`cmd_inspect_tx` 读文件薄壳，把 `config::decode_pubkey` 提 pub 复用，注册子命令 + usage；新单测 `inspect_tx_renders_fields_and_hash`/`inspect_tx_verifies_signature_with_pubkey`（对/错 key ⇒ true/false）/`inspect_tx_surfaces_decode_and_pubkey_errors`，共 463 测、localnet head 不变~~ ✅
+- ~~M99 `node pubkey` 只读派生 pubkey——取 pubkey 此前只能跑 `keygen --seed`（会写文件）；M99 加 `node pubkey (--key-file F | --seed HEX) [--genesis-id N ...]` 只读种子、派生并打印 pubkey、不写任何文件，与 `inspect-tx --pubkey` 配对；核心抽成纯函数 `derive_pubkey(seed_hex, field) -> Result<String, ConfigError>`（复用 `config::decode_seed`、容忍尾换行）、`cmd_pubkey` 解析 `--seed`/`--key-file`（都缺 ⇒ 清晰报错）、可复用 M95 `keygen_genesis_entries`，注册子命令 + usage；新单测 `derive_pubkey_matches_keygen`/`derive_pubkey_surfaces_bad_seed`/`derive_pubkey_reads_keygen_written_file`，共 466 测、localnet head 不变~~ ✅
+- ~~M100 `node inspect-block` 区块日志检视——`status` 只重放打印最终状态、无从逐块检视；M100 加 `node inspect-block --dir DIR [--height N]` 读 `{dir}/blocks.log`：无 `--height` 每块一行汇总（height + txs/stake_ops/evidence/validator_updates 计数 + 总块数），给 `--height N` 打印该块 header（`hash`（即 `block.hash()`）/`prev_hash`/各 root/`timestamp_days`）+ 七类 body 计数 + 逐 tx 的 `hash`/`author`；块按自身 `height` 匹配；核心抽成纯函数 `inspect_block(&[Block], Option<u64>) -> Result<String, String>`、`cmd_inspect_block` 用既有 `BlockLog::open`/`read_all` 为薄壳，注册子命令 + usage；新单测 `inspect_block_lists_all_blocks`/`inspect_block_detail_prints_header_and_txs`/`inspect_block_missing_height_errors`，共 469 测、localnet head 不变~~ ✅
 
-……；运维篮子剩余（货币费用（独立共识里程碑）、费用优先出块排序、nonce 反重放、其余列表读（graph/unbonding/bonds/pending）、游标分页、`Accept-Encoding`（压缩须依赖）、RPC auth/TLS、证书/密钥轮换与落盘、follower 认证、每-sink 独立 rotation 覆盖、OTEL/结构化日志 exporter、指标端 TLS、指标 push exporter/直方图/每-peer/每-轮次时延序列）顺延至 M86+，每步仍遵循"可运行、可测试、契约一致"。
+……；运维篮子剩余（货币费用（独立共识里程碑）、费用优先出块排序、nonce 反重放、读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补、keyfile `0600` 已补、现成 genesis 条目已补、`check-config`/`genesis-hash`/`inspect-tx`/`pubkey`/`inspect-block` 已补、助记词/BIP-39、口令 keystore、密钥轮换、游标分页、`Accept-Encoding`（压缩须依赖）、未知方法 `405`、RPC auth/TLS、证书/密钥轮换与落盘、follower 认证、每-sink 独立 rotation 覆盖、OTEL/结构化日志 exporter、指标端 TLS、指标 push exporter/直方图/每-peer/每-轮次时延序列）顺延至 M101+，每步仍遵循"可运行、可测试、契约一致"。
