@@ -7,12 +7,14 @@
 use crate::consensus::{Commit, Vote, VoteType};
 use crate::light::{ProofEntry, ProofKind};
 use crate::merkle::{Proof, Step};
+use crate::validator::ValidatorSet;
 use crate::validator::{Validator, ValidatorUpdate};
 use crate::{
-    Account, Block, BondKind, BridgeHeader, BridgeRedeem, Embedding, Review, Reviewer,
-    SlashEvidence, StakeOp, SubmissionTx,
+    Account, Block, BondKind, BridgeHeader, BridgeRedeem, BridgeSource, ChainState, Embedding,
+    Review, Reviewer, SlashEvidence, StakeOp, SubmissionTx, UnbondingEntry,
 };
 use zhixing_engine::DIM;
+use zhixing_engine::{CognitiveGraph, DeltaKParams, GraphNode};
 
 #[derive(Debug)]
 pub enum CodecError {
@@ -45,6 +47,7 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     e.u64(b.height);
     e.raw(&b.prev_hash);
     e.f32(b.timestamp_days);
+    e.u64(b.proposer); // M122 (wire v1) — in the cert-signed header prefix
     e.raw(&b.next_validators_root);
     // M23: cert-signed state commitments, written into the cert-signed prefix
     // (between `next_validators_root` and the length-prefixed validator_updates
@@ -120,6 +123,7 @@ pub fn encode_header(h: &BlockHeader) -> Vec<u8> {
     e.u64(h.height);
     e.raw(&h.prev_hash);
     e.f32(h.timestamp_days);
+    e.u64(h.proposer); // M122 (wire v1) — must match encode_block's offset
     e.raw(&h.next_validators_root);
     // M23: the two cert-signed state commitments travel with the header so a
     // light client can verify account-inclusion proofs (`accounts_root`) and
@@ -166,6 +170,7 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
     let mut prev_hash = [0u8; 32];
     prev_hash.copy_from_slice(d.take(32)?);
     let timestamp_days = d.f32()?;
+    let proposer = d.u64()?; // M122 (wire v1)
     let mut next_validators_root = [0u8; 32];
     next_validators_root.copy_from_slice(d.take(32)?);
     // M23: the two cert-signed state commitments sit in the same prefix slot
@@ -214,6 +219,7 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
         height,
         prev_hash,
         timestamp_days,
+        proposer,
         next_validators_root,
         state_root,
         accounts_root,
@@ -245,17 +251,18 @@ pub fn encode_certified_header(ch: &CertifiedHeader) -> Vec<u8> {
 /// buffer must decode as exactly one [`Commit`] (the cert codec rejects
 /// trailing bytes, so any padding after the cert is an error).
 pub fn decode_certified_header(buf: &[u8]) -> Result<CertifiedHeader, CodecError> {
-    // Header layout: 8 (height) + 32 (prev) + 4 (timestamp) + 32 (next_validators_root)
-    //   + 32 (state_root) + 32 (accounts_root) + 32 (graph_root, M27)
-    //   + 32 (bridge_root, M30) + 8 (n_updates u64) = 212-byte fixed prefix ‖
-    //   n_updates * 48 bytes (u64 id ‖ 32-byte pubkey ‖ u64 power) ‖
-    //   6 * 32-byte commitments = 192 bytes tail (M30 adds bridge_locks_commitment;
-    //   M31 adds bridge_headers_commitment + bridge_redeems_commitment).
-    if buf.len() < 212 {
+    // Header layout: 8 (height) + 32 (prev) + 4 (timestamp) + 8 (proposer, M122)
+    //   + 32 (next_validators_root) + 32 (state_root) + 32 (accounts_root)
+    //   + 32 (graph_root, M27) + 32 (bridge_root, M30) + 8 (n_updates u64) =
+    //   220-byte fixed prefix ‖ n_updates * 48 bytes (u64 id ‖ 32-byte pubkey ‖
+    //   u64 power) ‖ 6 * 32-byte commitments = 192 bytes tail (M30 adds
+    //   bridge_locks_commitment; M31 adds bridge_headers_commitment +
+    //   bridge_redeems_commitment).
+    if buf.len() < 220 {
         return Err(CodecError::UnexpectedEof);
     }
-    let n_updates = u64::from_be_bytes(buf[204..212].try_into().unwrap());
-    let header_len = 212 + (n_updates as usize) * 48 + 192; // 404 base + 48 per update
+    let n_updates = u64::from_be_bytes(buf[212..220].try_into().unwrap());
+    let header_len = 220 + (n_updates as usize) * 48 + 192; // 412 base + 48 per update
     if buf.len() < header_len {
         return Err(CodecError::UnexpectedEof);
     }
@@ -281,6 +288,12 @@ pub struct BlockHeader {
     pub height: u64,
     pub prev_hash: crate::Hash,
     pub timestamp_days: f32,
+    /// M122 (wire v1): the validator who produced this block. Cert-signed so a
+    /// light client can independently verify fee routing. Set by the producer
+    /// before `Chain::seal`; zero at genesis (the genesis-fallback path in
+    /// `apply_block_inner` absorbs any non-zero fee at height 0 into the
+    /// treasury, but genesis has no txs so it stays 0).
+    pub proposer: u64,
     pub next_validators_root: crate::Hash,
     /// M23: full flat digest of every consensus-state field at this height
     /// (accounts/reviewers/graph/validators/bonds/bonded/unbonding/treasury/supply).
@@ -330,6 +343,7 @@ impl BlockHeader {
             height: b.height,
             prev_hash: b.prev_hash,
             timestamp_days: b.timestamp_days,
+            proposer: b.proposer,
             next_validators_root: b.next_validators_root,
             state_root: b.state_root,
             accounts_root: b.accounts_root,
@@ -337,15 +351,37 @@ impl BlockHeader {
             bridge_root: b.bridge_root,
             validator_updates: b.validator_updates.clone(),
             txs_commitment: list_commitment(&b.txs.iter().map(encode_tx).collect::<Vec<_>>()),
-            stake_ops_commitment: list_commitment(&b.stake_ops.iter().map(encode_stakeop).collect::<Vec<_>>()),
-            evidence_commitment: list_commitment(&b.slashing_evidence.iter().map(encode_evidence).collect::<Vec<_>>()),
-            bridge_locks_commitment: list_commitment(&b.bridge_locks.iter().map(encode_bridge_lock).collect::<Vec<_>>()),
+            stake_ops_commitment: list_commitment(
+                &b.stake_ops.iter().map(encode_stakeop).collect::<Vec<_>>(),
+            ),
+            evidence_commitment: list_commitment(
+                &b.slashing_evidence
+                    .iter()
+                    .map(encode_evidence)
+                    .collect::<Vec<_>>(),
+            ),
+            bridge_locks_commitment: list_commitment(
+                &b.bridge_locks
+                    .iter()
+                    .map(encode_bridge_lock)
+                    .collect::<Vec<_>>(),
+            ),
             // M31: bridge-follow + bridge-redeem body commitments. Each
             // op is canonically encoded via the dedicated fn so the
             // header hash is content-addressed in lockstep with the
             // corresponding body list.
-            bridge_headers_commitment: list_commitment(&b.bridge_headers.iter().map(encode_bridge_header).collect::<Vec<_>>()),
-            bridge_redeems_commitment: list_commitment(&b.bridge_redeems.iter().map(encode_bridge_redeem).collect::<Vec<_>>()),
+            bridge_headers_commitment: list_commitment(
+                &b.bridge_headers
+                    .iter()
+                    .map(encode_bridge_header)
+                    .collect::<Vec<_>>(),
+            ),
+            bridge_redeems_commitment: list_commitment(
+                &b.bridge_redeems
+                    .iter()
+                    .map(encode_bridge_redeem)
+                    .collect::<Vec<_>>(),
+            ),
         }
     }
 
@@ -377,6 +413,7 @@ impl BlockHeader {
             height: self.height,
             prev_hash: self.prev_hash,
             timestamp_days: self.timestamp_days,
+            proposer: self.proposer,
             next_validators_root: self.next_validators_root,
             state_root: self.state_root,
             accounts_root: self.accounts_root,
@@ -417,7 +454,10 @@ impl CertifiedHeader {
     /// Project a full `(Block, Commit)` to its cert-signed header form. The
     /// block's body fields are dropped.
     pub fn from_certified(b: &Block, cert: &Commit) -> Self {
-        CertifiedHeader { header: BlockHeader::from_block(b), cert: cert.clone() }
+        CertifiedHeader {
+            header: BlockHeader::from_block(b),
+            cert: cert.clone(),
+        }
     }
 
     /// The header hash the cert signs.
@@ -463,6 +503,8 @@ fn enc_tx(e: &mut Enc, t: &SubmissionTx, include_sig: bool) {
     e.emb(&t.embedding);
     e.u32(t.domain);
     e.u64(t.stake);
+    e.u64(t.fee); // M122 (wire v1)
+    e.u64(t.nonce); // M122 (wire v1)
     e.u64(t.reviews.len() as u64);
     for r in &t.reviews {
         e.u64(r.reviewer);
@@ -823,7 +865,14 @@ fn dec_proposal(d: &mut Dec) -> Result<crate::round::Proposal, CodecError> {
     signature.copy_from_slice(d.take(64)?);
     let n = d.u64()? as usize;
     let block = decode_block(d.take(n)?)?;
-    Ok(crate::round::Proposal { height, round, block, valid_round, proposer, signature })
+    Ok(crate::round::Proposal {
+        height,
+        round,
+        block,
+        valid_round,
+        proposer,
+        signature,
+    })
 }
 
 /// Canonical bytes of one [`SlashEvidence`] (two conflicting votes), used inside
@@ -908,6 +957,7 @@ pub fn encode_account(a: &Account) -> Vec<u8> {
     e.u64(a.slashed_total);
     e.u64(a.submissions);
     e.u64(a.accepted);
+    e.u64(a.nonce); // M122 (wire v1)
     e.0
 }
 
@@ -923,6 +973,7 @@ pub fn decode_account(buf: &[u8]) -> Result<Account, CodecError> {
     let slashed_total = d.u64()?;
     let submissions = d.u64()?;
     let accepted = d.u64()?;
+    let nonce = d.u64()?; // M122 (wire v1)
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -934,11 +985,310 @@ pub fn decode_account(buf: &[u8]) -> Result<Account, CodecError> {
         slashed_total,
         submissions,
         accepted,
+        nonce,
     })
 }
 
-/// Canonical bytes of one [`Proof`]. Each step is one tag byte (0 = Left,
-/// 1 = Right) followed by 32 bytes of sibling hash.
+// --- M131: full-state snapshot codec -----------------------------------------
+//
+// A snapshot is a canonical, self-describing serialization of an entire
+// [`ChainState`] — the foundation of fast-sync: a joining node can load state at
+// a height without replaying the whole block log. The format is versioned
+// (leading `u32`) and byte-deterministic (same state ⇒ same bytes), so a snapshot
+// can itself be hashed and its `state_root` cross-checked against a cert-signed
+// header. `genesis_hash` and `now_days` are included even though `state_root`
+// excludes them, so decode reproduces a *byte-identical* `ChainState`.
+
+/// Current snapshot wire version. Bumped if the layout ever changes.
+pub const SNAPSHOT_VERSION: u32 = 1;
+
+/// Write the account's state fields into the shared stream (same layout as
+/// [`encode_account`], inlined so the snapshot controls framing).
+fn enc_account_fields(e: &mut Enc, a: &Account) {
+    e.raw(&a.pubkey);
+    e.u64(a.balance);
+    e.u64(a.staked_total);
+    e.u64(a.earned_total);
+    e.u64(a.slashed_total);
+    e.u64(a.submissions);
+    e.u64(a.accepted);
+    e.u64(a.nonce); // M122
+}
+
+/// Inverse of [`enc_account_fields`].
+fn dec_account_fields(d: &mut Dec) -> Result<Account, CodecError> {
+    let mut pubkey = [0u8; 32];
+    pubkey.copy_from_slice(d.take(32)?);
+    Ok(Account {
+        pubkey,
+        balance: d.u64()?,
+        staked_total: d.u64()?,
+        earned_total: d.u64()?,
+        slashed_total: d.u64()?,
+        submissions: d.u64()?,
+        accepted: d.u64()?,
+        nonce: d.u64()?,
+    })
+}
+
+/// Write a validator set as `count ‖ (id ‖ pubkey ‖ power)*`.
+fn enc_validator_set(e: &mut Enc, vs: &ValidatorSet) {
+    let vals = vs.validators();
+    e.u64(vals.len() as u64);
+    for v in vals {
+        e.u64(v.id);
+        e.raw(&v.pubkey);
+        e.u64(v.power);
+    }
+}
+
+/// Inverse of [`enc_validator_set`].
+fn dec_validator_set(d: &mut Dec) -> Result<ValidatorSet, CodecError> {
+    let n = d.count()?;
+    let mut vals = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let id = d.u64()?;
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(d.take(32)?);
+        let power = d.u64()?;
+        vals.push(crate::validator::Validator { id, pubkey, power });
+    }
+    Ok(ValidatorSet::new(vals))
+}
+
+/// Serialize an entire [`ChainState`] to canonical, versioned bytes.
+pub fn encode_snapshot(s: &ChainState) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    e.u32(SNAPSHOT_VERSION);
+    // scalar state
+    e.u64(s.height);
+    e.f32(s.now_days);
+    e.u64(s.supply);
+    e.u64(s.treasury);
+    e.u64(s.bonded);
+    e.u64(s.bridge_locked);
+    e.u64(s.bridge_minted);
+    e.u64(s.next_lock_id);
+    e.u64(s.base_emission_micro);
+    e.u32(s.slash_bps);
+    e.raw(&s.genesis_hash);
+    // ΔK params
+    let p = &s.params;
+    e.f32(p.tau_dup);
+    e.u64(p.n_review_min as u64);
+    e.f32(p.c_cap);
+    e.u64(p.n_min as u64);
+    e.f32(p.lam);
+    e.f32(p.bonus_max);
+    e.f32(p.decay);
+    e.f32(p.fresh_min);
+    e.f32(p.delta_k_min);
+    // accounts
+    e.u64(s.accounts.len() as u64);
+    for (id, a) in &s.accounts {
+        e.u64(*id);
+        enc_account_fields(&mut e, a);
+    }
+    // reviewers
+    e.u64(s.reviewers.len() as u64);
+    for (id, rep) in &s.reviewers {
+        e.u64(*id);
+        e.f32(*rep);
+    }
+    // cognitive graph nodes
+    e.u64(s.graph.nodes.len() as u64);
+    for n in &s.graph.nodes {
+        e.u64(n.node_id);
+        e.emb(&n.embedding);
+        e.u32(n.domain);
+    }
+    // bonds
+    e.u64(s.bonds.len() as u64);
+    for (id, amt) in &s.bonds {
+        e.u64(*id);
+        e.u64(*amt);
+    }
+    // unbonding queue
+    e.u64(s.unbonding.len() as u64);
+    for u in &s.unbonding {
+        e.u64(u.account);
+        e.u64(u.amount);
+        e.u64(u.mature_height);
+    }
+    // active validator set
+    enc_validator_set(&mut e, &s.validators);
+    // bridge locks
+    e.u64(s.bridge_locks.len() as u64);
+    for (id, lock) in &s.bridge_locks {
+        e.u64(*id);
+        enc_bridge_lock(&mut e, lock, true);
+    }
+    // bridge lock heights
+    e.u64(s.bridge_lock_heights.len() as u64);
+    for (id, h) in &s.bridge_lock_heights {
+        e.u64(*id);
+        e.u64(*h);
+    }
+    // bridge sources
+    e.u64(s.bridge_sources.len() as u64);
+    for (chain, src) in &s.bridge_sources {
+        e.raw(chain);
+        enc_validator_set(&mut e, &src.set);
+        e.raw(&src.head);
+        e.u64(src.height);
+        e.u64(src.consumed.len() as u64);
+        for c in &src.consumed {
+            e.u64(*c);
+        }
+    }
+    e.0
+}
+
+/// Inverse of [`encode_snapshot`]. Rejects an unknown version and any trailing
+/// bytes, so a corrupt or newer snapshot fails loudly rather than silently.
+pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let version = d.u32()?;
+    if version != SNAPSHOT_VERSION {
+        return Err(CodecError::BadEnum(version));
+    }
+    let height = d.u64()?;
+    let now_days = d.f32()?;
+    let supply = d.u64()?;
+    let treasury = d.u64()?;
+    let bonded = d.u64()?;
+    let bridge_locked = d.u64()?;
+    let bridge_minted = d.u64()?;
+    let next_lock_id = d.u64()?;
+    let base_emission_micro = d.u64()?;
+    let slash_bps = d.u32()?;
+    let mut genesis_hash = [0u8; 32];
+    genesis_hash.copy_from_slice(d.take(32)?);
+    let params = DeltaKParams {
+        tau_dup: d.f32()?,
+        n_review_min: d.u64()? as usize,
+        c_cap: d.f32()?,
+        n_min: d.u64()? as usize,
+        lam: d.f32()?,
+        bonus_max: d.f32()?,
+        decay: d.f32()?,
+        fresh_min: d.f32()?,
+        delta_k_min: d.f32()?,
+    };
+    // accounts
+    let n = d.count()?;
+    let mut accounts = std::collections::BTreeMap::new();
+    for _ in 0..n {
+        let id = d.u64()?;
+        accounts.insert(id, dec_account_fields(&mut d)?);
+    }
+    // reviewers
+    let n = d.count()?;
+    let mut reviewers = std::collections::BTreeMap::new();
+    for _ in 0..n {
+        let id = d.u64()?;
+        reviewers.insert(id, d.f32()?);
+    }
+    // graph nodes
+    let n = d.count()?;
+    let mut nodes = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let node_id = d.u64()?;
+        let embedding = d.emb()?;
+        let domain = d.u32()?;
+        nodes.push(GraphNode {
+            node_id,
+            embedding,
+            domain,
+        });
+    }
+    let graph = CognitiveGraph { nodes };
+    // bonds
+    let n = d.count()?;
+    let mut bonds = std::collections::BTreeMap::new();
+    for _ in 0..n {
+        let id = d.u64()?;
+        bonds.insert(id, d.u64()?);
+    }
+    // unbonding
+    let n = d.count()?;
+    let mut unbonding = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        unbonding.push(UnbondingEntry {
+            account: d.u64()?,
+            amount: d.u64()?,
+            mature_height: d.u64()?,
+        });
+    }
+    // validators
+    let validators = dec_validator_set(&mut d)?;
+    // bridge locks
+    let n = d.count()?;
+    let mut bridge_locks = std::collections::BTreeMap::new();
+    for _ in 0..n {
+        let id = d.u64()?;
+        bridge_locks.insert(id, dec_bridge_lock(&mut d)?);
+    }
+    // bridge lock heights
+    let n = d.count()?;
+    let mut bridge_lock_heights = std::collections::BTreeMap::new();
+    for _ in 0..n {
+        let id = d.u64()?;
+        bridge_lock_heights.insert(id, d.u64()?);
+    }
+    // bridge sources
+    let n = d.count()?;
+    let mut bridge_sources = std::collections::BTreeMap::new();
+    for _ in 0..n {
+        let mut chain = [0u8; 32];
+        chain.copy_from_slice(d.take(32)?);
+        let set = dec_validator_set(&mut d)?;
+        let mut head = [0u8; 32];
+        head.copy_from_slice(d.take(32)?);
+        let src_height = d.u64()?;
+        let cn = d.count()?;
+        let mut consumed = std::collections::BTreeSet::new();
+        for _ in 0..cn {
+            consumed.insert(d.u64()?);
+        }
+        bridge_sources.insert(
+            chain,
+            BridgeSource {
+                set,
+                head,
+                height: src_height,
+                consumed,
+            },
+        );
+    }
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(ChainState {
+        accounts,
+        reviewers,
+        graph,
+        params,
+        base_emission_micro,
+        slash_bps,
+        supply,
+        treasury,
+        bonded,
+        bonds,
+        unbonding,
+        height,
+        now_days,
+        validators,
+        bridge_locked,
+        bridge_locks,
+        bridge_lock_heights,
+        next_lock_id,
+        bridge_minted,
+        bridge_sources,
+        genesis_hash,
+    })
+}
+
 pub fn encode_proof(p: &Proof) -> Vec<u8> {
     let mut e = Enc(Vec::new());
     e.u64(p.steps.len() as u64);
@@ -1134,7 +1484,11 @@ pub fn decode_graph_node(buf: &[u8]) -> Result<crate::engine::GraphNode, CodecEr
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
-    Ok(crate::engine::GraphNode { node_id, embedding, domain })
+    Ok(crate::engine::GraphNode {
+        node_id,
+        embedding,
+        domain,
+    })
 }
 
 /// M24: canonical bytes of one [`ProofEntry`]. Carries the typed leaf
@@ -1165,8 +1519,8 @@ pub fn decode_proof_entry(buf: &[u8]) -> Result<ProofEntry, CodecError> {
     // 4 bytes per entry.
     let leaf_byte_len = match kind {
         // Account: u64 id ‖ raw pubkey ‖ 6 × u64 (balance, staked, earned,
-        // slashed, submissions, accepted) = 8 + 32 + 48 = 88.
-        ProofKind::Account => 88,
+        // slashed, submissions, accepted) ‖ u64 nonce (M122) = 8 + 32 + 48 + 8 = 96.
+        ProofKind::Account => 96,
         // Reviewer: u64 id ‖ f32 reputation = 8 + 4 = 12.
         ProofKind::Reviewer => 12,
         // Validator: u64 id ‖ raw pubkey ‖ u64 power = 8 + 32 + 8 = 48.
@@ -1182,7 +1536,10 @@ pub fn decode_proof_entry(buf: &[u8]) -> Result<ProofEntry, CodecError> {
     let proof = decode_proof(&buf[1 + leaf_byte_len..])?;
     let entry = match kind {
         ProofKind::Account => {
-            let mut d2 = Dec { buf: leaf_buf, pos: 0 };
+            let mut d2 = Dec {
+                buf: leaf_buf,
+                pos: 0,
+            };
             let id = d2.u64()?;
             let mut pubkey = [0u8; 32];
             pubkey.copy_from_slice(d2.take(32)?);
@@ -1192,6 +1549,7 @@ pub fn decode_proof_entry(buf: &[u8]) -> Result<ProofEntry, CodecError> {
             let slashed_total = d2.u64()?;
             let submissions = d2.u64()?;
             let accepted = d2.u64()?;
+            let nonce = d2.u64()?; // M122 (wire v1)
             ProofEntry::Account {
                 id,
                 account: Account {
@@ -1202,18 +1560,29 @@ pub fn decode_proof_entry(buf: &[u8]) -> Result<ProofEntry, CodecError> {
                     slashed_total,
                     submissions,
                     accepted,
+                    nonce,
                 },
                 proof,
             }
         }
         ProofKind::Reviewer => {
-            let mut d2 = Dec { buf: leaf_buf, pos: 0 };
+            let mut d2 = Dec {
+                buf: leaf_buf,
+                pos: 0,
+            };
             let id = d2.u64()?;
             let reputation = d2.f32()?;
-            ProofEntry::Reviewer { id, reputation, proof }
+            ProofEntry::Reviewer {
+                id,
+                reputation,
+                proof,
+            }
         }
         ProofKind::Validator => {
-            let mut d2 = Dec { buf: leaf_buf, pos: 0 };
+            let mut d2 = Dec {
+                buf: leaf_buf,
+                pos: 0,
+            };
             let id = d2.u64()?;
             let mut pubkey = [0u8; 32];
             pubkey.copy_from_slice(d2.take(32)?);
@@ -1226,7 +1595,11 @@ pub fn decode_proof_entry(buf: &[u8]) -> Result<ProofEntry, CodecError> {
         }
         ProofKind::GraphNode => {
             let graph_node = decode_graph_node(leaf_buf)?;
-            ProofEntry::GraphNode { node_id: graph_node.node_id, graph_node, proof }
+            ProofEntry::GraphNode {
+                node_id: graph_node.node_id,
+                graph_node,
+                proof,
+            }
         }
     };
     Ok(entry)
@@ -1264,6 +1637,7 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     let mut prev_hash = [0u8; 32];
     prev_hash.copy_from_slice(d.take(32)?);
     let timestamp_days = d.f32()?;
+    let proposer = d.u64()?; // M122 (wire v1)
     let mut next_validators_root = [0u8; 32];
     next_validators_root.copy_from_slice(d.take(32)?);
     // M23: cert-signed state commitments travel in the same prefix slot the
@@ -1330,6 +1704,7 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         height,
         prev_hash,
         timestamp_days,
+        proposer,
         next_validators_root,
         state_root,
         accounts_root,
@@ -1357,6 +1732,8 @@ fn dec_tx(d: &mut Dec) -> Result<SubmissionTx, CodecError> {
     let embedding = d.emb()?;
     let domain = d.u32()?;
     let stake = d.u64()?;
+    let fee = d.u64()?; // M122 (wire v1)
+    let nonce = d.u64()?; // M122 (wire v1)
     let n_rev = d.count()?;
     let mut reviews = Vec::with_capacity(n_rev as usize);
     for _ in 0..n_rev {
@@ -1375,6 +1752,8 @@ fn dec_tx(d: &mut Dec) -> Result<SubmissionTx, CodecError> {
         embedding,
         domain,
         stake,
+        fee,
+        nonce,
         reviews,
         repl_success,
         repl_total,
@@ -1420,7 +1799,9 @@ impl<'a> Dec<'a> {
         Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
     fn f32(&mut self) -> Result<f32, CodecError> {
-        Ok(f32::from_bits(u32::from_be_bytes(self.take(4)?.try_into().unwrap())))
+        Ok(f32::from_bits(u32::from_be_bytes(
+            self.take(4)?.try_into().unwrap(),
+        )))
     }
     fn emb(&mut self) -> Result<Embedding, CodecError> {
         let mut e = [0.0f32; DIM];
@@ -1441,9 +1822,9 @@ impl<'a> Dec<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::{decode_gossip, encode_gossip, GossipMsg};
     use crate::BridgeLock;
     use crate::MICRO;
-    use crate::net::{decode_gossip, encode_gossip, GossipMsg};
 
     /// A conflicting-precommit pair for validator `v` at (h, r) — dummy
     /// signatures (the codec does not verify them; that is the chain's job).
@@ -1489,37 +1870,62 @@ mod tests {
                 domain: 2,
                 stake: 2 * MICRO,
                 reviews: vec![
-                    Review { reviewer: 10, score: 0.9 },
-                    Review { reviewer: 11, score: 0.75 },
+                    Review {
+                        reviewer: 10,
+                        score: 0.9,
+                    },
+                    Review {
+                        reviewer: 11,
+                        score: 0.75,
+                    },
                 ],
                 repl_success: 2,
                 repl_total: 3,
                 timestamp_days: 3.0,
                 signature: [9u8; 64],
+                fee: 0,
+                nonce: 0,
             }],
             validator_updates: vec![
-                ValidatorUpdate { id: 25, pubkey: [5u8; 32], power: 3 },
-                ValidatorUpdate { id: 21, pubkey: [0u8; 32], power: 0 },
-            ],
-            stake_ops: vec![
-                StakeOp { account: 1, kind: BondKind::Bond, amount: 5 * MICRO, signature: [7u8; 64] },
-                StakeOp { account: 2, kind: BondKind::Unbond, amount: 2 * MICRO, signature: [8u8; 64] },
-            ],
-            slashing_evidence: vec![sample_evidence(22)],
-            bridge_locks: vec![
-                BridgeLock {
-                    account: 1,
-                    amount: 3 * MICRO,
-                    dest_chain: [77u8; 32],
-                    dest_account: 9,
-                    nonce: 1,
-                    signature: [6u8; 64],
+                ValidatorUpdate {
+                    id: 25,
+                    pubkey: [5u8; 32],
+                    power: 3,
+                },
+                ValidatorUpdate {
+                    id: 21,
+                    pubkey: [0u8; 32],
+                    power: 0,
                 },
             ],
+            stake_ops: vec![
+                StakeOp {
+                    account: 1,
+                    kind: BondKind::Bond,
+                    amount: 5 * MICRO,
+                    signature: [7u8; 64],
+                },
+                StakeOp {
+                    account: 2,
+                    kind: BondKind::Unbond,
+                    amount: 2 * MICRO,
+                    signature: [8u8; 64],
+                },
+            ],
+            slashing_evidence: vec![sample_evidence(22)],
+            bridge_locks: vec![BridgeLock {
+                account: 1,
+                amount: 3 * MICRO,
+                dest_chain: [77u8; 32],
+                dest_account: 9,
+                nonce: 1,
+                signature: [6u8; 64],
+            }],
             // M31: leave empty in the round-trip fixture; the per-op
             // encode/decode fns have their own dedicated round-trip tests.
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
+            proposer: 0,
         }
     }
 
@@ -1546,7 +1952,10 @@ mod tests {
         };
         match decode_consensus_msg(&encode_consensus_msg(&Msg::Proposal(prop))).unwrap() {
             Msg::Proposal(p) => {
-                assert_eq!((p.height, p.round, p.valid_round, p.proposer), (7, 2, -1, 21));
+                assert_eq!(
+                    (p.height, p.round, p.valid_round, p.proposer),
+                    (7, 2, -1, 21)
+                );
                 assert_eq!(p.signature, [5u8; 64]);
                 assert_eq!(p.block.hash(), sample_block().hash());
             }
@@ -1598,7 +2007,10 @@ mod tests {
         };
         let mut bytes = encode_consensus_msg(&Msg::Proposal(prop));
         bytes.push(0);
-        assert!(matches!(decode_consensus_msg(&bytes), Err(CodecError::TrailingBytes)));
+        assert!(matches!(
+            decode_consensus_msg(&bytes),
+            Err(CodecError::TrailingBytes)
+        ));
         assert!(decode_consensus_msg(&[]).is_err());
     }
 
@@ -1611,7 +2023,7 @@ mod tests {
         assert_eq!(back.validator_updates[0].power, 3);
         assert_eq!(back.validator_updates[1].id, 21);
         assert_eq!(back.validator_updates[1].power, 0); // removal encoded as power 0
-        // a block with no updates still round-trips (empty length prefix)
+                                                        // a block with no updates still round-trips (empty length prefix)
         let mut plain = sample_block();
         plain.validator_updates.clear();
         let back2 = decode_block(&encode_block(&plain)).unwrap();
@@ -1636,7 +2048,10 @@ mod tests {
         // trailing bytes are rejected
         let mut extra = bytes.clone();
         extra.push(0);
-        assert!(matches!(decode_stakeop(&extra), Err(CodecError::TrailingBytes)));
+        assert!(matches!(
+            decode_stakeop(&extra),
+            Err(CodecError::TrailingBytes)
+        ));
     }
 
     #[test]
@@ -1669,7 +2084,10 @@ mod tests {
         // trailing bytes are rejected
         let mut extra = bytes.clone();
         extra.push(0);
-        assert!(matches!(decode_evidence(&extra), Err(CodecError::TrailingBytes)));
+        assert!(matches!(
+            decode_evidence(&extra),
+            Err(CodecError::TrailingBytes)
+        ));
     }
 
     #[test]
@@ -1714,7 +2132,10 @@ mod tests {
     fn trailing_bytes_error() {
         let mut bytes = encode_block(&sample_block());
         bytes.push(0);
-        assert!(matches!(decode_block(&bytes), Err(CodecError::TrailingBytes)));
+        assert!(matches!(
+            decode_block(&bytes),
+            Err(CodecError::TrailingBytes)
+        ));
     }
 
     #[test]
@@ -1756,7 +2177,10 @@ mod tests {
         };
         let mut bytes = encode_commit(&commit);
         bytes.push(0);
-        assert!(matches!(decode_commit(&bytes), Err(CodecError::TrailingBytes)));
+        assert!(matches!(
+            decode_commit(&bytes),
+            Err(CodecError::TrailingBytes)
+        ));
     }
 
     // --- header codec (M22) ------------------------------------------------
@@ -1791,7 +2215,11 @@ mod tests {
         let mut tampered = b.clone();
         tampered.txs[0].stake += 1;
         let h2 = BlockHeader::from_block(&tampered);
-        assert_ne!(h2.hash(), h.hash(), "tampering a body changes the header hash");
+        assert_ne!(
+            h2.hash(),
+            h.hash(),
+            "tampering a body changes the header hash"
+        );
     }
 
     #[test]
@@ -1825,13 +2253,19 @@ mod tests {
         let back = decode_certified_header(&bytes).unwrap();
         assert_eq!(encode_certified_header(&back), bytes);
         assert_eq!(back.header.height, ch.header.height);
-        assert_eq!(back.header.next_validators_root, ch.header.next_validators_root);
+        assert_eq!(
+            back.header.next_validators_root,
+            ch.header.next_validators_root
+        );
         assert_eq!(back.cert.height, cert.height);
         assert_eq!(back.cert.block_hash, ch.cert.block_hash);
         // trailing bytes are rejected
         let mut extra = bytes.clone();
         extra.push(0);
-        assert!(matches!(decode_certified_header(&extra), Err(CodecError::TrailingBytes)));
+        assert!(matches!(
+            decode_certified_header(&extra),
+            Err(CodecError::TrailingBytes)
+        ));
     }
 
     // --- M27: graph_root slot round-trip ----------------------------------
@@ -1863,8 +2297,11 @@ mod tests {
         let h = BlockHeader::from_block(&b);
         let hdr_bytes = encode_header(&h);
         let prefix_len = 8 + 32 + 4 + 32 + 32 + 32 + 32; // 180-byte fixed prefix
-        assert_eq!(hdr_bytes[..prefix_len], bytes[..prefix_len],
-            "encode_header and encode_block must share the 180-byte prefix");
+        assert_eq!(
+            hdr_bytes[..prefix_len],
+            bytes[..prefix_len],
+            "encode_header and encode_block must share the 180-byte prefix"
+        );
     }
 
     #[test]
@@ -1873,7 +2310,10 @@ mod tests {
         let h = BlockHeader::from_block(&b);
         let mut bytes = encode_header(&h);
         bytes.push(0);
-        assert!(matches!(decode_header(&bytes), Err(CodecError::TrailingBytes)));
+        assert!(matches!(
+            decode_header(&bytes),
+            Err(CodecError::TrailingBytes)
+        ));
     }
 
     // --- M24: typed proof wire codecs ---------------------------------------
@@ -1904,14 +2344,20 @@ mod tests {
             (ProofKind::Validator, 25),
             (ProofKind::GraphNode, 0),
         ];
-        let req_bytes = encode_gossip(&GossipMsg::GetProof { items: request_items.clone() });
+        let req_bytes = encode_gossip(&GossipMsg::GetProof {
+            items: request_items.clone(),
+        });
         let req_back: GossipMsg = decode_gossip(&req_bytes).unwrap();
         let req_items_back = match &req_back {
             GossipMsg::GetProof { items } => items.clone(),
             other => panic!("expected GetProof, got {other:?}"),
         };
         assert_eq!(req_items_back, request_items);
-        assert_eq!(encode_gossip(&req_back), req_bytes, "GetProof must be self-stable");
+        assert_eq!(
+            encode_gossip(&req_back),
+            req_bytes,
+            "GetProof must be self-stable"
+        );
 
         // Build a `Proof` covering all four kinds plus a None slot.
         let account = Account {
@@ -1922,6 +2368,7 @@ mod tests {
             slashed_total: 0,
             submissions: 4,
             accepted: 3,
+            nonce: 0,
         };
         let validator = Validator {
             id: 25,
@@ -1930,22 +2377,38 @@ mod tests {
         };
         let graph_node = GraphNode {
             node_id: 7,
-            embedding: [
-                0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8,
-            ],
+            embedding: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
             domain: 42,
         };
         let fake_proof = Proof {
             steps: vec![Step::Right([0xCC; 32])],
         };
         let resp_items: Vec<Option<ProofEntry>> = vec![
-            Some(ProofEntry::Account { id: 1, account: account.clone(), proof: fake_proof.clone() }),
+            Some(ProofEntry::Account {
+                id: 1,
+                account: account.clone(),
+                proof: fake_proof.clone(),
+            }),
             None,
-            Some(ProofEntry::Reviewer { id: 10, reputation: 0.91, proof: fake_proof.clone() }),
-            Some(ProofEntry::Validator { id: 25, validator: validator.clone(), proof: fake_proof.clone() }),
-            Some(ProofEntry::GraphNode { node_id: 7, graph_node: graph_node.clone(), proof: fake_proof.clone() }),
+            Some(ProofEntry::Reviewer {
+                id: 10,
+                reputation: 0.91,
+                proof: fake_proof.clone(),
+            }),
+            Some(ProofEntry::Validator {
+                id: 25,
+                validator: validator.clone(),
+                proof: fake_proof.clone(),
+            }),
+            Some(ProofEntry::GraphNode {
+                node_id: 7,
+                graph_node: graph_node.clone(),
+                proof: fake_proof.clone(),
+            }),
         ];
-        let resp_bytes = encode_gossip(&GossipMsg::Proof { items: resp_items.clone() });
+        let resp_bytes = encode_gossip(&GossipMsg::Proof {
+            items: resp_items.clone(),
+        });
         let resp_back: GossipMsg = decode_gossip(&resp_bytes).unwrap();
         let resp_items_back = match &resp_back {
             GossipMsg::Proof { items } => items.clone(),
@@ -1955,7 +2418,11 @@ mod tests {
         for (i, (a, b)) in resp_items_back.iter().zip(resp_items.iter()).enumerate() {
             assert_eq!(a, b, "entry {i} mismatch after round-trip");
         }
-        assert_eq!(encode_gossip(&resp_back), resp_bytes, "Proof must be self-stable");
+        assert_eq!(
+            encode_gossip(&resp_back),
+            resp_bytes,
+            "Proof must be self-stable"
+        );
     }
 
     /// M25: encode/decode a standalone `ProofEntry::GraphNode` and confirm
@@ -1971,12 +2438,13 @@ mod tests {
             domain: 9,
         };
         let proof = Proof {
-            steps: vec![
-                Step::Left([0x11; 32]),
-                Step::Right([0x22; 32]),
-            ],
+            steps: vec![Step::Left([0x11; 32]), Step::Right([0x22; 32])],
         };
-        let entry = ProofEntry::GraphNode { node_id: 17, graph_node: n.clone(), proof: proof.clone() };
+        let entry = ProofEntry::GraphNode {
+            node_id: 17,
+            graph_node: n.clone(),
+            proof: proof.clone(),
+        };
         let bytes = encode_proof_entry(&entry);
         // kind tag = 3, then 44-byte leaf, then proof bytes.
         assert_eq!(bytes[0], 3);
@@ -2073,8 +2541,7 @@ mod tests {
     #[test]
     fn encode_batch_envelope_round_trips() {
         use crate::light::{
-            BatchItem, BatchResponseEnvelope, BatchResponseItem, DiffEnvelope,
-            ProofEntry,
+            BatchItem, BatchResponseEnvelope, BatchResponseItem, DiffEnvelope, ProofEntry,
         };
         let g = crate::engine::GraphNode {
             node_id: 0,
@@ -2089,6 +2556,7 @@ mod tests {
             slashed_total: 0,
             submissions: 0,
             accepted: 0,
+            nonce: 0,
         };
         let inclusion_entry = ProofEntry::Account {
             id: 1,
@@ -2112,6 +2580,7 @@ mod tests {
                 bridge_locks_commitment: [0u8; 32],
                 bridge_headers_commitment: [0u8; 32],
                 bridge_redeems_commitment: [0u8; 32],
+                proposer: 0,
             },
             cert_prev: crate::consensus::Commit {
                 height: 1,
@@ -2135,6 +2604,7 @@ mod tests {
                 bridge_locks_commitment: [0u8; 32],
                 bridge_headers_commitment: [0u8; 32],
                 bridge_redeems_commitment: [0u8; 32],
+                proposer: 0,
             },
             cert_new: crate::consensus::Commit {
                 height: 2,
@@ -2225,10 +2695,7 @@ mod tests {
                 kind: crate::light::ProofKind::Account,
                 id: 7,
             },
-            BatchItem::Knn {
-                query: q,
-                k: 3,
-            },
+            BatchItem::Knn { query: q, k: 3 },
             BatchItem::Range {
                 query: q,
                 min_sim: 0.0,
@@ -2257,6 +2724,7 @@ mod tests {
                         bridge_locks_commitment: [0u8; 32],
                         bridge_headers_commitment: [0u8; 32],
                         bridge_redeems_commitment: [0u8; 32],
+                        proposer: 0,
                     },
                     cert_prev: crate::consensus::Commit {
                         height: 1,
@@ -2280,6 +2748,7 @@ mod tests {
                         bridge_locks_commitment: [0u8; 32],
                         bridge_headers_commitment: [0u8; 32],
                         bridge_redeems_commitment: [0u8; 32],
+                        proposer: 0,
                     },
                     cert_new: crate::consensus::Commit {
                         height: 2,
@@ -2299,7 +2768,9 @@ mod tests {
         // Reference ProofEntry to silence the import.
         let _ = std::mem::size_of::<ProofEntry>();
 
-        let get = GossipMsg::GetBatch { items: items.clone() };
+        let get = GossipMsg::GetBatch {
+            items: items.clone(),
+        };
         let bytes = encode_gossip(&get);
         let back = decode_gossip(&bytes).expect("decode GetBatch");
         match back {
@@ -2357,8 +2828,16 @@ mod tests {
 
     fn sample_validator_set() -> crate::validator::ValidatorSet {
         crate::validator::ValidatorSet::new(vec![
-            Validator { id: 21, pubkey: [1u8; 32], power: 2 },
-            Validator { id: 22, pubkey: [2u8; 32], power: 3 },
+            Validator {
+                id: 21,
+                pubkey: [1u8; 32],
+                power: 2,
+            },
+            Validator {
+                id: 22,
+                pubkey: [2u8; 32],
+                power: 3,
+            },
         ])
     }
 
@@ -2400,7 +2879,10 @@ mod tests {
         // trailing bytes are rejected
         let mut extra = bytes.clone();
         extra.push(0);
-        assert!(matches!(decode_bridge_header(&extra), Err(CodecError::TrailingBytes)));
+        assert!(matches!(
+            decode_bridge_header(&extra),
+            Err(CodecError::TrailingBytes)
+        ));
     }
 
     #[test]
@@ -2436,7 +2918,10 @@ mod tests {
         // trailing bytes are rejected
         let mut extra = bytes.clone();
         extra.push(0);
-        assert!(matches!(decode_bridge_redeem(&extra), Err(CodecError::TrailingBytes)));
+        assert!(matches!(
+            decode_bridge_redeem(&extra),
+            Err(CodecError::TrailingBytes)
+        ));
     }
 
     #[test]
@@ -2463,7 +2948,9 @@ mod tests {
                 nonce: 0,
                 signature: [6u8; 64],
             },
-            proof: Proof { steps: vec![Step::Right([9u8; 32])] },
+            proof: Proof {
+                steps: vec![Step::Right([9u8; 32])],
+            },
         }];
         let bytes = encode_block(&b);
         let back = decode_block(&bytes).unwrap();
@@ -2476,6 +2963,99 @@ mod tests {
         let mut plain = b.clone();
         plain.bridge_headers.clear();
         plain.bridge_redeems.clear();
-        assert_ne!(decode_block(&encode_block(&plain)).unwrap().hash(), b.hash());
+        assert_ne!(
+            decode_block(&encode_block(&plain)).unwrap().hash(),
+            b.hash()
+        );
+    }
+
+    // --- M131: snapshot codec round-trip ------------------------------------
+
+    /// A non-trivial `ChainState`: genesis (accounts/reviewers/seed graph/validators)
+    /// plus a bond, an unbonding entry, a bridge lock + its height, and a bridge mint —
+    /// so the round-trip exercises every map/vec/nested field.
+    fn sample_state() -> ChainState {
+        let pk = |n: u8| crate::Keypair::from_seed([n; 32]).public();
+        let mut emb = [0.0f32; DIM];
+        emb[1] = 1.0;
+        let g = crate::Genesis {
+            accounts: vec![(1, 30 * MICRO, pk(1)), (2, 50 * MICRO, pk(2))],
+            reviewers: vec![(10, 1.0), (11, 0.5)],
+            seed_nodes: vec![(emb, 0)],
+            params: DeltaKParams::default(),
+            base_emission_micro: 8 * MICRO,
+            slash_bps: 10_000,
+            timestamp_days: 1.5,
+            validators: vec![(21, pk(21), 3), (22, pk(22), 1)],
+            bridge_sources: vec![],
+        };
+        let (mut s, _gh) = ChainState::genesis(g);
+        // Poke the stake + bridge fields so they are non-empty in the snapshot.
+        s.bonds.insert(21, 3 * MICRO);
+        s.bonded = 3 * MICRO;
+        s.unbonding.push(UnbondingEntry {
+            account: 2,
+            amount: MICRO,
+            mature_height: 9,
+        });
+        s.bridge_locks.insert(
+            0,
+            crate::BridgeLock {
+                account: 1,
+                amount: 5 * MICRO,
+                dest_chain: [7u8; 32],
+                dest_account: 2,
+                nonce: 0,
+                signature: [9u8; 64],
+            },
+        );
+        s.bridge_lock_heights.insert(0, 1);
+        s.next_lock_id = 1;
+        s.bridge_locked = 5 * MICRO;
+        s.bridge_minted = 2 * MICRO;
+        s
+    }
+
+    #[test]
+    fn snapshot_round_trips_to_identical_state() {
+        // M131: encode → decode reproduces a byte-identical state: same cert-signed roots,
+        // same scalar fields, and a byte-identical re-encode (determinism).
+        let s = sample_state();
+        let bytes = encode_snapshot(&s);
+        let back = decode_snapshot(&bytes).expect("decode snapshot");
+        // The cert-signed commitments are the strongest equality check (they digest the
+        // whole state); matching them means the decode reproduced the state faithfully.
+        assert_eq!(back.state_root(), s.state_root(), "state_root");
+        assert_eq!(back.merkle_root(), s.merkle_root(), "accounts_root");
+        assert_eq!(
+            back.bridge_merkle_root(),
+            s.bridge_merkle_root(),
+            "bridge_root"
+        );
+        // Fields excluded from state_root must still round-trip.
+        assert_eq!(back.genesis_hash, s.genesis_hash, "genesis_hash");
+        assert_eq!(back.now_days, s.now_days, "now_days");
+        assert_eq!(back.next_lock_id, s.next_lock_id, "next_lock_id");
+        assert_eq!(back.bridge_minted, s.bridge_minted, "bridge_minted");
+        // Re-encoding the decoded state is byte-identical (canonical, deterministic).
+        assert_eq!(encode_snapshot(&back), bytes, "re-encode stable");
+    }
+
+    #[test]
+    fn snapshot_rejects_bad_version_and_trailing_bytes() {
+        // M131: an unknown leading version ⇒ BadEnum; extra trailing bytes ⇒ TrailingBytes.
+        let bytes = encode_snapshot(&sample_state());
+        let mut wrong = bytes.clone();
+        wrong[0..4].copy_from_slice(&999u32.to_be_bytes());
+        assert!(matches!(
+            decode_snapshot(&wrong),
+            Err(CodecError::BadEnum(999))
+        ));
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(matches!(
+            decode_snapshot(&extra),
+            Err(CodecError::TrailingBytes)
+        ));
     }
 }

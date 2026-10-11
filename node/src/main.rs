@@ -31,16 +31,18 @@ use std::sync::mpsc;
 use std::thread;
 
 use zhixing_engine::{DeltaKParams, DIM};
+use zhixing_node::bridge::{BridgeEndpoint, BridgeError};
+use zhixing_node::codec::BlockHeader;
 use zhixing_node::config::{self, NodeConfig, NodeSection, PeerConfig};
 use zhixing_node::consensus::{commit_block, detect_equivocation, Commit};
 use zhixing_node::daemon;
 use zhixing_node::driver::ChainDriver;
-use zhixing_node::codec::BlockHeader;
-use zhixing_node::bridge::{BridgeEndpoint, BridgeError};
 use zhixing_node::light::{DiffEnvelope, LightError, ProofEntry, ValidatorTracker};
 use zhixing_node::mempool::Mempool;
 use zhixing_node::merkle;
-use zhixing_node::net::{read_msg, write_msg, GossipMsg, GossipNode, LightGossipNode, LightNetwork, Network};
+use zhixing_node::net::{
+    read_msg, write_msg, GossipMsg, GossipNode, LightGossipNode, LightNetwork, Network,
+};
 use zhixing_node::round::Sim;
 use zhixing_node::store::{BlockLog, CertLog};
 use zhixing_node::validator::{Validator, ValidatorSet, ValidatorUpdate};
@@ -76,17 +78,46 @@ fn blend(a: usize, b: usize) -> Emb {
 fn reviews(scores: &[(u64, f32)]) -> Vec<Review> {
     scores
         .iter()
-        .map(|(id, s)| Review { reviewer: *id, score: *s })
+        .map(|(id, s)| Review {
+            reviewer: *id,
+            score: *s,
+        })
         .collect()
 }
 
-/// Build and sign a submission with `author`'s key.
-fn tx(author: u64, emb: Emb, domain: u32, revs: Vec<Review>, repl: (u32, u32), day: f32) -> SubmissionTx {
+/// Build and sign a submission with `author`'s key. `nonce: 0` — call
+/// `tx_nonce` instead for follow-up txs from the same author.
+fn tx(
+    author: u64,
+    emb: Emb,
+    domain: u32,
+    revs: Vec<Review>,
+    repl: (u32, u32),
+    day: f32,
+) -> SubmissionTx {
+    tx_nonce(author, emb, domain, revs, repl, day, 0)
+}
+
+/// M122: explicit-nonce variant. The demo and the gossip `submit-tx` flow
+/// build each tx with the author's current account nonce; this variant exists
+/// so a single block carrying > 1 tx from the same author can label them
+/// 0, 1, 2, … in the order they would apply.
+fn tx_nonce(
+    author: u64,
+    emb: Emb,
+    domain: u32,
+    revs: Vec<Review>,
+    repl: (u32, u32),
+    day: f32,
+    nonce: u64,
+) -> SubmissionTx {
     SubmissionTx {
         author,
         embedding: emb,
         domain,
         stake: 2 * MICRO,
+        fee: 0,
+        nonce,
         reviews: revs,
         repl_success: repl.0,
         repl_total: repl.1,
@@ -139,7 +170,11 @@ fn demo_validators() -> (ValidatorSet, BTreeMap<u64, [u8; 32]>) {
     let ids = [21u64, 22, 23, 24];
     let vset = ValidatorSet::new(
         ids.iter()
-            .map(|&id| Validator { id, pubkey: kp(id).public(), power: 1 })
+            .map(|&id| Validator {
+                id,
+                pubkey: kp(id).public(),
+                power: 1,
+            })
             .collect(),
     );
     let seeds = ids
@@ -163,6 +198,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         height: 1,
         prev_hash: trial.head,
         timestamp_days: 1.0,
+        proposer: 0, // M122
         next_validators_root: [0u8; 32],
         // M23: state commitments stamped by `Chain::commit`.
         state_root: [0u8; 32],
@@ -171,8 +207,22 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         graph_root: [0u8; 32],
         bridge_root: [0u8; 32],
         txs: vec![
-            tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
-            tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
+            tx(
+                1,
+                unit(1),
+                1,
+                reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]),
+                (3, 3),
+                1.0,
+            ),
+            tx(
+                2,
+                unit(2),
+                2,
+                reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]),
+                (3, 3),
+                1.0,
+            ),
         ],
         validator_updates: Vec::new(),
         stake_ops: Vec::new(),
@@ -188,6 +238,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         height: 2,
         prev_hash: b1.hash(),
         timestamp_days: 2.0,
+        proposer: 0, // M122
         next_validators_root: [0u8; 32],
         // M23: state commitments stamped by `Chain::commit`.
         state_root: [0u8; 32],
@@ -195,8 +246,24 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         graph_root: [0u8; 32],
         bridge_root: [0u8; 32],
         txs: vec![
-            tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 2.0),
-            tx(1, unit(0), 0, reviews(&[(10, 0.7), (11, 0.6), (12, 0.65)]), (0, 3), 2.0),
+            tx(
+                3,
+                blend(1, 2),
+                3,
+                reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]),
+                (3, 3),
+                2.0,
+            ),
+            // M122: author 1's first tx was in b1, so this follow-up is nonce 1.
+            tx_nonce(
+                1,
+                unit(0),
+                0,
+                reviews(&[(10, 0.7), (11, 0.6), (12, 0.65)]),
+                (0, 3),
+                2.0,
+                1,
+            ),
         ],
         validator_updates: Vec::new(),
         stake_ops: Vec::new(),
@@ -234,12 +301,27 @@ fn main() {
         "batch" => cmd_batch(),
         "bridge" => cmd_bridge(),
         "redeem" => cmd_redeem(),
-        "run" => cmd_run(config_arg(&args)),
+        "run" => cmd_run(config_arg(&args), &args),
+        "check-config" => cmd_check_config(config_arg(&args)),
+        "genesis-hash" => cmd_genesis_hash(config_arg(&args)),
+        "inspect-genesis" => cmd_inspect_genesis(config_arg(&args)),
+        "inspect-tx" => cmd_inspect_tx(&args),
+        "pubkey" => cmd_pubkey(&args),
         "submit-tx" => cmd_submit_tx(config_arg(&args), tx_arg(&args)),
+        "rpc" => cmd_rpc(&args),
         "encode-tx" => cmd_encode_tx(&args),
         "keygen" => cmd_keygen(&args),
         "localnet" => cmd_localnet(),
         "status" => cmd_status(dir_arg(&args)),
+        "verify" => cmd_verify(dir_arg(&args)),
+        "snapshot" => cmd_snapshot(dir_arg(&args), req_arg(&args, "--out").to_string()),
+        "inspect-snapshot" => cmd_inspect_snapshot(req_arg(&args, "--snapshot").to_string()),
+        "check-snapshot" => cmd_check_snapshot(
+            req_arg(&args, "--snapshot").to_string(),
+            req_arg(&args, "--header").to_string(),
+        ),
+        "inspect-block" => cmd_inspect_block(&args),
+        "inspect-cert" => cmd_inspect_cert(&args),
         "certs" => cmd_certs(dir_arg(&args)),
         "-h" | "--help" | "help" => usage(),
         other => {
@@ -294,11 +376,17 @@ fn usage() {
     eprintln!("  node prove              build+verify a light-client Merkle proof of an account");
     eprintln!("  node vprove             prove a validator's membership in a cert-signed block's next set");
     eprintln!("  node bft                4 validators certify a block; show fault tolerance + equivocation");
-    eprintln!("  node live               drive the BFT round FSM to a commit (incl. a dead proposer)");
+    eprintln!(
+        "  node live               drive the BFT round FSM to a commit (incl. a dead proposer)"
+    );
     eprintln!("  node chain              grow a BFT-certified chain height by height (mempool -> consensus -> commit)");
-    eprintln!("  node validators         grow a chain across on-chain validator-set changes (add/remove)");
+    eprintln!(
+        "  node validators         grow a chain across on-chain validator-set changes (add/remove)"
+    );
     eprintln!("  node staking            bond stake to gain validator power; unbond through a delayed withdrawal");
-    eprintln!("  node slashing           slash an equivocating validator's bonded stake to the treasury");
+    eprintln!(
+        "  node slashing           slash an equivocating validator's bonded stake to the treasury"
+    );
     eprintln!("  node gossip             gossip + anti-entropy sync: fresh nodes catch up to a certified chain (in-proc + TCP)");
     eprintln!("  node light              light client: follow the validator set across heights without full replay");
     eprintln!("  node lsync              header-only SPV sync over the gossip bus: a light peer reaches the full node's height with zero tx bodies");
@@ -311,17 +399,35 @@ fn usage() {
     eprintln!("  node bridge             trustless bridge: chain A locks to chain B, relayer ferries a cert-signed envelope, B's endpoint verifies + credits — no relayer trust");
     eprintln!("  node redeem             consensus-level redeem: B's producer follows A on-chain and mints from a source lock inside its state machine — the mint is BFT-enforced, not off-chain");
     eprintln!("  node run    --config F  run the networked BFT daemon (tokio TCP P2P): load config/genesis/validator key, gossip votes + sync/verify over sockets");
+    eprintln!("  node run    --config F --snapshot FILE --snapshot-header HEX [--snapshot-cert HEX --snapshot-validators FILE]  adopt a M131 snapshot at boot (fast-sync): verify the header's three roots against the snapshot (M135) and, when a cert + trusted set are given, additionally require the cert to reach >2/3 of that pinned set (M141); restart resumes the post-snapshot tail without re-syncing");
+    eprintln!("  node check-config --config F  dry-run: load + validate config, its genesis, and validator key (if any) without starting the daemon; print a summary or the first error");
+    eprintln!("  node genesis-hash --config F  print the chain identity derived from the config's genesis: genesis_hash + initial state_root + validator count (compare across operators before joining)");
+    eprintln!("  node inspect-genesis --config F  dump the config's genesis contents: every account (id/balance/pubkey), reviewer, validator, plus params (the detail view to genesis-hash's identity)");
     eprintln!("  node submit-tx --config F --tx F  submit a codec-encoded tx to a running daemon's [rpc] ingress endpoint; print accepted hash or reject reason");
-    eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--config F]  author+sign a tx offline into a submit-tx file; print its hash");
+    eprintln!("  node rpc --config F --path P [--post FILE]  send a request to the config's [rpc] endpoint and print the response body; GET by default, or POST FILE's raw bytes (e.g. /validate, /submit_tx, /batch)");
+    eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--fee MICRO] [--nonce N] [--config F]  author+sign a tx offline into a submit-tx file; print its hash; M122: --fee paid to the proposer (default 0), --nonce must equal the author's account nonce (default 0)");
+    eprintln!("  node inspect-tx --tx F [--pubkey HEX]  decode a codec-encoded tx file and print its fields + content hash; with --pubkey, also verify the signature (the read-side companion to encode-tx)");
     eprintln!("  node keygen --out F [--seed HEX]  generate (or derive from a 64-hex seed) an ed25519 keypair; write the seed file (for encode-tx --key-file) and print the pubkey");
+    eprintln!("  node keygen ... --genesis-id N [--balance MICRO] [--power P]  also print a ready-to-paste genesis [[accounts]] (and, with --power, [[validators]]) entry");
+    eprintln!("  node pubkey (--key-file F | --seed HEX) [--genesis-id N ...]  derive + print the pubkey for an existing seed WITHOUT writing a file (read-only; pairs with inspect-tx --pubkey)");
     eprintln!("  node localnet           spin up an in-process tokio testnet (4 validators, no sequencer) and show all nodes converge via distributed BFT voting over real sockets");
     eprintln!("  node status --dir DIR   replay the block log and print state");
+    eprintln!("  node verify --dir DIR   replay blocks+certs logs through finality verification; non-zero exit on any integrity error (missing log, length mismatch, cert mismatch, < 2/3 quorum)");
+    eprintln!("  node snapshot --dir DIR --out FILE  export the chain (replay-verified) as a M131 snapshot blob; --out - writes to stdout");
+    eprintln!("  node inspect-snapshot --snapshot FILE  decode a M131 snapshot blob and print height/roots/supply_conserved; --snapshot - reads stdin");
+    eprintln!("  node check-snapshot --snapshot FILE --header HEX  cross-check a snapshot against a cert-signed BlockHeader hex (GET /header/{{h}}): height + 3 roots must match; non-zero exit on mismatch");
+    eprintln!("  node inspect-block --dir DIR [--height N]  read the persisted block log and print a per-block summary, or (with --height) one block's header + contents + tx hashes");
+    eprintln!("  node inspect-cert  --dir DIR [--height N]  read the persisted cert log and print a per-cert summary, or (with --height) one finality certificate's height/round/block_hash + precommit voters");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
 }
 
 fn cmd_demo() {
     let mut chain = Chain::new(demo_genesis());
-    println!("genesis  head={}  supply={} COG", short(&chain.head), cog(chain.state.supply));
+    println!(
+        "genesis  head={}  supply={} COG",
+        short(&chain.head),
+        cog(chain.state.supply)
+    );
     for blk in demo_blocks(&chain) {
         let label = format!("block {}", blk.height);
         commit_print(&mut chain, None, &label, blk);
@@ -336,13 +442,37 @@ fn cmd_build() {
     let chain = Chain::new(demo_genesis());
     // three novel submissions, offered to the pool in a deliberately odd order
     let candidates = vec![
-        tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 1.0),
-        tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
-        tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
+        tx(
+            3,
+            blend(1, 2),
+            3,
+            reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]),
+            (3, 3),
+            1.0,
+        ),
+        tx(
+            1,
+            unit(1),
+            1,
+            reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]),
+            (3, 3),
+            1.0,
+        ),
+        tx(
+            2,
+            unit(2),
+            2,
+            reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]),
+            (3, 3),
+            1.0,
+        ),
     ];
 
     let mut mp = Mempool::new(16);
-    println!("submitting {} txs to the mempool (arrival order):", candidates.len());
+    println!(
+        "submitting {} txs to the mempool (arrival order):",
+        candidates.len()
+    );
     for t in &candidates {
         let h = mp.insert(&chain, t.clone()).unwrap();
         println!("  author #{}  tx={}", t.author, short(&h));
@@ -350,7 +480,10 @@ fn cmd_build() {
 
     let mut blk = mp.build_block(&chain, 1.0).expect("pool builds a block");
     chain.seal(&mut blk).expect("seal the built block");
-    println!("\nbuilder laid out block {} (canonical, hash-ordered):", blk.height);
+    println!(
+        "\nbuilder laid out block {} (canonical, hash-ordered):",
+        blk.height
+    );
     for t in &blk.txs {
         println!("  author #{}  tx={}", t.author, short(&t.hash()));
     }
@@ -374,12 +507,23 @@ fn cmd_prove() {
     println!("merkle_root = {}\n", short(&root));
 
     let id = 1u64;
-    let acct = chain.state.accounts.get(&id).expect("account exists").clone();
+    let acct = chain
+        .state
+        .accounts
+        .get(&id)
+        .expect("account exists")
+        .clone();
     let proof = chain.state.account_proof(id).expect("proof exists");
     let leaf = merkle::leaf_hash(&acct.merkle_leaf(id));
 
-    println!("light client is told: account #{id} balance={} COG", cog(acct.balance));
-    println!("proof: {} sibling hash(es) up to the root", proof.steps.len());
+    println!(
+        "light client is told: account #{id} balance={} COG",
+        cog(acct.balance)
+    );
+    println!(
+        "proof: {} sibling hash(es) up to the root",
+        proof.steps.len()
+    );
     let ok = merkle::verify(&root, &leaf, &proof);
     println!("verify against merkle_root -> {ok}");
 
@@ -408,26 +552,50 @@ fn cmd_vprove() {
 
     // height 1: admit a brand-new validator (id 25) so the next set differs from
     // the genesis set — the thing we will prove membership in.
-    d.stage_validator_update(ValidatorUpdate { id: 25, pubkey: kp(25).public(), power: 2 * MICRO });
-    d.produce(1.0, &BTreeSet::new()).unwrap_or_else(|e| fail_msg("produce h1", &e));
+    d.stage_validator_update(ValidatorUpdate {
+        id: 25,
+        pubkey: kp(25).public(),
+        power: 2 * MICRO,
+    });
+    d.produce(1.0, &BTreeSet::new())
+        .unwrap_or_else(|e| fail_msg("produce h1", &e));
 
     let block = &d.blocks()[0];
     let cert = &d.certificates()[0];
     // the set that certifies height 2 — what block 1 commits to in its header.
     let next_set = d.chain.state.validators.clone();
     // the set active for height 1 (anchors the certificate): the genesis set.
-    let tracked = ValidatorTracker::from_genesis(&demo_genesis()).validators().clone();
+    let tracked = ValidatorTracker::from_genesis(&demo_genesis())
+        .validators()
+        .clone();
 
-    println!("certified block {} commits next_validators_root = {}", block.height, short(&block.next_validators_root));
+    println!(
+        "certified block {} commits next_validators_root = {}",
+        block.height,
+        short(&block.next_validators_root)
+    );
     println!("(the certificate signs the block hash, which includes that root)\n");
 
     let id = 25u64;
-    let v = next_set.get(id).expect("validator 25 is in the next set").clone();
+    let v = next_set
+        .get(id)
+        .expect("validator 25 is in the next set")
+        .clone();
     let proof = next_set.proof(id).expect("membership proof exists");
-    println!("light client is told: validator #{id} power={} $COG", cog(v.power));
-    println!("proof: {} sibling hash(es) up to next_validators_root", proof.steps.len());
+    println!(
+        "light client is told: validator #{id} power={} $COG",
+        cog(v.power)
+    );
+    println!(
+        "proof: {} sibling hash(es) up to next_validators_root",
+        proof.steps.len()
+    );
     let header = zhixing_node::codec::BlockHeader::from_block(block);
-    let entry = ProofEntry::Validator { id, validator: v.clone(), proof: proof.clone() };
+    let entry = ProofEntry::Validator {
+        id,
+        validator: v.clone(),
+        proof: proof.clone(),
+    };
     match ValidatorTracker::verify_proof_against_header(&header, cert, &tracked, &entry) {
         Ok(()) => println!("verify membership against the cert-signed header -> true"),
         Err(e) => {
@@ -439,11 +607,17 @@ fn cmd_vprove() {
     // negative case: a lie about the validator's power must fail.
     let mut forged = v.clone();
     forged.power += 1;
-    let forged_entry = ProofEntry::Validator { id, validator: forged, proof };
+    let forged_entry = ProofEntry::Validator {
+        id,
+        validator: forged,
+        proof,
+    };
     let bad = ValidatorTracker::verify_proof_against_header(&header, cert, &tracked, &forged_entry);
-    println!("verify a forged (power+1) leaf -> {} (must be false)", bad.is_ok());
+    println!(
+        "verify a forged (power+1) leaf -> {} (must be false)",
+        bad.is_ok()
+    );
 }
-
 
 /// the deterministic proposer, a quorum commit that tolerates one crash, a
 /// sub-quorum that fails to commit, and equivocation being caught.
@@ -452,8 +626,22 @@ fn cmd_bft() {
     let chain = Chain::new(demo_genesis());
     let mut mp = Mempool::new(16);
     for t in [
-        tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
-        tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
+        tx(
+            1,
+            unit(1),
+            1,
+            reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]),
+            (3, 3),
+            1.0,
+        ),
+        tx(
+            2,
+            unit(2),
+            2,
+            reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]),
+            (3, 3),
+            1.0,
+        ),
     ] {
         mp.insert(&chain, t).unwrap();
     }
@@ -464,12 +652,23 @@ fn cmd_bft() {
     let keys: BTreeMap<u64, Keypair> = ids.iter().map(|&id| (id, kp(id))).collect();
     let vset = ValidatorSet::new(
         ids.iter()
-            .map(|&id| Validator { id, pubkey: kp(id).public(), power: 1 })
+            .map(|&id| Validator {
+                id,
+                pubkey: kp(id).public(),
+                power: 1,
+            })
             .collect(),
     );
     println!("validators   {ids:?}  (equal power)");
-    println!("total power  {}   quorum {} (> 2/3)", vset.total_power(), vset.quorum());
-    println!("proposer(h=1) #{}\n", vset.proposer_for(blk.height).unwrap());
+    println!(
+        "total power  {}   quorum {} (> 2/3)",
+        vset.total_power(),
+        vset.quorum()
+    );
+    println!(
+        "proposer(h=1) #{}\n",
+        vset.proposer_for(blk.height).unwrap()
+    );
     println!("certifying block {} ({})", blk.height, short(&blk.hash()));
 
     // happy path: one validator crashes (24), the other 3 still commit
@@ -492,7 +691,10 @@ fn cmd_bft() {
     }
 
     // equivocation: a conflicting block certified by an overlapping quorum
-    let blk2 = Block { prev_hash: [7u8; 32], ..blk.clone() }; // different hash, same height
+    let blk2 = Block {
+        prev_hash: [7u8; 32],
+        ..blk.clone()
+    }; // different hash, same height
     if let (Some(c1), Some(c2)) = (
         commit_block(&vset, &keys, &blk, 0, &[21, 22, 23]),
         commit_block(&vset, &keys, &blk2, 0, &[21, 22, 24]),
@@ -510,8 +712,22 @@ fn cmd_live() {
     let chain = Chain::new(demo_genesis());
     let mut mp = Mempool::new(16);
     for t in [
-        tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
-        tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
+        tx(
+            1,
+            unit(1),
+            1,
+            reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]),
+            (3, 3),
+            1.0,
+        ),
+        tx(
+            2,
+            unit(2),
+            2,
+            reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]),
+            (3, 3),
+            1.0,
+        ),
     ] {
         mp.insert(&chain, t).unwrap();
     }
@@ -520,7 +736,11 @@ fn cmd_live() {
     let ids = [21u64, 22, 23, 24];
     let vset = ValidatorSet::new(
         ids.iter()
-            .map(|&id| Validator { id, pubkey: kp(id).public(), power: 1 })
+            .map(|&id| Validator {
+                id,
+                pubkey: kp(id).public(),
+                power: 1,
+            })
             .collect(),
     );
     let mkkeys = || -> BTreeMap<u64, Keypair> { ids.iter().map(|&id| (id, kp(id))).collect() };
@@ -528,7 +748,13 @@ fn cmd_live() {
     println!("candidate block {} ({})\n", blk.height, short(&blk.hash()));
 
     // scenario 1: everyone honest
-    let mut sim = Sim::new(vset.clone(), mkkeys(), blk.height, blk.clone(), &BTreeSet::new());
+    let mut sim = Sim::new(
+        vset.clone(),
+        mkkeys(),
+        blk.height,
+        blk.clone(),
+        &BTreeSet::new(),
+    );
     let dec = sim.run();
     report_live("all honest", &sim, &dec, &vset, &blk);
 
@@ -559,7 +785,10 @@ fn report_live(
         verified
     );
     if let Some(c) = dec.values().next() {
-        println!("    finalized {} with a quorum certificate", short(&c.block_hash));
+        println!(
+            "    finalized {} with a quorum certificate",
+            short(&c.block_hash)
+        );
     }
 }
 
@@ -572,7 +801,11 @@ fn cmd_chain() {
     let ids = [21u64, 22, 23, 24];
     let vset = ValidatorSet::new(
         ids.iter()
-            .map(|&id| Validator { id, pubkey: kp(id).public(), power: 1 })
+            .map(|&id| Validator {
+                id,
+                pubkey: kp(id).public(),
+                power: 1,
+            })
             .collect(),
     );
     let seeds: BTreeMap<u64, [u8; 32]> = ids
@@ -587,9 +820,30 @@ fn cmd_chain() {
     // one block per height so the chain visibly grows tx by tx
     let mut d = ChainDriver::new(demo_genesis(), seeds, 1);
     for t in [
-        tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
-        tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
-        tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 1.0),
+        tx(
+            1,
+            unit(1),
+            1,
+            reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]),
+            (3, 3),
+            1.0,
+        ),
+        tx(
+            2,
+            unit(2),
+            2,
+            reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]),
+            (3, 3),
+            1.0,
+        ),
+        tx(
+            3,
+            blend(1, 2),
+            3,
+            reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]),
+            (3, 3),
+            1.0,
+        ),
     ] {
         d.submit(t).unwrap();
     }
@@ -611,7 +865,15 @@ fn cmd_chain() {
     println!("head {} at height {}\n", short(&d.head()), d.height());
 
     // fault tolerance: submit one more, finalize it with a validator offline
-    d.submit(tx(1, unit(4), 4, reviews(&[(10, 0.8), (11, 0.75), (12, 0.82)]), (0, 3), day)).unwrap();
+    d.submit(tx(
+        1,
+        unit(4),
+        4,
+        reviews(&[(10, 0.8), (11, 0.75), (12, 0.82)]),
+        (0, 3),
+        day,
+    ))
+    .unwrap();
     let mut silent = BTreeSet::new();
     silent.insert(24u64);
     match d.produce(day, &silent) {
@@ -625,7 +887,15 @@ fn cmd_chain() {
     }
 
     // safety: with two offline, quorum is impossible -> stall, no block forged
-    d.submit(tx(2, unit(5), 5, reviews(&[(10, 0.85), (11, 0.8), (12, 0.88)]), (3, 3), day + 1.0)).unwrap();
+    d.submit(tx(
+        2,
+        unit(5),
+        5,
+        reviews(&[(10, 0.85), (11, 0.8), (12, 0.88)]),
+        (3, 3),
+        day + 1.0,
+    ))
+    .unwrap();
     let mut two_down = BTreeSet::new();
     two_down.insert(23u64);
     two_down.insert(24u64);
@@ -638,7 +908,12 @@ fn cmd_chain() {
         Ok(_) => println!("unexpected: a block was produced below quorum"),
     }
     debug_assert_eq!(d.height(), h_before);
-    println!("\nfinal head {} · height {} · {} certificates", short(&d.head()), d.height(), d.certificates().len());
+    println!(
+        "\nfinal head {} · height {} · {} certificates",
+        short(&d.head()),
+        d.height(),
+        d.certificates().len()
+    );
 }
 
 /// Demonstrate a validator handoff on a live, BFT-certified chain: grow a few
@@ -657,15 +932,50 @@ fn cmd_validators() {
         .collect();
     let mut d = ChainDriver::new(demo_genesis(), seeds, 1);
     for t in [
-        tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
-        tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
-        tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 1.0),
-        tx(1, unit(4), 4, reviews(&[(10, 0.8), (11, 0.78), (12, 0.82)]), (3, 3), 1.0),
+        tx(
+            1,
+            unit(1),
+            1,
+            reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]),
+            (3, 3),
+            1.0,
+        ),
+        tx(
+            2,
+            unit(2),
+            2,
+            reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]),
+            (3, 3),
+            1.0,
+        ),
+        tx(
+            3,
+            blend(1, 2),
+            3,
+            reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]),
+            (3, 3),
+            1.0,
+        ),
+        tx(
+            1,
+            unit(4),
+            4,
+            reviews(&[(10, 0.8), (11, 0.78), (12, 0.82)]),
+            (3, 3),
+            1.0,
+        ),
     ] {
         d.submit(t).unwrap();
     }
 
-    let ids0: Vec<u64> = d.chain.state.validators.validators().iter().map(|v| v.id).collect();
+    let ids0: Vec<u64> = d
+        .chain
+        .state
+        .validators
+        .validators()
+        .iter()
+        .map(|v| v.id)
+        .collect();
     println!(
         "genesis validator set {ids0:?}  quorum {} (> 2/3)\n",
         d.chain.state.validators.quorum()
@@ -677,12 +987,20 @@ fn cmd_validators() {
     // admit validator #25: the change rides in the height-2 block but is
     // certified by the PRE-change set — the newcomer never votes on its arrival.
     println!("  staged: ADD validator #25 (takes effect next height)");
-    d.stage_validator_update(ValidatorUpdate { id: 25, pubkey: kp(25).public(), power: 1 });
+    d.stage_validator_update(ValidatorUpdate {
+        id: 25,
+        pubkey: kp(25).public(),
+        power: 1,
+    });
     produce_vreport(&mut d, 2.0);
 
     // remove validator #21, certified by the five-validator set now in force
     println!("  staged: REMOVE validator #21");
-    d.stage_validator_update(ValidatorUpdate { id: 21, pubkey: kp(21).public(), power: 0 });
+    d.stage_validator_update(ValidatorUpdate {
+        id: 21,
+        pubkey: kp(21).public(),
+        power: 0,
+    });
     produce_vreport(&mut d, 3.0);
 
     // one more plain height under the evolved set
@@ -692,7 +1010,13 @@ fn cmd_validators() {
     // following the very same validator handoffs the live chain produced.
     let chain = Chain::replay_verified(demo_genesis(), d.blocks(), d.certificates())
         .unwrap_or_else(|e| fail_msg("verify finality across handoffs", &e));
-    let final_ids: Vec<u64> = chain.state.validators.validators().iter().map(|v| v.id).collect();
+    let final_ids: Vec<u64> = chain
+        .state
+        .validators
+        .validators()
+        .iter()
+        .map(|v| v.id)
+        .collect();
     println!(
         "\nreplay re-verified finality across every handoff ✓  final set {final_ids:?}  head {}",
         short(&chain.head)
@@ -718,7 +1042,14 @@ fn produce_vreport(d: &mut ChainDriver, day: f32) {
         before.total_power(),
         before.quorum()
     );
-    let ids_after: Vec<u64> = d.chain.state.validators.validators().iter().map(|v| v.id).collect();
+    let ids_after: Vec<u64> = d
+        .chain
+        .state
+        .validators
+        .validators()
+        .iter()
+        .map(|v| v.id)
+        .collect();
     if ids_after != ids_before {
         println!(
             "    -> validator set for height {} is now {:?}  (quorum {})",
@@ -749,7 +1080,14 @@ fn cmd_staking() {
         .collect();
     let mut d = ChainDriver::new(demo_genesis(), seeds, 1);
 
-    let ids0: Vec<u64> = d.chain.state.validators.validators().iter().map(|v| v.id).collect();
+    let ids0: Vec<u64> = d
+        .chain
+        .state
+        .validators
+        .validators()
+        .iter()
+        .map(|v| v.id)
+        .collect();
     println!(
         "genesis validator set {ids0:?} (equal power); account #1 balance {} $COG, bonded pool {} $COG\n",
         cog(d.chain.state.accounts[&1].balance),
@@ -760,17 +1098,29 @@ fn cmd_staking() {
     // GENESIS set — the newcomer never votes on its own arrival. power == bond.
     println!("  height 1: account #1 BONDs 6 $COG  (power activates next height)");
     d.stage_stake_op(
-        StakeOp { account: 1, kind: BondKind::Bond, amount: 6 * MICRO, signature: [0u8; 64] }
-            .signed(&kp(1)),
+        StakeOp {
+            account: 1,
+            kind: BondKind::Bond,
+            amount: 6 * MICRO,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1)),
     );
     produce_stakereport(&mut d, 1.0);
 
     // height 2: #1 is now an active validator with power == its bond. It unbonds,
     // scheduling a delayed withdrawal that matures UNBONDING_PERIOD heights later.
-    println!("\n  height 2: account #1 UNBONDs 6 $COG  (power removed next height; funds time-locked)");
+    println!(
+        "\n  height 2: account #1 UNBONDs 6 $COG  (power removed next height; funds time-locked)"
+    );
     d.stage_stake_op(
-        StakeOp { account: 1, kind: BondKind::Unbond, amount: 6 * MICRO, signature: [0u8; 64] }
-            .signed(&kp(1)),
+        StakeOp {
+            account: 1,
+            kind: BondKind::Unbond,
+            amount: 6 * MICRO,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1)),
     );
     produce_stakereport(&mut d, 2.0);
     let mature = 2 + UNBONDING_PERIOD;
@@ -801,7 +1151,10 @@ fn cmd_staking() {
         cog(d.chain.state.bonded),
         d.chain.state.unbonding.len(),
     );
-    println!("  supply conserved throughout: {}", d.chain.state.supply_conserved());
+    println!(
+        "  supply conserved throughout: {}",
+        d.chain.state.supply_conserved()
+    );
 
     // replay the whole certified chain, re-verifying finality height by height.
     let chain = Chain::replay_verified(demo_genesis(), d.blocks(), d.certificates())
@@ -816,17 +1169,37 @@ fn cmd_staking() {
 /// Produce one height (all validators honest) and report the set that certified
 /// it, the bonded pool, and account #1's live validator power (== its bond).
 fn produce_stakereport(d: &mut ChainDriver, day: f32) {
-    let before: Vec<u64> = d.chain.state.validators.validators().iter().map(|v| v.id).collect();
+    let before: Vec<u64> = d
+        .chain
+        .state
+        .validators
+        .validators()
+        .iter()
+        .map(|v| v.id)
+        .collect();
     d.produce(day, &BTreeSet::new())
         .unwrap_or_else(|e| fail_msg("produce height", &e))
         .expect("a block to produce");
-    let after: Vec<u64> = d.chain.state.validators.validators().iter().map(|v| v.id).collect();
+    let after: Vec<u64> = d
+        .chain
+        .state
+        .validators
+        .validators()
+        .iter()
+        .map(|v| v.id)
+        .collect();
     println!(
         "    height {} certified by {:?}; bonded pool {} $COG; account #1 power {} $COG",
         d.height(),
         before,
         cog(d.chain.state.bonded),
-        cog(d.chain.state.validators.get(1).map(|v| v.power).unwrap_or(0)),
+        cog(d
+            .chain
+            .state
+            .validators
+            .get(1)
+            .map(|v| v.power)
+            .unwrap_or(0)),
     );
     if after != before {
         println!("      -> validator set for the next height is now {after:?}");
@@ -853,7 +1226,14 @@ fn cmd_slashing() {
     let mut d = ChainDriver::new(demo_genesis(), seeds, 1);
 
     let supply0 = d.chain.state.supply;
-    let ids0: Vec<u64> = d.chain.state.validators.validators().iter().map(|v| v.id).collect();
+    let ids0: Vec<u64> = d
+        .chain
+        .state
+        .validators
+        .validators()
+        .iter()
+        .map(|v| v.id)
+        .collect();
     println!(
         "genesis validator set {ids0:?}; treasury {} $COG, bonded pool {} $COG\n",
         cog(d.chain.state.treasury),
@@ -864,8 +1244,13 @@ fn cmd_slashing() {
     // power == its bond, effective from height 2 (certified by the genesis set).
     println!("  height 1: account #1 BONDs 6 $COG  (becomes a validator next height)");
     d.stage_stake_op(
-        StakeOp { account: 1, kind: BondKind::Bond, amount: 6 * MICRO, signature: [0u8; 64] }
-            .signed(&kp(1)),
+        StakeOp {
+            account: 1,
+            kind: BondKind::Bond,
+            amount: 6 * MICRO,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1)),
     );
     produce_stakereport(&mut d, 1.0);
 
@@ -876,13 +1261,19 @@ fn cmd_slashing() {
     // `consensus::detect_equivocation`.)
     let bad_a = Vote::signed(1, 2, 0, [0xAAu8; 32], VoteType::Precommit, &kp(1));
     let bad_b = Vote::signed(1, 2, 0, [0xBBu8; 32], VoteType::Precommit, &kp(1));
-    let evidence = SlashEvidence { vote_a: bad_a, vote_b: bad_b };
+    let evidence = SlashEvidence {
+        vote_a: bad_a,
+        vote_b: bad_b,
+    };
     println!(
         "\n  height 2: validator #1 DOUBLE-SIGNs (precommits {} and {} at h2/r0)",
         short(&[0xAAu8; 32]),
         short(&[0xBBu8; 32]),
     );
-    println!("    -> submitting the proof on-chain; power {} $COG at stake", cog(6 * MICRO));
+    println!(
+        "    -> submitting the proof on-chain; power {} $COG at stake",
+        cog(6 * MICRO)
+    );
 
     d.stage_slashing_evidence(evidence);
     let commit = d
@@ -901,7 +1292,14 @@ fn cmd_slashing() {
         cog(d.chain.state.bonded),
         d.chain.state.validators.get(1).is_some(),
     );
-    let ids_after: Vec<u64> = d.chain.state.validators.validators().iter().map(|v| v.id).collect();
+    let ids_after: Vec<u64> = d
+        .chain
+        .state
+        .validators
+        .validators()
+        .iter()
+        .map(|v| v.id)
+        .collect();
     println!("    validator set for the next height is now {ids_after:?}");
     println!(
         "\n  slash is supply-neutral (bonded -> treasury): supply {} unchanged: {}",
@@ -928,13 +1326,35 @@ fn cmd_gossip() {
     let (_, seeds) = demo_validators();
     let mut d = ChainDriver::new(demo_genesis(), seeds, 1);
     for t in [
-        tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
-        tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
-        tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 1.0),
+        tx(
+            1,
+            unit(1),
+            1,
+            reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]),
+            (3, 3),
+            1.0,
+        ),
+        tx(
+            2,
+            unit(2),
+            2,
+            reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]),
+            (3, 3),
+            1.0,
+        ),
+        tx(
+            3,
+            blend(1, 2),
+            3,
+            reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]),
+            (3, 3),
+            1.0,
+        ),
     ] {
         d.submit(t).unwrap();
     }
-    d.produce_until_drained(1.0, 16).unwrap_or_else(|e| fail_msg("produce chain", &e));
+    d.produce_until_drained(1.0, 16)
+        .unwrap_or_else(|e| fail_msg("produce chain", &e));
     let blocks = d.blocks().to_vec();
     let certs = d.certificates().to_vec();
     println!(
@@ -947,8 +1367,10 @@ fn cmd_gossip() {
     let ids = [1u64, 2, 3, 4];
     let mut seed_node = GossipNode::new(1, demo_genesis(), 16, ids);
     assert!(seed_node.load_certified(&blocks, &certs));
-    let others: Vec<GossipNode> =
-        [2u64, 3, 4].iter().map(|&id| GossipNode::new(id, demo_genesis(), 16, ids)).collect();
+    let others: Vec<GossipNode> = [2u64, 3, 4]
+        .iter()
+        .map(|&id| GossipNode::new(id, demo_genesis(), 16, ids))
+        .collect();
     let mut net = Network::new(std::iter::once(seed_node).chain(others).collect());
 
     println!("in-process anti-entropy sync (node 1 seeded, nodes 2–4 fresh):");
@@ -956,7 +1378,11 @@ fn cmd_gossip() {
     let delivered = net.run();
     for id in ids {
         let n = net.node(id);
-        println!("  node {id}  height {}  head {}", n.height(), short(&n.head()));
+        println!(
+            "  node {id}  height {}  head {}",
+            n.height(),
+            short(&n.head())
+        );
     }
     println!(
         "  -> converged={} after {delivered} messages; state_root {}\n",
@@ -965,11 +1391,22 @@ fn cmd_gossip() {
     );
 
     // epidemic tx gossip: inject one tx at node 3, watch it reach every mempool
-    let t = tx(1, unit(5), 5, reviews(&[(10, 0.8), (11, 0.78), (12, 0.82)]), (3, 3), 4.0);
+    let t = tx(
+        1,
+        unit(5),
+        5,
+        reviews(&[(10, 0.8), (11, 0.78), (12, 0.82)]),
+        (3, 3),
+        4.0,
+    );
     let h = t.hash();
     net.submit(3, t);
     net.run();
-    let reached: Vec<u64> = ids.iter().copied().filter(|&id| net.node(id).mempool.contains(&h)).collect();
+    let reached: Vec<u64> = ids
+        .iter()
+        .copied()
+        .filter(|&id| net.node(id).mempool.contains(&h))
+        .collect();
     println!("epidemic tx gossip: tx {} injected at node 3", short(&h));
     println!("  -> present in mempools of nodes {reached:?}\n");
 
@@ -983,8 +1420,22 @@ fn cmd_gossip() {
     // end-to-end slash.
     let offender = 1u64;
     let ev = SlashEvidence {
-        vote_a: Vote::signed(offender, 2, 0, [0xAAu8; 32], VoteType::Precommit, &kp(offender)),
-        vote_b: Vote::signed(offender, 2, 0, [0xBBu8; 32], VoteType::Precommit, &kp(offender)),
+        vote_a: Vote::signed(
+            offender,
+            2,
+            0,
+            [0xAAu8; 32],
+            VoteType::Precommit,
+            &kp(offender),
+        ),
+        vote_b: Vote::signed(
+            offender,
+            2,
+            0,
+            [0xBBu8; 32],
+            VoteType::Precommit,
+            &kp(offender),
+        ),
     };
     let ev_hash = ev.hash();
     net.submit_evidence(2, ev);
@@ -1037,21 +1488,27 @@ fn cmd_gossip() {
                     node.apply_certified(b, c); // re-verifies each cert on arrival
                 }
             }
-            tx_done.send((id, node.height(), node.head())).expect("report");
+            tx_done
+                .send((id, node.height(), node.head()))
+                .expect("report");
         });
     }
     drop(tx_done);
     server.join().expect("seed server");
 
-    let mut results: Vec<(u64, u64, String)> =
-        rx_done.iter().map(|(id, h, head)| (id, h, short(&head))).collect();
+    let mut results: Vec<(u64, u64, String)> = rx_done
+        .iter()
+        .map(|(id, h, head)| (id, h, short(&head)))
+        .collect();
     results.sort();
     let expected = short(&d.head());
     for (id, h, head) in &results {
         let ok = if *head == expected { "✓" } else { "✗" };
         println!("  follower {id}  synced to height {h}  head {head}  {ok}");
     }
-    let all_ok = results.iter().all(|(_, h, head)| *h == blocks.len() as u64 && *head == expected);
+    let all_ok = results
+        .iter()
+        .all(|(_, h, head)| *h == blocks.len() as u64 && *head == expected);
     println!(
         "  -> {} follower(s) synced to the certified head over TCP, every certificate re-verified: {}",
         results.len(),
@@ -1091,21 +1548,46 @@ fn cmd_light() {
     println!("building a certified chain that reshapes its validator set 3 ways:\n");
 
     // height 1: two real submissions PLUS admit a brand-new validator (id 25).
-    d.submit(tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0))
-        .unwrap_or_else(|e| fail_chain("submit tx", e));
-    d.submit(tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0))
-        .unwrap_or_else(|e| fail_chain("submit tx", e));
-    d.stage_validator_update(ValidatorUpdate { id: 25, pubkey: kp(25).public(), power: 2 * MICRO });
+    d.submit(tx(
+        1,
+        unit(1),
+        1,
+        reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]),
+        (3, 3),
+        1.0,
+    ))
+    .unwrap_or_else(|e| fail_chain("submit tx", e));
+    d.submit(tx(
+        2,
+        unit(2),
+        2,
+        reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]),
+        (3, 3),
+        1.0,
+    ))
+    .unwrap_or_else(|e| fail_chain("submit tx", e));
+    d.stage_validator_update(ValidatorUpdate {
+        id: 25,
+        pubkey: kp(25).public(),
+        power: 2 * MICRO,
+    });
     println!("  height 1: 2 submissions + ADD validator 25 (power 2)");
-    d.produce(1.0, &BTreeSet::new()).unwrap_or_else(|e| fail_msg("produce h1", &e));
+    d.produce(1.0, &BTreeSet::new())
+        .unwrap_or_else(|e| fail_msg("produce h1", &e));
 
     // height 2: account #1 self-bonds and becomes a validator.
     d.stage_stake_op(
-        StakeOp { account: 1, kind: BondKind::Bond, amount: 6 * MICRO, signature: [0u8; 64] }
-            .signed(&kp(1)),
+        StakeOp {
+            account: 1,
+            kind: BondKind::Bond,
+            amount: 6 * MICRO,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1)),
     );
     println!("  height 2: account #1 BONDs 6 $COG (becomes validator #1)");
-    d.produce(2.0, &BTreeSet::new()).unwrap_or_else(|e| fail_msg("produce h2", &e));
+    d.produce(2.0, &BTreeSet::new())
+        .unwrap_or_else(|e| fail_msg("produce h2", &e));
 
     // height 3: validator #1 double-signs; evidence slashes and removes it.
     let ev = SlashEvidence {
@@ -1114,7 +1596,8 @@ fn cmd_light() {
     };
     d.stage_slashing_evidence(ev);
     println!("  height 3: validator #1 DOUBLE-SIGNs -> slashed + removed\n");
-    d.produce(3.0, &BTreeSet::new()).unwrap_or_else(|e| fail_msg("produce h3", &e));
+    d.produce(3.0, &BTreeSet::new())
+        .unwrap_or_else(|e| fail_msg("produce h3", &e));
 
     let n_txs: usize = d.blocks().iter().map(|b| b.txs.len()).sum();
     println!(
@@ -1146,15 +1629,27 @@ fn cmd_light() {
     // set at the tip — proven, not trusted (every cert was re-verified).
     let full = Chain::replay_verified(demo_genesis(), d.blocks(), d.certificates())
         .unwrap_or_else(|e| fail_msg("replay_verified", &e));
-    let light_ids: Vec<(u64, u64)> =
-        lt.validators().validators().iter().map(|v| (v.id, v.power)).collect();
-    let full_ids: Vec<(u64, u64)> =
-        full.state.validators.validators().iter().map(|v| (v.id, v.power)).collect();
+    let light_ids: Vec<(u64, u64)> = lt
+        .validators()
+        .validators()
+        .iter()
+        .map(|v| (v.id, v.power))
+        .collect();
+    let full_ids: Vec<(u64, u64)> = full
+        .state
+        .validators
+        .validators()
+        .iter()
+        .map(|v| (v.id, v.power))
+        .collect();
     println!(
         "\nlight-followed set == authoritative replayed set: {}  (light applied 0 txs)",
         light_ids == full_ids && lt.head() == full.head,
     );
-    assert_eq!(light_ids, full_ids, "light client diverged from the full chain");
+    assert_eq!(
+        light_ids, full_ids,
+        "light client diverged from the full chain"
+    );
 
     // M21: the transition-FREE path. Given each block's next set (which a header
     // sync transport would ship alongside the block), the tracker advances by
@@ -1165,7 +1660,9 @@ fn cmd_light() {
     let mut replay = Chain::new(demo_genesis());
     for b in d.blocks() {
         let mut b = b.clone();
-        replay.commit(&mut b).unwrap_or_else(|e| fail_msg("replay commit", &e));
+        replay
+            .commit(&mut b)
+            .unwrap_or_else(|e| fail_msg("replay commit", &e));
         committed_sets.push(replay.state.validators.clone());
     }
     let mut lt2 = ValidatorTracker::from_genesis(&demo_genesis());
@@ -1173,14 +1670,21 @@ fn cmd_light() {
         lt2.follow_committed(b, c, &committed_sets[i])
             .unwrap_or_else(|e| fail_msg("follow_committed", &e));
     }
-    let committed_ids: Vec<(u64, u64)> =
-        lt2.validators().validators().iter().map(|v| (v.id, v.power)).collect();
+    let committed_ids: Vec<(u64, u64)> = lt2
+        .validators()
+        .validators()
+        .iter()
+        .map(|v| (v.id, v.power))
+        .collect();
     show("transition-free set", lt2.validators());
     println!(
         "transition-free set == replayed set: {}",
         committed_ids == full_ids && lt2.head() == full.head,
     );
-    assert_eq!(committed_ids, full_ids, "follow_committed diverged from the full chain");
+    assert_eq!(
+        committed_ids, full_ids,
+        "follow_committed diverged from the full chain"
+    );
 }
 
 /// Demonstrate M22 — header-only SPV sync over the gossip bus. A full node holds
@@ -1205,21 +1709,49 @@ fn cmd_lsync() {
         })
         .collect();
     let mut d = ChainDriver::new(demo_genesis(), seeds, 4);
-    d.submit(tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0)).unwrap();
-    d.submit(tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0)).unwrap();
-    d.stage_validator_update(ValidatorUpdate { id: 25, pubkey: kp(25).public(), power: 2 * MICRO });
-    d.produce(1.0, &BTreeSet::new()).unwrap_or_else(|e| fail_msg("produce h1", &e));
+    d.submit(tx(
+        1,
+        unit(1),
+        1,
+        reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]),
+        (3, 3),
+        1.0,
+    ))
+    .unwrap();
+    d.submit(tx(
+        2,
+        unit(2),
+        2,
+        reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]),
+        (3, 3),
+        1.0,
+    ))
+    .unwrap();
+    d.stage_validator_update(ValidatorUpdate {
+        id: 25,
+        pubkey: kp(25).public(),
+        power: 2 * MICRO,
+    });
+    d.produce(1.0, &BTreeSet::new())
+        .unwrap_or_else(|e| fail_msg("produce h1", &e));
     d.stage_stake_op(
-        StakeOp { account: 1, kind: BondKind::Bond, amount: 6 * MICRO, signature: [0u8; 64] }
-            .signed(&kp(1)),
+        StakeOp {
+            account: 1,
+            kind: BondKind::Bond,
+            amount: 6 * MICRO,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1)),
     );
-    d.produce(2.0, &BTreeSet::new()).unwrap_or_else(|e| fail_msg("produce h2", &e));
+    d.produce(2.0, &BTreeSet::new())
+        .unwrap_or_else(|e| fail_msg("produce h2", &e));
     let ev = SlashEvidence {
         vote_a: Vote::signed(1, 3, 0, [0xAA; 32], VoteType::Precommit, &kp(1)),
         vote_b: Vote::signed(1, 3, 0, [0xBB; 32], VoteType::Precommit, &kp(1)),
     };
     d.stage_slashing_evidence(ev);
-    d.produce(3.0, &BTreeSet::new()).unwrap_or_else(|e| fail_msg("produce h3", &e));
+    d.produce(3.0, &BTreeSet::new())
+        .unwrap_or_else(|e| fail_msg("produce h3", &e));
 
     let n_txs: usize = d.blocks().iter().map(|b| b.txs.len()).sum();
     let n_stake_ops: usize = d.blocks().iter().map(|b| b.stake_ops.len()).sum();
@@ -1244,7 +1776,10 @@ fn cmd_lsync() {
 
     println!("SPV header-sync over the gossip bus:");
     let full_height = full.height();
-    println!("  full peer (id=1): height {}  ·  light peer (id={}): height 0", full_height, light_id);
+    println!(
+        "  full peer (id=1): height {}  ·  light peer (id={}): height 0",
+        full_height, light_id
+    );
     let mut net = LightNetwork::new(vec![full], vec![light]);
 
     // Per-height authoritative next sets, computed once from a full replay.
@@ -1255,7 +1790,9 @@ fn cmd_lsync() {
     let mut replay = Chain::new(demo_genesis());
     for b in d.blocks() {
         let mut b = b.clone();
-        replay.commit(&mut b).unwrap_or_else(|e| fail_msg("replay commit", &e));
+        replay
+            .commit(&mut b)
+            .unwrap_or_else(|e| fail_msg("replay commit", &e));
         committed_sets.push(replay.state.validators.clone());
     }
     let next_set_for = |h: u64| committed_sets.get((h - 1) as usize).cloned();
@@ -1280,22 +1817,32 @@ fn cmd_lsync() {
 
     // Wire-byte accounting: the certified headers carry no bodies.
     let certs_ref = d.certificates();
-    let full_bytes: usize = d.blocks().iter().zip(certs_ref.iter()).map(|(b, c)| encode_block(b).len() + encode_commit(c).len()).sum();
+    let full_bytes: usize = d
+        .blocks()
+        .iter()
+        .zip(certs_ref.iter())
+        .map(|(b, c)| encode_block(b).len() + encode_commit(c).len())
+        .sum();
     let header_bytes: usize = d
         .blocks()
         .iter()
         .zip(certs_ref.iter())
-        .map(|(b, c)| encode_certified_header(&zhixing_node::codec::CertifiedHeader::from_certified(b, c)).len())
+        .map(|(b, c)| {
+            encode_certified_header(&zhixing_node::codec::CertifiedHeader::from_certified(b, c))
+                .len()
+        })
         .sum();
-    println!(
-        "\n  bandwidth (block+certs vs certified headers, summed across the chain):"
-    );
+    println!("\n  bandwidth (block+certs vs certified headers, summed across the chain):");
     println!("    full blocks  : {:>6} B", full_bytes);
     println!("    headers only : {:>6} B", header_bytes);
     println!(
         "    savings      : {:>5.1}%  ({})",
         100.0 * (1.0 - (header_bytes as f64 / full_bytes as f64)),
-        if header_bytes < full_bytes { "SPV saved bytes ✓" } else { "UNEXPECTED: not smaller" },
+        if header_bytes < full_bytes {
+            "SPV saved bytes ✓"
+        } else {
+            "UNEXPECTED: not smaller"
+        },
     );
 
     // Light peer can prove a validator's membership against the latest header.
@@ -1314,9 +1861,16 @@ fn cmd_lsync() {
     // header's `next_validators_root`): `committed_sets[h-1]`.
     let next_set = &committed_sets[h - 1];
     let id = 25u64;
-    let v = next_set.get(id).expect("validator 25 active at the tip").clone();
+    let v = next_set
+        .get(id)
+        .expect("validator 25 active at the tip")
+        .clone();
     let proof = next_set.proof(id).expect("membership proof exists");
-    let entry = ProofEntry::Validator { id, validator: v.clone(), proof: proof.clone() };
+    let entry = ProofEntry::Validator {
+        id,
+        validator: v.clone(),
+        proof: proof.clone(),
+    };
     match ValidatorTracker::verify_proof_against_header(
         &lh.header,
         &lh.cert,
@@ -1341,7 +1895,11 @@ fn cmd_lsync() {
     // Use the valid proof for validator 25 but claim it opens validator 99 —
     // merkle::verify rejects it, exercising the proof path.
     let bad_proof = next_set.proof(25).unwrap();
-    let bad_entry = ProofEntry::Validator { id: 99, validator: bad_validator, proof: bad_proof };
+    let bad_entry = ProofEntry::Validator {
+        id: 99,
+        validator: bad_validator,
+        proof: bad_proof,
+    };
     let wrong = ValidatorTracker::verify_proof_against_header(
         &lh.header,
         &lh.cert,
@@ -1359,7 +1917,7 @@ fn cmd_lsync() {
 /// trip and a single verifier, against the same cert-signed header pulled over
 /// the M22 gossip bus. No replay, no tx bodies, no full-peer trust.
 fn cmd_account() {
-use zhixing_node::light::ProofKind;
+    use zhixing_node::light::ProofKind;
 
     println!("M24 — batched SPV: account + reviewer + validator in one round-trip");
     println!();
@@ -1418,13 +1976,16 @@ use zhixing_node::light::ProofKind;
     //    (Reviewer, 10), (Validator, 25)] }. One round-trip, three proofs.
     let mut full_node = net.take_full(1);
     let mut light_node = net.take_light(light_id);
-    let reply = full_node.on_message(light_id, GossipMsg::GetProof {
-        items: vec![
-            (ProofKind::Account, 1),
-            (ProofKind::Reviewer, 10),
-            (ProofKind::Validator, 25),
-        ],
-    });
+    let reply = full_node.on_message(
+        light_id,
+        GossipMsg::GetProof {
+            items: vec![
+                (ProofKind::Account, 1),
+                (ProofKind::Reviewer, 10),
+                (ProofKind::Validator, 25),
+            ],
+        },
+    );
     assert_eq!(reply.len(), 1, "full peer must serve the batched proofs");
     let (_dst, proof_msg) = reply.into_iter().next().unwrap();
     light_node.on_message(1, proof_msg);
@@ -1442,7 +2003,9 @@ use zhixing_node::light::ProofKind;
     //    equals the genesis set when the chain's first block is the one
     //    carrying the update. Use the genesis-tracker set explicitly.
     let header = zhixing_node::codec::BlockHeader::from_block(last_block);
-    let tracked = ValidatorTracker::from_genesis(&demo_genesis()).validators().clone();
+    let tracked = ValidatorTracker::from_genesis(&demo_genesis())
+        .validators()
+        .clone();
 
     let account_entry = light_node
         .take_proof(ProofKind::Account, 1)
@@ -1454,14 +2017,19 @@ use zhixing_node::light::ProofKind;
         .take_proof(ProofKind::Validator, 25)
         .expect("validator proof cached for id 25");
 
-    let account_ok = ValidatorTracker::verify_proof_against_header(
-        &header, last_cert, &tracked, &account_entry,
-    );
+    let account_ok =
+        ValidatorTracker::verify_proof_against_header(&header, last_cert, &tracked, &account_entry);
     let reviewer_ok = ValidatorTracker::verify_proof_against_header(
-        &header, last_cert, &tracked, &reviewer_entry,
+        &header,
+        last_cert,
+        &tracked,
+        &reviewer_entry,
     );
     let validator_ok = ValidatorTracker::verify_proof_against_header(
-        &header, last_cert, &tracked, &validator_entry,
+        &header,
+        last_cert,
+        &tracked,
+        &validator_entry,
     );
 
     let ProofEntry::Account { account, .. } = &account_entry else {
@@ -1496,7 +2064,12 @@ use zhixing_node::light::ProofKind;
 
     // 7. Negative: light wallet tampers with the validator's leaf (claims power+1),
     //    retry -> MembershipProofInvalid.
-    let ProofEntry::Validator { id: _id, validator: v_real, proof: p_real } = validator_entry else {
+    let ProofEntry::Validator {
+        id: _id,
+        validator: v_real,
+        proof: p_real,
+    } = validator_entry
+    else {
         unreachable!()
     };
     let mut bad_validator = v_real.clone();
@@ -1506,9 +2079,8 @@ use zhixing_node::light::ProofKind;
         validator: bad_validator,
         proof: p_real,
     };
-    let bad = ValidatorTracker::verify_proof_against_header(
-        &header, last_cert, &tracked, &forged_entry,
-    );
+    let bad =
+        ValidatorTracker::verify_proof_against_header(&header, last_cert, &tracked, &forged_entry);
     println!(
         "  inflated validator power (power+1) -> {} (must be false: {})",
         bad.is_ok(),
@@ -1522,7 +2094,10 @@ use zhixing_node::light::ProofKind;
     let mut bad_header = header.clone();
     bad_header.accounts_root = [0xAB; 32];
     let bad_root = ValidatorTracker::verify_proof_against_header(
-        &bad_header, last_cert, &tracked, &account_entry,
+        &bad_header,
+        last_cert,
+        &tracked,
+        &account_entry,
     );
     println!(
         "  tampered accounts_root -> {} (must be false: {})",
@@ -1537,9 +2112,18 @@ use zhixing_node::light::ProofKind;
     //    accounts_root is the inclusion-proof tree for accounts + reviewers.
     println!();
     println!("dual-root contract:");
-    println!("  state_root            = {}  (full consensus-state digest)", short(&header.state_root));
-    println!("  accounts_root         = {}  (Merkle root over accounts U reviewers)", short(&header.accounts_root));
-    println!("  next_validators_root  = {}  (Merkle root over next-set validators)", short(&header.next_validators_root));
+    println!(
+        "  state_root            = {}  (full consensus-state digest)",
+        short(&header.state_root)
+    );
+    println!(
+        "  accounts_root         = {}  (Merkle root over accounts U reviewers)",
+        short(&header.accounts_root)
+    );
+    println!(
+        "  next_validators_root  = {}  (Merkle root over next-set validators)",
+        short(&header.next_validators_root)
+    );
     println!("  the cert signs header.hash() which covers ALL THREE roots; the wallet");
     println!("  verifies each ProofEntry locally against its kind's root slot.");
     net.put_full(full_node);
@@ -1564,7 +2148,7 @@ use zhixing_node::light::ProofKind;
 /// The wallet never downloads the graph. The prover never gets to lie
 /// about the ranking or omit a tied neighbour.
 fn cmd_knn() {
-use zhixing_node::light::KnnClaim;
+    use zhixing_node::light::KnnClaim;
 
     println!("M26 — cert-signed kNN over the cognitive graph");
     println!();
@@ -1582,7 +2166,9 @@ use zhixing_node::light::KnnClaim;
     let mut full = GossipNode::new(1, demo_genesis(), 8, [1, 2]);
     full.load_certified(&blocks, &certs);
 
-    let tracked = ValidatorTracker::from_genesis(&demo_genesis()).validators().clone();
+    let tracked = ValidatorTracker::from_genesis(&demo_genesis())
+        .validators()
+        .clone();
     let header = zhixing_node::codec::BlockHeader::from_block(last_block);
 
     let n_graph = full.chain.state.graph.nodes.len();
@@ -1689,7 +2275,9 @@ use zhixing_node::light::KnnClaim;
         Err(zhixing_node::light::LightError::CertificateMismatch { .. }) => {
             println!("tampered accounts_root -> CertificateMismatch ✓");
         }
-        other => panic!("expected CertificateMismatch after tampering accounts_root, got {other:?}"),
+        other => {
+            panic!("expected CertificateMismatch after tampering accounts_root, got {other:?}")
+        }
     }
 
     println!();
@@ -1720,7 +2308,7 @@ cert-signed header without downloading the graph."
 ///   - tamper `header.graph_root` → `CertificateMismatch` (cert binding flips)
 ///   - bad `min_sim` (outside `[-1, 1]`) → `RangeCutoffInvalid`
 fn cmd_range() {
-use zhixing_node::light::RangeClaim;
+    use zhixing_node::light::RangeClaim;
 
     println!("M27 — cert-signed graph range query against a cert-signed header");
     println!();
@@ -1802,12 +2390,7 @@ use zhixing_node::light::RangeClaim;
     // CertificateMismatch wins before any Merkle check.
     let mut bad_header = header.clone();
     bad_header.graph_root = [0xCDu8; 32];
-    match ValidatorTracker::verify_range_against_header(
-        &bad_header,
-        &last_cert,
-        &tracked,
-        &claim,
-    ) {
+    match ValidatorTracker::verify_range_against_header(&bad_header, &last_cert, &tracked, &claim) {
         Err(LightError::CertificateMismatch { .. }) => {
             println!("negative 2: tamper graph_root → CertificateMismatch ✓");
         }
@@ -1822,12 +2405,7 @@ use zhixing_node::light::RangeClaim;
         min_sim: 2.0,
         nodes: claim.nodes.clone(),
     };
-    match ValidatorTracker::verify_range_against_header(
-        &header,
-        &last_cert,
-        &tracked,
-        &bad_claim,
-    ) {
+    match ValidatorTracker::verify_range_against_header(&header, &last_cert, &tracked, &bad_claim) {
         Err(LightError::RangeCutoffInvalid { .. }) => {
             println!("negative 3: min_sim=2.0 → RangeCutoffInvalid ✓");
         }
@@ -1850,7 +2428,6 @@ from a cert-signed header without downloading the graph."
 /// per-leaf proofs verify each entry's body, but completeness is bound
 /// to the replay.
 fn cmd_diff() {
-
     println!("M28 — cert-signed temporal graph diff between two cert-signed heights");
     println!();
 
@@ -1862,18 +2439,45 @@ fn cmd_diff() {
     // block after the first is produced.
     let mut driver = ChainDriver::new(demo_genesis(), demo_driver_seeds(), 4);
     driver
-        .submit(tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0))
+        .submit(tx(
+            1,
+            unit(1),
+            1,
+            reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]),
+            (3, 3),
+            1.0,
+        ))
         .expect("submit 1");
-    driver.produce(1.0, &BTreeSet::new()).unwrap().expect("block 1");
+    driver
+        .produce(1.0, &BTreeSet::new())
+        .unwrap()
+        .expect("block 1");
     // Block 2 carries two txs so the diff's `added` set has 2+ entries
     // (negative test 3 below requires at least two to drop one).
     driver
-        .submit(tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 2.0))
+        .submit(tx(
+            2,
+            unit(2),
+            2,
+            reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]),
+            (3, 3),
+            2.0,
+        ))
         .expect("submit 2");
     driver
-        .submit(tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 2.5))
+        .submit(tx(
+            3,
+            blend(1, 2),
+            3,
+            reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]),
+            (3, 3),
+            2.5,
+        ))
         .expect("submit 3");
-    driver.produce(2.0, &BTreeSet::new()).unwrap().expect("block 2");
+    driver
+        .produce(2.0, &BTreeSet::new())
+        .unwrap()
+        .expect("block 2");
     let blocks = driver.blocks().to_vec();
     let certs = driver.certificates().to_vec();
     assert_eq!(blocks.len(), 2, "test setup: chain must have 2 blocks");
@@ -1907,24 +2511,15 @@ fn cmd_diff() {
             entry.node_id,
         );
     }
-    println!(
-        "Merkle proofs: every added leaf verifies against header_h2.accounts_root"
-    );
+    println!("Merkle proofs: every added leaf verifies against header_h2.accounts_root");
     println!();
 
     // Wallet-side verifier: the wallet replays the full `[1..=h₂]` range
     // and re-derives the diff from scratch.
-    let blocks_in_range: Vec<(Block, Commit)> = blocks
-        .iter()
-        .cloned()
-        .zip(certs.iter().cloned())
-        .collect();
-    ValidatorTracker::verify_diff_against_headers(
-        &demo_genesis(),
-        &blocks_in_range,
-        &envelope,
-    )
-    .expect("wallet-side diff verifier accepts the envelope");
+    let blocks_in_range: Vec<(Block, Commit)> =
+        blocks.iter().cloned().zip(certs.iter().cloned()).collect();
+    ValidatorTracker::verify_diff_against_headers(&demo_genesis(), &blocks_in_range, &envelope)
+        .expect("wallet-side diff verifier accepts the envelope");
     println!("wallet: verify_diff_against_headers → Ok");
     println!();
 
@@ -1941,11 +2536,8 @@ fn cmd_diff() {
             };
         }
         bad.diff.added[0] = forged;
-        match ValidatorTracker::verify_diff_against_headers(
-            &demo_genesis(),
-            &blocks_in_range,
-            &bad,
-        ) {
+        match ValidatorTracker::verify_diff_against_headers(&demo_genesis(), &blocks_in_range, &bad)
+        {
             Err(LightError::MembershipProofInvalid { .. }) => {
                 println!("negative 1: tamper added proof → MembershipProofInvalid ✓");
             }
@@ -2010,9 +2602,7 @@ claim entry to its accounts_root."
 /// dispatches each slot to the matching existing verifier; no new SPV
 /// logic is added on top of M22–M28.
 fn cmd_batch() {
-use zhixing_node::light::{
-    BatchItem, BatchResponseEnvelope, BatchResponseItem, ProofKind,
-};
+    use zhixing_node::light::{BatchItem, BatchResponseEnvelope, BatchResponseItem, ProofKind};
 
     println!("M29 — heterogeneous batched proof transport (Inclusion + kNN + Range + Diff in one round-trip)");
     println!();
@@ -2021,25 +2611,49 @@ use zhixing_node::light::{
     // every batched slot has a non-trivial body to verify.
     let mut driver = ChainDriver::new(demo_genesis(), demo_driver_seeds(), 4);
     driver
-        .submit(tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0))
+        .submit(tx(
+            1,
+            unit(1),
+            1,
+            reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]),
+            (3, 3),
+            1.0,
+        ))
         .expect("submit 1");
-    driver.produce(1.0, &BTreeSet::new()).unwrap().expect("block 1");
     driver
-        .submit(tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 2.0))
+        .produce(1.0, &BTreeSet::new())
+        .unwrap()
+        .expect("block 1");
+    driver
+        .submit(tx(
+            2,
+            unit(2),
+            2,
+            reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]),
+            (3, 3),
+            2.0,
+        ))
         .expect("submit 2");
     driver
-        .submit(tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 2.5))
+        .submit(tx(
+            3,
+            blend(1, 2),
+            3,
+            reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]),
+            (3, 3),
+            2.5,
+        ))
         .expect("submit 3");
-    driver.produce(2.0, &BTreeSet::new()).unwrap().expect("block 2");
+    driver
+        .produce(2.0, &BTreeSet::new())
+        .unwrap()
+        .expect("block 2");
     let blocks = driver.blocks().to_vec();
     let certs = driver.certificates().to_vec();
     let header_h2 = BlockHeader::from_block(&blocks[1]);
     let cert_h2 = certs[1].clone();
-    let blocks_in_range: Vec<(Block, Commit)> = blocks
-        .iter()
-        .cloned()
-        .zip(certs.iter().cloned())
-        .collect();
+    let blocks_in_range: Vec<(Block, Commit)> =
+        blocks.iter().cloned().zip(certs.iter().cloned()).collect();
 
     // Full peer — wraps the same certified chain, so `serve_batch` reads
     // from the same state every per-primitive serve_* method does.
@@ -2050,15 +2664,25 @@ use zhixing_node::light::{
     // The full peer responds with one envelope carrying all four bodies.
     let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
     let items = vec![
-        BatchItem::Inclusion { kind: ProofKind::Account, id: 1 },
+        BatchItem::Inclusion {
+            kind: ProofKind::Account,
+            id: 1,
+        },
         BatchItem::Knn { query, k: 3 },
-        BatchItem::Range { query, min_sim: 0.0 },
+        BatchItem::Range {
+            query,
+            min_sim: 0.0,
+        },
         BatchItem::Diff { h1: 1, h2: 2 },
     ];
     let envelope: BatchResponseEnvelope = full
         .serve_batch(items.clone())
         .expect("full peer serves a heterogeneous batch");
-    assert_eq!(envelope.items.len(), 4, "envelope must have one slot per request item");
+    assert_eq!(
+        envelope.items.len(),
+        4,
+        "envelope must have one slot per request item"
+    );
     println!(
         "full peer served a heterogeneous batch: 4 items, |inclusion|={:?}, |knn_neighbours|={:?}, |range_nodes|={:?}, diff.added={}",
         matches!(envelope.items[0], BatchResponseItem::Inclusion(Some(_))),
@@ -2089,16 +2713,16 @@ use zhixing_node::light::{
     println!();
 
     // Negative 1: tamper inclusion balance → MembershipProofInvalid.
-    if let BatchResponseItem::Inclusion(Some(ProofEntry::Account { id, mut account, proof })) =
-        envelope.items[0].clone()
+    if let BatchResponseItem::Inclusion(Some(ProofEntry::Account {
+        id,
+        mut account,
+        proof,
+    })) = envelope.items[0].clone()
     {
         account.balance = account.balance.wrapping_add(1);
         let mut bad = envelope.clone();
-        bad.items[0] = BatchResponseItem::Inclusion(Some(ProofEntry::Account {
-            id,
-            account,
-            proof,
-        }));
+        bad.items[0] =
+            BatchResponseItem::Inclusion(Some(ProofEntry::Account { id, account, proof }));
         match ValidatorTracker::verify_batch(
             &tracker,
             &demo_genesis(),
@@ -2205,7 +2829,10 @@ fn cmd_bridge() {
     }
     .signed(&kp(1));
     driver_a.stage_bridge_lock(lock.clone());
-    driver_a.produce(1.0, &BTreeSet::new()).unwrap().expect("A block 1");
+    driver_a
+        .produce(1.0, &BTreeSet::new())
+        .unwrap()
+        .expect("A block 1");
     let blocks_a = driver_a.blocks().to_vec();
     let certs_a = driver_a.certificates().to_vec();
     assert_eq!(blocks_a.len(), 1);
@@ -2236,7 +2863,11 @@ fn cmd_bridge() {
     // Destination endpoint on B: follow source chain, verify lock, credit.
     let mut endpoint_b = BridgeEndpoint::new(&gb, &ga);
     endpoint_b
-        .follow_source(&env.source_header, &env.source_cert, &env.source_tracked_set)
+        .follow_source(
+            &env.source_header,
+            &env.source_cert,
+            &env.source_tracked_set,
+        )
         .expect("B follows A's height 1");
     let verified = endpoint_b.verify_lock(&env).expect("verify_lock → Ok");
     println!(
@@ -2376,11 +3007,22 @@ fn cmd_redeem() {
     .signed(&kp(1));
     driver_a.stage_bridge_lock(lock0.clone());
     driver_a.stage_bridge_lock(lock1.clone());
-    driver_a.produce(1.0, &BTreeSet::new()).unwrap().expect("A locks");
+    driver_a
+        .produce(1.0, &BTreeSet::new())
+        .unwrap()
+        .expect("A locks");
     let a_header = driver_a.blocks()[0].header();
     let a_cert = driver_a.certificates()[0].clone();
-    let proof0 = driver_a.chain.state.bridge_lock_proof(0).expect("proof for lock 0");
-    let proof1 = driver_a.chain.state.bridge_lock_proof(1).expect("proof for lock 1");
+    let proof0 = driver_a
+        .chain
+        .state
+        .bridge_lock_proof(0)
+        .expect("proof for lock 0");
+    let proof1 = driver_a
+        .chain
+        .state
+        .bridge_lock_proof(1)
+        .expect("proof for lock 1");
     println!(
         "chain A: locked {} → B (lock 0) and {} → C (lock 1); bridge_locked={}",
         cog(lock0.amount),
@@ -2396,12 +3038,21 @@ fn cmd_redeem() {
         cert: a_cert.clone(),
         next_set: a_genesis_set.clone(),
     });
-    driver_b.produce(1.0, &BTreeSet::new()).unwrap().expect("B follows A");
+    driver_b
+        .produce(1.0, &BTreeSet::new())
+        .unwrap()
+        .expect("B follows A");
     // Snapshot B at the followed-but-unredeemed state, for the negative cases.
     let followed = driver_b.chain.clone();
     println!(
         "chain B: followed A → source follower at height {}",
-        driver_b.chain.state.bridge_sources.get(&a_genesis_hash).unwrap().height
+        driver_b
+            .chain
+            .state
+            .bridge_sources
+            .get(&a_genesis_hash)
+            .unwrap()
+            .height
     );
 
     driver_b.stage_bridge_redeem(BridgeRedeem {
@@ -2412,12 +3063,22 @@ fn cmd_redeem() {
         lock: lock0.clone(),
         proof: proof0.clone(),
     });
-    driver_b.produce(2.0, &BTreeSet::new()).unwrap().expect("B redeems lock 0");
+    driver_b
+        .produce(2.0, &BTreeSet::new())
+        .unwrap()
+        .expect("B redeems lock 0");
 
     let minted = driver_b.chain.state.accounts.get(&5).unwrap().balance;
     assert_eq!(minted, 10 * MICRO, "destination credited on-chain");
-    assert_eq!(driver_b.chain.state.bridge_minted, 10 * MICRO, "audit counter");
-    assert!(driver_b.chain.state.supply_conserved(), "supply invariant holds");
+    assert_eq!(
+        driver_b.chain.state.bridge_minted,
+        10 * MICRO,
+        "audit counter"
+    );
+    assert!(
+        driver_b.chain.state.supply_conserved(),
+        "supply invariant holds"
+    );
     println!(
         "Ok: redeemed lock 0 in B's state machine → minted {} to account 5, \
          bridge_minted={}, supply conserved ✓",
@@ -2432,7 +3093,9 @@ fn cmd_redeem() {
     let try_redeem = |mut chain: Chain, redeem: BridgeRedeem, ts: f32| -> ChainError {
         let mut blk = empty_next_block(&chain, ts);
         blk.bridge_redeems.push(redeem);
-        chain.commit(&mut blk).expect_err("bad redeem must be rejected")
+        chain
+            .commit(&mut blk)
+            .expect_err("bad redeem must be rejected")
     };
 
     // Negative 1: tamper lock.amount → leaf no longer opens under bridge_root.
@@ -2537,6 +3200,7 @@ fn empty_next_block(chain: &Chain, timestamp_days: f32) -> Block {
         height: chain.state.height + 1,
         prev_hash: chain.head,
         timestamp_days,
+        proposer: 0, // M122
         next_validators_root: [0u8; 32],
         state_root: [0u8; 32],
         accounts_root: [0u8; 32],
@@ -2552,13 +3216,12 @@ fn empty_next_block(chain: &Chain, timestamp_days: f32) -> Block {
     }
 }
 
-
 /// a concept) against a cert-signed header via the unified GetProof bus —
 /// no replay, no graph download, no tx bodies. The graph node lives in the
 /// same `accounts_root` tree as accounts and reviewers; the wallet
 /// recomputes the leaf locally from the typed `ProofEntry::GraphNode`.
 fn cmd_graph() {
-use zhixing_node::light::ProofKind;
+    use zhixing_node::light::ProofKind;
 
     println!("M25 — cognitive-graph inclusion proof against a cert-signed header");
     println!();
@@ -2614,10 +3277,14 @@ use zhixing_node::light::ProofKind;
     println!("  domain    = {}", expected_node.domain);
     println!(
         "  embedding = [{:.2}, {:.2}, {:.2}, {:.2}, {:.2}, {:.2}, {:.2}, {:.2}]",
-        expected_node.embedding[0], expected_node.embedding[1],
-        expected_node.embedding[2], expected_node.embedding[3],
-        expected_node.embedding[4], expected_node.embedding[5],
-        expected_node.embedding[6], expected_node.embedding[7],
+        expected_node.embedding[0],
+        expected_node.embedding[1],
+        expected_node.embedding[2],
+        expected_node.embedding[3],
+        expected_node.embedding[4],
+        expected_node.embedding[5],
+        expected_node.embedding[6],
+        expected_node.embedding[7],
     );
 
     // Send a single batched GetProof: account #1 + graph node (idx 0).
@@ -2626,10 +3293,7 @@ use zhixing_node::light::ProofKind;
     let reply = full_node.on_message(
         light_id,
         GossipMsg::GetProof {
-            items: vec![
-                (ProofKind::Account, 1),
-                (ProofKind::GraphNode, idx as u64),
-            ],
+            items: vec![(ProofKind::Account, 1), (ProofKind::GraphNode, idx as u64)],
         },
     );
     assert_eq!(reply.len(), 1, "full peer must serve the batched proofs");
@@ -2637,7 +3301,9 @@ use zhixing_node::light::ProofKind;
     light_node.on_message(1, proof_msg);
 
     let header = zhixing_node::codec::BlockHeader::from_block(last_block);
-    let tracked = ValidatorTracker::from_genesis(&demo_genesis()).validators().clone();
+    let tracked = ValidatorTracker::from_genesis(&demo_genesis())
+        .validators()
+        .clone();
 
     let account_entry = light_node
         .take_proof(ProofKind::Account, 1)
@@ -2646,12 +3312,10 @@ use zhixing_node::light::ProofKind;
         .take_proof(ProofKind::GraphNode, expected_node.node_id)
         .expect("graph node proof cached");
 
-    let account_ok = ValidatorTracker::verify_proof_against_header(
-        &header, last_cert, &tracked, &account_entry,
-    );
-    let graph_ok = ValidatorTracker::verify_proof_against_header(
-        &header, last_cert, &tracked, &graph_entry,
-    );
+    let account_ok =
+        ValidatorTracker::verify_proof_against_header(&header, last_cert, &tracked, &account_entry);
+    let graph_ok =
+        ValidatorTracker::verify_proof_against_header(&header, last_cert, &tracked, &graph_entry);
 
     let ProofEntry::Account { account, .. } = &account_entry else {
         unreachable!("account entry shape");
@@ -2661,16 +3325,26 @@ use zhixing_node::light::ProofKind;
     };
 
     println!();
-    println!("verify_proof_against_header (Account #1, balance = {} COG) -> {}",
-        account.balance / MICRO, account_ok.is_ok());
+    println!(
+        "verify_proof_against_header (Account #1, balance = {} COG) -> {}",
+        account.balance / MICRO,
+        account_ok.is_ok()
+    );
     println!(
         "verify_proof_against_header (GraphNode #{}, domain = {}) -> {}",
-        graph_node.node_id, graph_node.domain, graph_ok.is_ok()
+        graph_node.node_id,
+        graph_node.domain,
+        graph_ok.is_ok()
     );
 
     // Negative: tamper with the graph node's embedding -> verifier recomputes
     // the leaf locally and rejects the proof with MembershipProofInvalid.
-    let ProofEntry::GraphNode { node_id: nid, graph_node: real_node, proof: p } = graph_entry.clone() else {
+    let ProofEntry::GraphNode {
+        node_id: nid,
+        graph_node: real_node,
+        proof: p,
+    } = graph_entry.clone()
+    else {
         unreachable!()
     };
     let mut bad_node = real_node.clone();
@@ -2680,9 +3354,8 @@ use zhixing_node::light::ProofKind;
         graph_node: bad_node,
         proof: p.clone(),
     };
-    let bad = ValidatorTracker::verify_proof_against_header(
-        &header, last_cert, &tracked, &forged_entry,
-    );
+    let bad =
+        ValidatorTracker::verify_proof_against_header(&header, last_cert, &tracked, &forged_entry);
     println!();
     println!(
         "tampered embedding[0] -> {} (must be false: {})",
@@ -2698,7 +3371,10 @@ use zhixing_node::light::ProofKind;
     let mut bad_header = header.clone();
     bad_header.accounts_root = [0xAB; 32];
     let bad_root = ValidatorTracker::verify_proof_against_header(
-        &bad_header, last_cert, &tracked, &graph_entry,
+        &bad_header,
+        last_cert,
+        &tracked,
+        &graph_entry,
     );
     println!(
         "tampered accounts_root -> {} (must be false: {})",
@@ -2713,30 +3389,397 @@ use zhixing_node::light::ProofKind;
     net.put_light(light_node);
 }
 
-
 /// Run the real networked daemon. Loads the node config and its referenced
 /// genesis, derives this process's single validator key (M33: one key per node,
 /// no sequencer) from the `[validator]` section, builds a multi-thread tokio
 /// runtime, and blocks on `daemon::run` until Ctrl-C. `main()` stays sync so the
 /// ~20 in-memory demo commands are unaffected by the async runtime.
-fn cmd_run(config_path: String) {
+/// M96: load + fully validate a node config and its referenced genesis — the same
+/// load/parse/convert/key-derive steps [`cmd_run`] performs, minus binding any socket or
+/// starting the actor. Returns a human-readable summary on success, or the first typed
+/// [`config::ConfigError`]. Pure (reads only the referenced files; no process exit, no
+/// network, no state) so it is unit-testable; [`cmd_check_config`] is the thin CLI shell.
+fn check_config(config_path: &str) -> Result<String, config::ConfigError> {
+    let cfg = config::load_node_config(config_path)?;
+    let gcfg = config::load_genesis(&cfg.genesis)?;
+    let genesis = gcfg.to_genesis()?;
+    // Validate the validator key material too (an enabled `[validator]` section) — a bad key
+    // should fail the dry-run, not first surface when `run` tries to vote.
+    let role = match cfg.validator.as_ref() {
+        Some(vc) if vc.enabled => {
+            vc.keypair()?;
+            "validator"
+        }
+        _ => "follower",
+    };
+    Ok(format!(
+        "ok config {config_path}\nnode id {}\nrole {role}\ngenesis {}\naccounts {}\nreviewers {}\nvalidators {}\npeers {}",
+        cfg.node.id,
+        cfg.genesis,
+        genesis.accounts.len(),
+        genesis.reviewers.len(),
+        genesis.validators.len(),
+        cfg.peers.len(),
+    ))
+}
+
+/// M96: `node check-config --config F` — dry-run config/genesis validation. Prints the
+/// [`check_config`] summary on success, or the typed error + exit 2 (the CLI idiom). Binds
+/// no socket and starts no actor, so it is safe to run against a production config anywhere.
+fn cmd_check_config(config_path: String) {
+    match check_config(&config_path) {
+        Ok(summary) => println!("{summary}"),
+        Err(e) => fail_msg("check-config", &e),
+    }
+}
+
+/// M97: derive the chain identity from a config's genesis — the `genesis_hash` (the head
+/// every honest node starts from), the initial `state_root`, and the genesis validator
+/// count. Two operators comparing these three before joining can confirm they agree on
+/// genesis byte-for-byte (a mismatched genesis means incompatible chains / failed sync).
+/// Loads + converts the genesis exactly as `cmd_run` does, then stamps it via
+/// [`ChainState::genesis`] — no socket, no actor. Pure for unit testing.
+fn genesis_identity(config_path: &str) -> Result<String, config::ConfigError> {
+    let cfg = config::load_node_config(config_path)?;
+    let genesis = config::load_genesis(&cfg.genesis)?.to_genesis()?;
+    let (state, gh) = ChainState::genesis(genesis);
+    Ok(format!(
+        "genesis_hash {}\nstate_root {}\nvalidators {}",
+        hex(&gh),
+        hex(&state.state_root()),
+        state.validators.validators().len(),
+    ))
+}
+
+/// M97: `node genesis-hash --config F` — print the chain identity for the config's genesis,
+/// or the typed error + exit 2. Reads only the referenced files; binds nothing.
+fn cmd_genesis_hash(config_path: String) {
+    match genesis_identity(&config_path) {
+        Ok(summary) => println!("{summary}"),
+        Err(e) => fail_msg("genesis-hash", &e),
+    }
+}
+
+/// M102: dump a config's genesis contents in full — the detail view to `genesis-hash`'s
+/// identity triple. Lists every account (id/balance/pubkey), reviewer (id/reputation), and
+/// validator (id/power/pubkey), plus the scalar params and seed-node count, so a reviewer can
+/// eyeball exactly what a `genesis.toml` seeds before joining. Loads + converts the genesis
+/// exactly as `cmd_run` does (so a malformed genesis is reported), binding nothing. Pure.
+fn inspect_genesis(config_path: &str) -> Result<String, config::ConfigError> {
+    let cfg = config::load_node_config(config_path)?;
+    let g = config::load_genesis(&cfg.genesis)?.to_genesis()?;
+    let mut out = format!(
+        "genesis {}\nbase_emission_micro {}\nslash_bps {}\ntimestamp_days {}",
+        cfg.genesis, g.base_emission_micro, g.slash_bps, g.timestamp_days,
+    );
+    out.push_str(&format!("\naccounts {}", g.accounts.len()));
+    for (id, balance, pk) in &g.accounts {
+        out.push_str(&format!(
+            "\naccount {id} balance {balance} pubkey {}",
+            hex(pk)
+        ));
+    }
+    out.push_str(&format!("\nreviewers {}", g.reviewers.len()));
+    for (id, reputation) in &g.reviewers {
+        out.push_str(&format!("\nreviewer {id} reputation {reputation}"));
+    }
+    out.push_str(&format!("\nvalidators {}", g.validators.len()));
+    for (id, pk, power) in &g.validators {
+        out.push_str(&format!(
+            "\nvalidator {id} power {power} pubkey {}",
+            hex(pk)
+        ));
+    }
+    out.push_str(&format!("\nseed_nodes {}", g.seed_nodes.len()));
+    Ok(out)
+}
+
+/// M102: `node inspect-genesis --config F` — print the [`inspect_genesis`] dump, or the typed
+/// error + exit 2. Reads only the referenced files; binds nothing.
+fn cmd_inspect_genesis(config_path: String) {
+    match inspect_genesis(&config_path) {
+        Ok(summary) => println!("{summary}"),
+        Err(e) => fail_msg("inspect-genesis", &e),
+    }
+}
+
+/// M98: decode a `codec::encode_tx` file and render its fields + content hash in human form
+/// — the read-side companion to `encode-tx`. With `pubkey_hex` present, also verify the
+/// ed25519 signature over `tx_signing_bytes` against that account key (a tx file carries no
+/// pubkey; the chain looks it up by `author`, so verification needs the key supplied). The
+/// hash is what the mempool dedups on, so an operator can confirm a file matches an on-chain
+/// tx. Pure (decode/verify only) for unit testing; `cmd_inspect_tx` is the file-reading shell.
+fn inspect_tx(bytes: &[u8], pubkey_hex: Option<&str>) -> Result<String, String> {
+    let tx = zhixing_node::codec::decode_tx(bytes).map_err(|e| format!("decode tx: {e}"))?;
+    let mut out = format!(
+        "hash {}\nauthor {}\ndomain {}\nstake {}\nreviews {}\nrepl {}/{}\ntimestamp_days {}\nembedding_dim {}\nsignature {}\n",
+        hex(&tx.hash()),
+        tx.author,
+        tx.domain,
+        tx.stake,
+        tx.reviews.len(),
+        tx.repl_success,
+        tx.repl_total,
+        tx.timestamp_days,
+        tx.embedding.len(),
+        hex(&tx.signature),
+    );
+    match pubkey_hex {
+        Some(h) => {
+            let pk = config::decode_pubkey(h.trim(), "--pubkey").map_err(|e| format!("{e}"))?;
+            let ok = zhixing_node::crypto::verify(
+                &pk,
+                &zhixing_node::codec::tx_signing_bytes(&tx),
+                &tx.signature,
+            );
+            out.push_str(&format!("signature_valid {ok}"));
+        }
+        None => out.push_str("signature_valid unknown (pass --pubkey <hex> to verify)"),
+    }
+    Ok(out)
+}
+
+/// M98: `node inspect-tx --tx F [--pubkey HEX]` — print a decoded tx file (and optionally
+/// verify its signature). Reads only the `--tx` file; binds nothing.
+fn cmd_inspect_tx(args: &[String]) {
+    let tx_path = tx_arg(args);
+    let bytes = std::fs::read(&tx_path).unwrap_or_else(|e| fail("read tx file", e));
+    match inspect_tx(&bytes, opt_arg(args, "--pubkey")) {
+        Ok(summary) => println!("{summary}"),
+        Err(e) => fail_msg("inspect-tx", &e),
+    }
+}
+
+/// M99: derive the ed25519 public-key hex from a 64-hex seed (the format `keygen` writes and
+/// `encode-tx --key-file` consumes). Reuses `config::decode_seed` for identical parsing +
+/// `BadHex` errors. Pure for unit testing.
+fn derive_pubkey(seed_hex: &str, field: &str) -> Result<String, config::ConfigError> {
+    let seed = config::decode_seed(seed_hex.trim(), field)?;
+    Ok(hex(&Keypair::from_seed(seed).public()))
+}
+
+/// M99: `node pubkey (--key-file F | --seed HEX) [--genesis-id N ...]` — derive and print the
+/// pubkey for an existing seed **without writing any file** (unlike `keygen`, which recovers a
+/// pubkey only as a side effect of writing a seed file). Read-only; pairs with
+/// `inspect-tx --pubkey`. With `--genesis-id`, also prints the M95 genesis entry.
+fn cmd_pubkey(args: &[String]) {
+    let (seed_hex, field) = if let Some(s) = opt_arg(args, "--seed") {
+        (s.to_string(), "--seed")
+    } else if let Some(path) = opt_arg(args, "--key-file") {
+        (
+            std::fs::read_to_string(path).unwrap_or_else(|e| fail("read key file", e)),
+            "--key-file",
+        )
+    } else {
+        fail_msg("pubkey", &"requires --key-file <path> or --seed <64hex>");
+    };
+    let pub_hex = derive_pubkey(&seed_hex, field).unwrap_or_else(|e| fail_msg("pubkey", &e));
+    println!("pubkey {pub_hex}");
+    if let Some(entries) = keygen_genesis_entries(args, &pub_hex) {
+        print!("{entries}");
+    }
+}
+
+/// M100: render a persisted block log for offline inspection — the read-side companion to
+/// `inspect-tx`, one level up (a block instead of a loose tx). `height == None` lists every
+/// block with its body counts; `Some(h)` prints one block's header (hash, prev, roots,
+/// timestamp) + contents counts + each tx's hash/author. Blocks are matched by their own
+/// `height` field (authoritative), not log index. Pure for unit testing; `cmd_inspect_block`
+/// is the log-reading shell.
+fn inspect_block(blocks: &[Block], height: Option<u64>) -> Result<String, String> {
+    match height {
+        None => {
+            let mut out = format!("blocks {}", blocks.len());
+            for b in blocks {
+                out.push_str(&format!(
+                    "\nheight {} txs {} stake_ops {} evidence {} validator_updates {}",
+                    b.height,
+                    b.txs.len(),
+                    b.stake_ops.len(),
+                    b.slashing_evidence.len(),
+                    b.validator_updates.len(),
+                ));
+            }
+            Ok(out)
+        }
+        Some(h) => {
+            let b = blocks.iter().find(|b| b.height == h).ok_or_else(|| {
+                format!("no block at height {h} (log has {} block(s))", blocks.len())
+            })?;
+            let mut out = format!(
+                "height {}\nhash {}\nprev_hash {}\ntimestamp_days {}\nstate_root {}\naccounts_root {}\ngraph_root {}\nnext_validators_root {}\n\
+txs {}\nstake_ops {}\nslashing_evidence {}\nvalidator_updates {}\nbridge_locks {}\nbridge_headers {}\nbridge_redeems {}",
+                b.height,
+                hex(&b.hash()),
+                hex(&b.prev_hash),
+                b.timestamp_days,
+                hex(&b.state_root),
+                hex(&b.accounts_root),
+                hex(&b.graph_root),
+                hex(&b.next_validators_root),
+                b.txs.len(),
+                b.stake_ops.len(),
+                b.slashing_evidence.len(),
+                b.validator_updates.len(),
+                b.bridge_locks.len(),
+                b.bridge_headers.len(),
+                b.bridge_redeems.len(),
+            );
+            for (i, tx) in b.txs.iter().enumerate() {
+                out.push_str(&format!(
+                    "\ntx {i} hash {} author {}",
+                    hex(&tx.hash()),
+                    tx.author
+                ));
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// M100: `node inspect-block --dir DIR [--height N]` — read `{dir}/blocks.log` and print the
+/// [`inspect_block`] rendering. Read-only (opens the log, binds nothing).
+fn cmd_inspect_block(args: &[String]) {
+    let dir = dir_arg(args);
+    let path = format!("{dir}/blocks.log");
+    let log = BlockLog::open(&path).unwrap_or_else(|e| fail("open log", e));
+    let blocks = log.read_all().unwrap_or_else(|e| fail("read log", e));
+    let height = opt_arg(args, "--height").map(|h| {
+        h.parse::<u64>()
+            .unwrap_or_else(|_| fail_msg("--height", &format!("`{h}` is not a u64")))
+    });
+    match inspect_block(&blocks, height) {
+        Ok(s) => println!("{s}"),
+        Err(e) => fail_msg("inspect-block", &e),
+    }
+}
+
+/// M101: render a persisted finality-certificate log for offline inspection — the cert-log
+/// companion to `inspect-block` (`certs.log` beside `blocks.log`). `height == None` lists each
+/// `Commit` with its round, block hash, and precommit count; `Some(h)` prints one cert's
+/// height/round/block_hash + every precommit's voter id and vote type. This is a *structural*
+/// view (who signed what) — it does not re-verify the > 2/3 quorum, which needs the
+/// height-specific validator set (`node certs` does that end to end). Certs match by their own
+/// `height` field. Pure for unit testing; `cmd_inspect_cert` is the log-reading shell.
+fn inspect_cert(certs: &[Commit], height: Option<u64>) -> Result<String, String> {
+    match height {
+        None => {
+            let mut out = format!("certs {}", certs.len());
+            for c in certs {
+                out.push_str(&format!(
+                    "\nheight {} round {} precommits {} block_hash {}",
+                    c.height,
+                    c.round,
+                    c.precommits.len(),
+                    hex(&c.block_hash),
+                ));
+            }
+            Ok(out)
+        }
+        Some(h) => {
+            let c = certs.iter().find(|c| c.height == h).ok_or_else(|| {
+                format!("no cert at height {h} (log has {} cert(s))", certs.len())
+            })?;
+            let mut out = format!(
+                "height {}\nround {}\nblock_hash {}\nprecommits {}",
+                c.height,
+                c.round,
+                hex(&c.block_hash),
+                c.precommits.len(),
+            );
+            for (i, v) in c.precommits.iter().enumerate() {
+                let vote_type = match v.vote_type {
+                    VoteType::Prevote => "prevote",
+                    VoteType::Precommit => "precommit",
+                };
+                out.push_str(&format!(
+                    "\nprecommit {i} validator {} round {} vote_type {vote_type}",
+                    v.validator, v.round
+                ));
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// M101: `node inspect-cert --dir DIR [--height N]` — read `{dir}/certs.log` and print the
+/// [`inspect_cert`] rendering. Read-only (opens the log, binds nothing).
+fn cmd_inspect_cert(args: &[String]) {
+    let dir = dir_arg(args);
+    let path = format!("{dir}/certs.log");
+    let log = CertLog::open(&path).unwrap_or_else(|e| fail("open cert log", e));
+    let certs = log.read_all().unwrap_or_else(|e| fail("read cert log", e));
+    let height = opt_arg(args, "--height").map(|h| {
+        h.parse::<u64>()
+            .unwrap_or_else(|_| fail_msg("--height", &format!("`{h}` is not a u64")))
+    });
+    match inspect_cert(&certs, height) {
+        Ok(s) => println!("{s}"),
+        Err(e) => fail_msg("inspect-cert", &e),
+    }
+}
+
+fn cmd_run(config_path: String, args: &[String]) {
     // M44: load the config first, then install the subscriber from its optional
     // `[logging]` section (absent ⇒ the M37 default). Config-load errors print via
     // `fail_msg`/eprintln — not tracing — so no log lines are lost by ordering the
     // load before the subscriber init.
-    let cfg = config::load_node_config(&config_path)
-        .unwrap_or_else(|e| fail_msg("load node config", &e));
+    let mut cfg =
+        config::load_node_config(&config_path).unwrap_or_else(|e| fail_msg("load node config", &e));
+    // M140: optional snapshot-boot flags — `--snapshot FILE` + `--snapshot-header HEX`. The two
+    // flags are a coherent pair; if either is given we set `cfg.snapshot` so `Node::start`
+    // adopts the snapshot at boot (reconciling the on-disk log + verifying the cert-signed
+    // header against the snapshot's three roots).
+    // M141: optional `--snapshot-cert HEX` + `--snapshot-validators FILE` upgrade the boot to a
+    // `>2/3` quorum check against an operator-pinned trusted set. They require the base pair and
+    // are themselves a coherent pair; the final cert/trusted-set coherence is enforced in
+    // `load_snapshot_boot` (authoritative for both the CLI and the TOML keypath).
+    let snap_path = opt_arg(args, "--snapshot").map(str::to_string);
+    let snap_header = opt_arg(args, "--snapshot-header").map(str::to_string);
+    let snap_cert = opt_arg(args, "--snapshot-cert").map(str::to_string);
+    let snap_vals = opt_arg(args, "--snapshot-validators").map(str::to_string);
+    match (snap_path, snap_header) {
+        (Some(_), None) | (None, Some(_)) => fail_msg(
+            "node run",
+            &"--snapshot and --snapshot-header must be given together",
+        ),
+        (Some(path), Some(header_hex)) => {
+            let trusted_validators = snap_vals
+                .as_ref()
+                .map(|p| {
+                    config::load_trusted_validators(p)
+                        .unwrap_or_else(|e| fail_msg("load snapshot trusted validators", &e))
+                })
+                .unwrap_or_default();
+            cfg.snapshot = Some(config::SnapshotBootConfig {
+                path,
+                header_hex,
+                cert_hex: snap_cert,
+                trusted_validators,
+            });
+        }
+        (None, None) => {
+            if snap_cert.is_some() || snap_vals.is_some() {
+                fail_msg(
+                    "node run",
+                    &"--snapshot-cert/--snapshot-validators require --snapshot and --snapshot-header",
+                );
+            }
+        }
+    }
     daemon::init_tracing_with(cfg.logging.as_ref());
-    let gcfg = config::load_genesis(&cfg.genesis)
-        .unwrap_or_else(|e| fail_msg("load genesis", &e));
-    let genesis = gcfg.to_genesis().unwrap_or_else(|e| fail_msg("build genesis", &e));
+    let gcfg = config::load_genesis(&cfg.genesis).unwrap_or_else(|e| fail_msg("load genesis", &e));
+    let genesis = gcfg
+        .to_genesis()
+        .unwrap_or_else(|e| fail_msg("build genesis", &e));
 
     // M33: an enabled `[validator]` section makes this node a voting validator;
     // absent or disabled ⇒ a pure follower that syncs + verifies but never votes.
     let validator_key = match cfg.validator.as_ref() {
-        Some(vc) if vc.enabled => {
-            Some(vc.keypair().unwrap_or_else(|e| fail_msg("validator key", &e)))
-        }
+        Some(vc) if vc.enabled => Some(
+            vc.keypair()
+                .unwrap_or_else(|e| fail_msg("validator key", &e)),
+        ),
         _ => None,
     };
 
@@ -2756,8 +3799,8 @@ fn cmd_run(config_path: String) {
 fn cmd_submit_tx(config_path: String, tx_path: String) {
     use std::io::{Read as _, Write as _};
 
-    let cfg = config::load_node_config(&config_path)
-        .unwrap_or_else(|e| fail_msg("load node config", &e));
+    let cfg =
+        config::load_node_config(&config_path).unwrap_or_else(|e| fail_msg("load node config", &e));
     let rpc = match cfg.rpc.as_ref().filter(|r| r.enabled) {
         Some(r) => r,
         None => fail_msg(
@@ -2778,11 +3821,17 @@ fn cmd_submit_tx(config_path: String, tx_path: String) {
         "POST /submit_tx HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    stream.write_all(header.as_bytes()).unwrap_or_else(|e| fail("send request", e));
-    stream.write_all(&body).unwrap_or_else(|e| fail("send request", e));
+    stream
+        .write_all(header.as_bytes())
+        .unwrap_or_else(|e| fail("send request", e));
+    stream
+        .write_all(&body)
+        .unwrap_or_else(|e| fail("send request", e));
 
     let mut resp = Vec::new();
-    stream.read_to_end(&mut resp).unwrap_or_else(|e| fail("read response", e));
+    stream
+        .read_to_end(&mut resp)
+        .unwrap_or_else(|e| fail("read response", e));
     let text = String::from_utf8_lossy(&resp);
 
     // Split status line + body; the status line's first token after the version
@@ -2799,15 +3848,101 @@ fn cmd_submit_tx(config_path: String, tx_path: String) {
     }
 }
 
+/// M116: format an HTTP/1.1 GET request for the read-RPC client. Pure for unit testing.
+fn rpc_get_request(host: &str, path: &str) -> String {
+    format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+}
+
+/// M117: build a full HTTP/1.1 POST request (header block + raw body) for the RPC client's
+/// `--post` mode. Returns bytes (not a `String`) so a binary codec body passes through
+/// untouched; `Content-Length` is the exact body length. Pure for unit testing.
+fn rpc_post_request(host: &str, path: &str, body: &[u8]) -> Vec<u8> {
+    let mut req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    req.extend_from_slice(body);
+    req
+}
+
+/// M116: split a raw HTTP response into `(status_line, body)` — the status line is the first
+/// line, the body is everything after the `\r\n\r\n` header terminator (empty when absent,
+/// e.g. a 304/HEAD). Pure for unit testing.
+fn split_http_response(text: &str) -> (&str, &str) {
+    let status_line = text.lines().next().unwrap_or("");
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+    (status_line, body)
+}
+
+/// M116: `node rpc --config F --path P` — a curl-free read client. GETs `P` from the config's
+/// enabled `[rpc]` endpoint and prints the response body on a 2xx, or the status line + body
+/// on stderr (exit 1) otherwise. Reads only; the one-shot CLI needs no tokio runtime.
+/// M117: with `--post FILE`, sends a POST carrying the file's raw bytes (e.g. a codec-encoded
+/// tx to `/submit_tx` or `/validate`, a batch request to `/batch`) — one client for every
+/// GET or POST endpoint.
+fn cmd_rpc(args: &[String]) {
+    use std::io::{Read as _, Write as _};
+
+    let config_path = config_arg(args);
+    let path = req_arg(args, "--path");
+    let cfg =
+        config::load_node_config(&config_path).unwrap_or_else(|e| fail_msg("load node config", &e));
+    let rpc = match cfg.rpc.as_ref().filter(|r| r.enabled) {
+        Some(r) => r,
+        None => fail_msg(
+            "rpc",
+            &"config has no enabled [rpc] section (set [rpc] enabled = true on the daemon)",
+        ),
+    };
+    let addr = rpc.listen.clone();
+
+    let mut stream = std::net::TcpStream::connect(&addr).unwrap_or_else(|e| fail("connect rpc", e));
+    match opt_arg(args, "--post") {
+        Some(file) => {
+            let body = std::fs::read(file).unwrap_or_else(|e| fail("read post body", e));
+            stream
+                .write_all(&rpc_post_request(&addr, path, &body))
+                .unwrap_or_else(|e| fail("send request", e));
+        }
+        None => {
+            stream
+                .write_all(rpc_get_request(&addr, path).as_bytes())
+                .unwrap_or_else(|e| fail("send request", e));
+        }
+    }
+    let mut resp = Vec::new();
+    stream
+        .read_to_end(&mut resp)
+        .unwrap_or_else(|e| fail("read response", e));
+    let text = String::from_utf8_lossy(&resp);
+    let (status_line, body) = split_http_response(&text);
+    let code = status_line.split_whitespace().nth(1).unwrap_or("");
+    if code.starts_with('2') {
+        println!("{body}");
+    } else {
+        eprintln!("{status_line}");
+        if !body.is_empty() {
+            eprintln!("{body}");
+        }
+        exit(1);
+    }
+}
+
 /// First `--flag value` occurrence, if present.
 fn opt_arg<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].as_str())
+    args.windows(2)
+        .find(|w| w[0] == flag)
+        .map(|w| w[1].as_str())
 }
 
 /// All `--flag value` occurrences, in order — for repeatable flags like `--review`
 /// (the single-value `config_arg`/`tx_arg` only grab the first).
 fn multi_arg<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
-    args.windows(2).filter(|w| w[0] == flag).map(|w| w[1].as_str()).collect()
+    args.windows(2)
+        .filter(|w| w[0] == flag)
+        .map(|w| w[1].as_str())
+        .collect()
 }
 
 /// A required `--flag value`; missing ⇒ usage error + exit 2 (the encode-tx idiom).
@@ -2838,7 +3973,9 @@ fn parse_embedding(s: &str) -> Result<Emb, String> {
     }
     let mut e = [0.0f32; DIM];
     for (i, p) in parts.iter().enumerate() {
-        e[i] = p.parse::<f32>().map_err(|_| format!("embedding[{i}] not an f32: `{p}`"))?;
+        e[i] = p
+            .parse::<f32>()
+            .map_err(|_| format!("embedding[{i}] not an f32: `{p}`"))?;
     }
     Ok(e)
 }
@@ -2848,8 +3985,14 @@ fn parse_review(s: &str) -> Result<Review, String> {
     let (r, sc) = s
         .split_once(':')
         .ok_or_else(|| format!("review must be <reviewer>:<score>, got `{s}`"))?;
-    let reviewer = r.trim().parse::<u64>().map_err(|_| format!("review reviewer not a u64: `{r}`"))?;
-    let score = sc.trim().parse::<f32>().map_err(|_| format!("review score not an f32: `{sc}`"))?;
+    let reviewer = r
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("review reviewer not a u64: `{r}`"))?;
+    let score = sc
+        .trim()
+        .parse::<f32>()
+        .map_err(|_| format!("review score not an f32: `{sc}`"))?;
     Ok(Review { reviewer, score })
 }
 
@@ -2862,6 +4005,8 @@ fn build_signed_tx(
     embedding: Emb,
     domain: u32,
     stake: u64,
+    fee: u64,
+    nonce: u64,
     reviews: Vec<Review>,
     repl_success: u32,
     repl_total: u32,
@@ -2872,6 +4017,8 @@ fn build_signed_tx(
         embedding,
         domain,
         stake,
+        fee,
+        nonce,
         reviews,
         repl_success,
         repl_total,
@@ -2895,16 +4042,33 @@ fn cmd_encode_tx(args: &[String]) {
     let author: u64 = parse_arg(args, "--author");
     let domain: u32 = parse_arg(args, "--domain");
     let stake: u64 = parse_arg(args, "--stake");
+    // M122 (wire v1): fee defaults to 0, nonce to 0 (the account's first tx). A
+    // second tx from the same author must pass `--nonce 1`, etc.
+    let fee: u64 = opt_arg(args, "--fee")
+        .map(|s| {
+            s.parse()
+                .unwrap_or_else(|_| fail_msg("--fee", &format!("`{s}` is not a u64")))
+        })
+        .unwrap_or(0);
+    let nonce: u64 = opt_arg(args, "--nonce")
+        .map(|s| {
+            s.parse()
+                .unwrap_or_else(|_| fail_msg("--nonce", &format!("`{s}` is not a u64")))
+        })
+        .unwrap_or(0);
     let repl_success: u32 = parse_arg(args, "--repl-success");
     let repl_total: u32 = parse_arg(args, "--repl-total");
     let timestamp_days: f32 = parse_arg(args, "--timestamp-days");
 
-    let embedding =
-        parse_embedding(req_arg(args, "--embedding")).unwrap_or_else(|e| fail_msg("encode-tx embedding", &e));
+    let embedding = parse_embedding(req_arg(args, "--embedding"))
+        .unwrap_or_else(|e| fail_msg("encode-tx embedding", &e));
 
     let review_args = multi_arg(args, "--review");
     if review_args.is_empty() {
-        fail_msg("encode-tx", &"at least one --review <reviewer>:<score> is required");
+        fail_msg(
+            "encode-tx",
+            &"at least one --review <reviewer>:<score> is required",
+        );
     }
     let reviews: Vec<Review> = review_args
         .iter()
@@ -2920,21 +4084,38 @@ fn cmd_encode_tx(args: &[String]) {
 
     // Optional guardrail: the derived pubkey must match the author's genesis entry.
     if let Some(cfg_path) = opt_arg(args, "--config") {
-        let cfg = config::load_node_config(cfg_path).unwrap_or_else(|e| fail_msg("load node config", &e));
-        let gcfg = config::load_genesis(&cfg.genesis).unwrap_or_else(|e| fail_msg("load genesis", &e));
-        let genesis = gcfg.to_genesis().unwrap_or_else(|e| fail_msg("build genesis", &e));
+        let cfg =
+            config::load_node_config(cfg_path).unwrap_or_else(|e| fail_msg("load node config", &e));
+        let gcfg =
+            config::load_genesis(&cfg.genesis).unwrap_or_else(|e| fail_msg("load genesis", &e));
+        let genesis = gcfg
+            .to_genesis()
+            .unwrap_or_else(|e| fail_msg("build genesis", &e));
         match genesis.accounts.iter().find(|(id, _, _)| *id == author) {
             Some((_, _, pk)) if *pk == kp.public() => {}
             Some(_) => fail_msg(
                 "author key",
                 &format!("--key-file pubkey does not match genesis account {author}"),
             ),
-            None => fail_msg("author key", &format!("author {author} is not a genesis account")),
+            None => fail_msg(
+                "author key",
+                &format!("author {author} is not a genesis account"),
+            ),
         }
     }
 
     let tx = build_signed_tx(
-        seed, author, embedding, domain, stake, reviews, repl_success, repl_total, timestamp_days,
+        seed,
+        author,
+        embedding,
+        domain,
+        stake,
+        fee,
+        nonce,
+        reviews,
+        repl_success,
+        repl_total,
+        timestamp_days,
     );
 
     // Self-check the encoding round-trips (the same guard submit-tx applies to its
@@ -2959,9 +4140,80 @@ fn keygen_derive(seed: [u8; 32]) -> (String, String) {
     (hex(&seed), hex(&kp.public()))
 }
 
+/// M95: render a ready-to-paste genesis `[[accounts]]` TOML entry. Field names mirror
+/// [`config::AccountConfig`] exactly (`id`/`balance_micro`/`pubkey_hex`), so the output
+/// parses straight back through [`config::load_genesis`]. Pure for direct unit testing.
+fn genesis_account_toml(id: u64, balance_micro: u64, pubkey_hex: &str) -> String {
+    format!(
+        "[[accounts]]\nid = {id}\nbalance_micro = {balance_micro}\npubkey_hex = \"{pubkey_hex}\"\n"
+    )
+}
+
+/// M95: render a ready-to-paste genesis `[[validators]]` TOML entry, mirroring
+/// [`config::ValidatorConfig`] (`id`/`pubkey_hex`/`power`). Pure for direct unit testing.
+fn genesis_validator_toml(id: u64, pubkey_hex: &str, power: u64) -> String {
+    format!("[[validators]]\nid = {id}\npubkey_hex = \"{pubkey_hex}\"\npower = {power}\n")
+}
+
+/// M95: optional genesis-entry emission for `cmd_keygen`. When `--genesis-id <id>` is
+/// given, build the `[[accounts]]` block (`--balance <micro>`, default 0) and, if
+/// `--power <p>` is also given, the `[[validators]]` block. Returns `None` when
+/// `--genesis-id` is absent (keygen keeps its original output). Pure for unit testing
+/// (parsing is isolated here; `cmd_keygen` only prints the result).
+fn keygen_genesis_entries(args: &[String], pubkey_hex: &str) -> Option<String> {
+    let id = opt_arg(args, "--genesis-id")?;
+    let id = id
+        .parse::<u64>()
+        .unwrap_or_else(|_| fail_msg("--genesis-id", &format!("`{id}` is not a u64")));
+    let balance = match opt_arg(args, "--balance") {
+        Some(b) => b
+            .parse::<u64>()
+            .unwrap_or_else(|_| fail_msg("--balance", &format!("`{b}` is not a u64"))),
+        None => 0,
+    };
+    let mut out = String::from("# genesis entry (paste into genesis.toml)\n");
+    out.push_str(&genesis_account_toml(id, balance, pubkey_hex));
+    if let Some(p) = opt_arg(args, "--power") {
+        let power = p
+            .parse::<u64>()
+            .unwrap_or_else(|_| fail_msg("--power", &format!("`{p}` is not a u64")));
+        out.push('\n');
+        out.push_str(&genesis_validator_toml(id, pubkey_hex, power));
+    }
+    Some(out)
+}
+
+/// M94: write a private-key seed file with owner-only (`0600`) permissions. A key seed must
+/// never be world-readable: on Unix the file is *created* with mode `0600` (via
+/// `OpenOptionsExt::mode`, so there is no world-readable window between create and chmod),
+/// and `0600` is re-asserted afterwards to cover the case where the path already existed with
+/// wider bits (where the creation `mode` is a no-op). On non-Unix targets it falls back to a
+/// plain write (the platform has no POSIX mode to set).
+#[cfg(unix)]
+fn write_key_file(path: &str, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(contents.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_key_file(path: &str, contents: &str) -> std::io::Result<()> {
+    std::fs::write(path, contents)
+}
+
 /// M73: generate (or derive from `--seed <64hex>`) an ed25519 keypair offline.
 /// Writes the 64-hex seed to `--out` (consumable by `encode-tx --key-file`) and
 /// prints the derived pubkey hex (paste into a genesis `accounts` entry).
+/// M94: the seed file is written `0600` (owner-only) — see [`write_key_file`].
+/// M95: with `--genesis-id <id>` (+ optional `--balance`/`--power`), also print a
+/// ready-to-paste genesis `[[accounts]]` (and `[[validators]]`) TOML entry.
 fn cmd_keygen(args: &[String]) {
     let out_path = req_arg(args, "--out");
 
@@ -2969,7 +4221,9 @@ fn cmd_keygen(args: &[String]) {
     // else 32 fresh CSPRNG bytes. `--seed` reuses the same decoder + BadHex errors
     // as `encode-tx --key-file`, so the two tools agree on the seed format.
     let seed = match opt_arg(args, "--seed") {
-        Some(s) => config::decode_seed(s.trim(), "--seed").unwrap_or_else(|e| fail_msg("decode seed", &e)),
+        Some(s) => {
+            config::decode_seed(s.trim(), "--seed").unwrap_or_else(|e| fail_msg("decode seed", &e))
+        }
         None => {
             let mut s = [0u8; 32];
             getrandom::getrandom(&mut s).unwrap_or_else(|e| fail_msg("keygen rng", &e));
@@ -2978,9 +4232,12 @@ fn cmd_keygen(args: &[String]) {
     };
 
     let (seed_hex, pub_hex) = keygen_derive(seed);
-    std::fs::write(out_path, &seed_hex).unwrap_or_else(|e| fail("write key file", e));
+    write_key_file(out_path, &seed_hex).unwrap_or_else(|e| fail("write key file", e));
     println!("pubkey {pub_hex}");
     println!("out {out_path}");
+    if let Some(entries) = keygen_genesis_entries(args, &pub_hex) {
+        print!("{entries}");
+    }
 }
 
 /// End-to-end showcase on the production path: launch a small tokio testnet
@@ -3005,7 +4262,10 @@ fn cmd_localnet() {
         let peers = ids
             .iter()
             .filter(|&&p| p != id)
-            .map(|&p| PeerConfig { id: p, addr: addr(p) })
+            .map(|&p| PeerConfig {
+                id: p,
+                addr: addr(p),
+            })
             .collect();
         NodeConfig {
             node: NodeSection {
@@ -3022,6 +4282,7 @@ fn cmd_localnet() {
             rpc: None,
             logging: None,
             mempool: crate::config::MempoolConfig::default(),
+            snapshot: None,
         }
     };
 
@@ -3083,10 +4344,361 @@ fn cmd_status(dir: String) {
     let path = format!("{dir}/blocks.log");
     let log = BlockLog::open(&path).unwrap_or_else(|e| fail("open log", e));
     let blocks = log.read_all().unwrap_or_else(|e| fail("read log", e));
-    let chain = Chain::replay(demo_genesis(), &blocks)
-        .unwrap_or_else(|e| fail_chain("replay log", e));
+    let chain =
+        Chain::replay(demo_genesis(), &blocks).unwrap_or_else(|e| fail_chain("replay log", e));
     println!("replayed {} block(s) from {path}", chain.state.height);
     print_summary(&chain);
+}
+
+/// M128: outcome of a finality-replay of an on-disk chain — one of a clean run, a
+/// [`zhixing_node::ReplayError`] from `replay_verified`, or an I/O / corrupt-log failure.
+#[derive(Debug)]
+enum VerifyOutcome {
+    Ok {
+        blocks: usize,
+        certs: usize,
+        head: String,
+        state_root: String,
+    },
+    ReplayError(zhixing_node::ReplayError),
+    IoError {
+        what: &'static str,
+        path: String,
+        err: std::io::Error,
+    },
+}
+
+/// M128: load `{dir}/blocks.log` and `{dir}/certs.log`, then `replay_verified` the chain so
+/// every committed block is checked against its finality certificate (height + block hash
+/// bind + a real > 2/3 quorum under the height's active validator set). Pure helper (no I/O
+/// coupling to process exit) so it can be unit-tested.
+fn verify_logs(dir: &str) -> VerifyOutcome {
+    let bpath = format!("{dir}/blocks.log");
+    let cpath = format!("{dir}/certs.log");
+    let blocks = match BlockLog::open(&bpath).and_then(|l| l.read_all()) {
+        Ok(b) => b,
+        Err(e) => {
+            return VerifyOutcome::IoError {
+                what: "open/read blocks.log",
+                path: bpath,
+                err: e,
+            };
+        }
+    };
+    let certs = match CertLog::open(&cpath).and_then(|l| l.read_all()) {
+        Ok(c) => c,
+        Err(e) => {
+            return VerifyOutcome::IoError {
+                what: "open/read certs.log",
+                path: cpath,
+                err: e,
+            };
+        }
+    };
+    let n = blocks.len();
+    let m = certs.len();
+    match Chain::replay_verified(demo_genesis(), &blocks, &certs) {
+        Ok(chain) => VerifyOutcome::Ok {
+            blocks: n,
+            certs: m,
+            head: short(&chain.head),
+            state_root: short(&chain.state.state_root()),
+        },
+        Err(e) => VerifyOutcome::ReplayError(e),
+    }
+}
+
+/// M132: load the on-disk chain (replay-verified) and hand the caller the reconstructed
+/// `Chain` so a snapshot can be exported. I/O and finality-replay errors surface as
+/// `SnapshotReplayError` variants that the CLI maps to a non-zero exit + stderr.
+enum SnapshotReplayError {
+    Io {
+        what: &'static str,
+        path: String,
+        err: std::io::Error,
+    },
+    Replay(zhixing_node::ReplayError),
+}
+
+impl std::fmt::Display for SnapshotReplayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io { what, path, err } => write!(f, "{what} ({path}): {err}"),
+            Self::Replay(e) => write!(f, "replay_verified: {e}"),
+        }
+    }
+}
+
+impl std::fmt::Debug for SnapshotReplayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self}")
+    }
+}
+
+fn replay_for_snapshot(dir: &str) -> Result<Chain, SnapshotReplayError> {
+    let bpath = format!("{dir}/blocks.log");
+    let cpath = format!("{dir}/certs.log");
+    let blocks = BlockLog::open(&bpath)
+        .and_then(|l| l.read_all())
+        .map_err(|e| SnapshotReplayError::Io {
+            what: "open/read blocks.log",
+            path: bpath,
+            err: e,
+        })?;
+    let certs = CertLog::open(&cpath)
+        .and_then(|l| l.read_all())
+        .map_err(|e| SnapshotReplayError::Io {
+            what: "open/read certs.log",
+            path: cpath,
+            err: e,
+        })?;
+    Chain::replay_verified(demo_genesis(), &blocks, &certs).map_err(SnapshotReplayError::Replay)
+}
+
+/// M128: `node verify --dir DIR` — the operator's finality audit. Replays `blocks.log` against
+/// `certs.log` and prints a one-line verdict. Exits **non-zero** on any integrity error
+/// (missing log, length mismatch, cert doesn't bind its block, < 2/3 quorum, …) so a
+/// monitor / CI hook can use the exit code.
+fn cmd_verify(dir: String) {
+    match verify_logs(&dir) {
+        VerifyOutcome::Ok {
+            blocks,
+            certs,
+            head,
+            state_root,
+        } => {
+            println!(
+                "ok  {blocks} block(s) + {certs} cert(s) verified; head {head}; state_root {state_root}"
+            );
+        }
+        VerifyOutcome::ReplayError(e) => {
+            eprintln!("error: replay_verified: {e}");
+            exit(1);
+        }
+        VerifyOutcome::IoError { what, path, err } => {
+            eprintln!("error: {what} ({path}): {err}");
+            exit(1);
+        }
+    }
+}
+
+/// M132: `node snapshot --dir DIR --out FILE` — export the on-disk chain (after finality
+/// replay) as a M131 snapshot blob. `--out -` writes to stdout for piping (e.g. to
+/// `gzip` or a network); otherwise the snapshot is written to `FILE`. Errors map to
+/// non-zero exit + stderr.
+fn cmd_snapshot(dir: String, out: String) {
+    let chain = match replay_for_snapshot(&dir) {
+        Ok(c) => c,
+        Err(SnapshotReplayError::Io { what, path, err }) => {
+            eprintln!("error: {what} ({path}): {err}");
+            exit(1);
+        }
+        Err(SnapshotReplayError::Replay(e)) => {
+            eprintln!("error: replay_verified: {e}");
+            exit(1);
+        }
+    };
+    let bytes = zhixing_node::codec::encode_snapshot(&chain.state);
+    if out == "-" {
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut h = stdout.lock();
+        if let Err(e) = h.write_all(&bytes) {
+            eprintln!("error: write snapshot to stdout: {e}");
+            exit(1);
+        }
+    } else {
+        if let Err(e) = std::fs::write(&out, &bytes) {
+            eprintln!("error: write snapshot to {out}: {e}");
+            exit(1);
+        }
+    }
+    eprintln!(
+        "wrote {} byte(s) to {}; height {}; head {}; state_root {}",
+        bytes.len(),
+        if out == "-" { "<stdout>" } else { &out },
+        chain.state.height,
+        short(&chain.head),
+        short(&chain.state.state_root()),
+    );
+}
+
+/// M133: a one-line summary of a decoded M131 snapshot — `height`/`genesis_hash`/the three
+/// cert-signed state roots + the `conserved` verdict — so a `node inspect-snapshot F` reads
+/// like a compact health report. Pure (no I/O) so it can be unit-tested.
+fn inspect_snapshot(state: &zhixing_node::ChainState) -> String {
+    format!(
+        "height={} genesis_hash={} state_root={} accounts_root={} bridge_root={} supply={} accounts={} supply_conserved={}",
+        state.height,
+        hex(&state.genesis_hash),
+        short(&state.state_root()),
+        short(&state.merkle_root()),
+        short(&state.bridge_merkle_root()),
+        state.supply,
+        state.accounts.len(),
+        state.supply_conserved(),
+    )
+}
+
+/// M133: `node inspect-snapshot FILE` — decode a M131 snapshot blob and print the
+/// summary. Use `-` to read from stdin (handy for `snapshot --out - | inspect-snapshot -`).
+/// Errors map to non-zero exit + stderr.
+fn cmd_inspect_snapshot(path: String) {
+    let bytes = if path == "-" {
+        let mut buf = Vec::new();
+        use std::io::Read;
+        if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
+            eprintln!("error: read snapshot from stdin: {e}");
+            exit(1);
+        }
+        buf
+    } else {
+        match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("error: read snapshot {path}: {e}");
+                exit(1);
+            }
+        }
+    };
+    let state = match zhixing_node::codec::decode_snapshot(&bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: decode snapshot: {e:?}");
+            exit(1);
+        }
+    };
+    println!("snapshot  bytes={}", bytes.len());
+    println!("{summary}", summary = inspect_snapshot(&state));
+}
+
+/// M135: outcome of a snapshot ↔ cert-signed header cross-check.
+enum CheckOutcome {
+    /// Height + three roots agree. The snapshot is the *same state* the header commits
+    /// to; with a trusted validator set the full M134 quorum check is also implied.
+    Ok { height: u64 },
+    /// Snapshot's height/roots disagree with the header.
+    Mismatch { height: u64, reason: &'static str },
+}
+
+/// M135: pure helper — decode a M131 snapshot + a `BlockHeader` (the on-wire hex form
+/// `GET /header/{h}` / `/headers?from=…` produces) and check height + the three cert-signed
+/// roots agree. With a trusted cert, this is the offline end-to-end fast-sync check
+/// (the cryptographically strong version lives in `light::verify_snapshot_against_header`,
+/// which requires the cert; M135's helper covers the cert-less case so an operator can
+/// spot a truncated/wrong-version snapshot with nothing but a header).
+fn check_snapshot_against_header(snapshot_bytes: &[u8], header_hex: &str) -> CheckOutcome {
+    let state = match zhixing_node::codec::decode_snapshot(snapshot_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("error: decode snapshot failed (corrupt/wrong-version blob)");
+            std::process::exit(1);
+        }
+    };
+    let header_bytes = match hex_decode(header_hex) {
+        Some(b) => b,
+        None => {
+            eprintln!("error: --header hex invalid");
+            std::process::exit(1);
+        }
+    };
+    let header = match zhixing_node::codec::decode_header(&header_bytes) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("error: decode header: {e:?}");
+            std::process::exit(1);
+        }
+    };
+    if state.height != header.height {
+        return CheckOutcome::Mismatch {
+            height: header.height,
+            reason: "snapshot.height != header.height",
+        };
+    }
+    if state.state_root() != header.state_root {
+        return CheckOutcome::Mismatch {
+            height: header.height,
+            reason: "state_root mismatch",
+        };
+    }
+    if state.merkle_root() != header.accounts_root {
+        return CheckOutcome::Mismatch {
+            height: header.height,
+            reason: "accounts_root mismatch",
+        };
+    }
+    if state.bridge_merkle_root() != header.bridge_root {
+        return CheckOutcome::Mismatch {
+            height: header.height,
+            reason: "bridge_root mismatch",
+        };
+    }
+    CheckOutcome::Ok {
+        height: header.height,
+    }
+}
+
+/// M135: `node check-snapshot --snapshot FILE --header HEX` — cross-check a M131 snapshot
+/// blob against a cert-signed `BlockHeader` (the on-wire hex form `GET /header/{h}` /
+/// `/headers?from=…` returns). Verifies height + the three cert-signed roots agree; non-zero
+/// exit + stderr on any mismatch. The cert-less part of fast-sync — for the quorum-bound
+/// check use M134's `light::verify_snapshot_against_header` programmatically.
+fn cmd_check_snapshot(snapshot_path: String, header_hex: String) {
+    let bytes = if snapshot_path == "-" {
+        let mut buf = Vec::new();
+        use std::io::Read;
+        if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
+            eprintln!("error: read snapshot from stdin: {e}");
+            exit(1);
+        }
+        buf
+    } else {
+        match std::fs::read(&snapshot_path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("error: read snapshot {snapshot_path}: {e}");
+                exit(1);
+            }
+        }
+    };
+    match check_snapshot_against_header(&bytes, &header_hex) {
+        CheckOutcome::Ok { height } => {
+            println!(
+                "ok  height {height}: height + state_root + accounts_root + bridge_root all match"
+            );
+        }
+        CheckOutcome::Mismatch { height, reason } => {
+            eprintln!("error: mismatch at height {height}: {reason}");
+            exit(1);
+        }
+    }
+}
+
+/// M135: decode a lowercase/uppercase hex string to bytes; `None` on a non-hex or odd-length
+/// input. (The RPC header reads emit lowercase hex; we accept either case.)
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = hex_nibble(bytes[i])?;
+        let lo = hex_nibble(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Some(out)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Demonstrate certificate persistence and *replay-as-finality-verification*.
@@ -3103,14 +4715,37 @@ fn cmd_certs(dir: String) {
     let (vset, seeds) = demo_validators();
 
     // seed once: if the logs are empty, produce a certified chain and persist it
-    let existing = blog.read_all().unwrap_or_else(|e| fail("read block log", e));
+    let existing = blog
+        .read_all()
+        .unwrap_or_else(|e| fail("read block log", e));
     if existing.is_empty() {
         println!("empty logs at {dir} — producing a BFT-certified chain\n");
         let mut d = ChainDriver::new(demo_genesis(), seeds, 1);
         for t in [
-            tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
-            tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
-            tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 1.0),
+            tx(
+                1,
+                unit(1),
+                1,
+                reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]),
+                (3, 3),
+                1.0,
+            ),
+            tx(
+                2,
+                unit(2),
+                2,
+                reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]),
+                (3, 3),
+                1.0,
+            ),
+            tx(
+                3,
+                blend(1, 2),
+                3,
+                reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]),
+                (3, 3),
+                1.0,
+            ),
         ] {
             d.submit(t).unwrap();
         }
@@ -3120,7 +4755,8 @@ fn cmd_certs(dir: String) {
             blog.append(b).unwrap_or_else(|e| fail("append block", e));
         }
         for c in d.certificates() {
-            clog.append(c).unwrap_or_else(|e| fail("append certificate", e));
+            clog.append(c)
+                .unwrap_or_else(|e| fail("append certificate", e));
         }
         println!(
             "persisted {} block(s) + {} certificate(s) to {dir}\n",
@@ -3130,7 +4766,9 @@ fn cmd_certs(dir: String) {
     }
 
     // reload both logs and replay re-verifying finality at every height
-    let blocks = blog.read_all().unwrap_or_else(|e| fail("read block log", e));
+    let blocks = blog
+        .read_all()
+        .unwrap_or_else(|e| fail("read block log", e));
     let certs = clog.read_all().unwrap_or_else(|e| fail("read cert log", e));
     let chain = Chain::replay_verified(demo_genesis(), &blocks, &certs)
         .unwrap_or_else(|e| fail_msg("verify finality on replay", &e));
@@ -3175,7 +4813,11 @@ fn commit_print(chain: &mut Chain, log: Option<&BlockLog>, label: &str, mut blk:
             }
             println!(
                 "{label}: h={} accepted={} rejected={} minted={} COG slashed={} COG",
-                r.height, r.accepted, r.rejected, cog(r.minted), cog(r.slashed)
+                r.height,
+                r.accepted,
+                r.rejected,
+                cog(r.minted),
+                cog(r.slashed)
             );
             for t in &r.txs {
                 println!(
@@ -3258,8 +4900,26 @@ fn run_driver(max_heights: usize) -> (Vec<Block>, Vec<Commit>) {
     });
     // Submit enough txs that the mempool actually produces blocks (otherwise
     // `produce_until_drained` returns 0 because no candidate is yielded).
-    driver.submit(tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0)).expect("submit 1");
-    driver.submit(tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0)).expect("submit 2");
+    driver
+        .submit(tx(
+            1,
+            unit(1),
+            1,
+            reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]),
+            (3, 3),
+            1.0,
+        ))
+        .expect("submit 1");
+    driver
+        .submit(tx(
+            2,
+            unit(2),
+            2,
+            reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]),
+            (3, 3),
+            1.0,
+        ))
+        .expect("submit 2");
     driver
         .produce_until_drained(1.0, max_heights)
         .expect("driver");
@@ -3312,6 +4972,8 @@ mod tests {
             unit(1),
             1,
             2 * MICRO,
+            0,
+            0,
             reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]),
             3,
             3,
@@ -3375,11 +5037,268 @@ mod tests {
 
     #[test]
     fn multi_arg_collects_all_occurrences() {
-        let args: Vec<String> = ["node", "encode-tx", "--review", "10:0.9", "--review", "11:0.8"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let args: Vec<String> = [
+            "node",
+            "encode-tx",
+            "--review",
+            "10:0.9",
+            "--review",
+            "11:0.8",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         assert_eq!(multi_arg(&args, "--review"), vec!["10:0.9", "11:0.8"]);
+    }
+
+    fn tmpdir(s: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("zhixing-verify-{}-{}", s, std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("create tmpdir");
+        p
+    }
+
+    fn demo_seeds() -> BTreeMap<u64, [u8; 32]> {
+        (21u64..=24).map(|id| (id, seed_for(id))).collect()
+    }
+
+    fn persist_demo_chain(dir: &std::path::Path) {
+        let blog = BlockLog::open(dir.join("blocks.log")).expect("open blocks.log");
+        let clog = CertLog::open(dir.join("certs.log")).expect("open certs.log");
+        let mut d = ChainDriver::new(demo_genesis(), demo_seeds(), 4);
+        // A single submission drives exactly one certified block.
+        d.submit(tx(
+            1,
+            unit(1),
+            1,
+            reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]),
+            (3, 3),
+            1.0,
+        ))
+        .unwrap();
+        d.produce_until_drained(1.0, 16).expect("produce");
+        for b in d.blocks() {
+            blog.append(b).expect("append block");
+        }
+        for c in d.certificates() {
+            clog.append(c).expect("append cert");
+        }
+    }
+
+    #[test]
+    fn verify_logs_ok_on_a_persisted_demo_chain() {
+        // M128: a clean, single-block demo chain (3-validator quorum) replay-verifies cleanly:
+        // `Ok` with matching block/cert counts and a non-empty head/state_root digest.
+        let dir = tmpdir("ok");
+        persist_demo_chain(&dir);
+        let path = dir.to_string_lossy().to_string();
+        match verify_logs(&path) {
+            VerifyOutcome::Ok {
+                blocks,
+                certs,
+                head,
+                state_root,
+            } => {
+                assert_eq!(blocks, 1);
+                assert_eq!(certs, 1);
+                // `short()` renders the first/last 8 hex of the 32-byte hash joined by `…`.
+                assert!(head.contains('…') && head.len() > 8, "head: {head}");
+                assert!(
+                    state_root.contains('…') && state_root.len() > 8,
+                    "state_root: {state_root}"
+                );
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_logs_empty_dir_is_vacuously_ok() {
+        // M128: a fresh dir (the store auto-creates empty logs) replays zero blocks — a vacuous
+        // `Ok{0,0}`, the honest "nothing to verify yet" answer (not an error).
+        let dir = tmpdir("empty");
+        let path = dir.to_string_lossy().to_string();
+        match verify_logs(&path) {
+            VerifyOutcome::Ok { blocks, certs, .. } => {
+                assert_eq!(blocks, 0);
+                assert_eq!(certs, 0);
+            }
+            other => panic!("expected vacuous Ok, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_logs_rejects_length_mismatch() {
+        // M128: when `blocks.log` and `certs.log` have different lengths, `replay_verified`
+        // returns `CountMismatch` and the helper surfaces it as `ReplayError`.
+        let dir = tmpdir("mismatch");
+        persist_demo_chain(&dir);
+        // Append a second block (a duplicate of the one already on disk) with no matching cert
+        // ⇒ the two logs' lengths differ by one.
+        let blog = BlockLog::open(dir.join("blocks.log")).expect("reopen blocks.log");
+        let existing = blog.read_all().expect("read blocks");
+        let extra = existing.first().expect("one demo block").clone();
+        blog.append(&extra).expect("append extra");
+        let path = dir.to_string_lossy().to_string();
+        match verify_logs(&path) {
+            VerifyOutcome::ReplayError(zhixing_node::ReplayError::CountMismatch {
+                blocks,
+                certs,
+            }) => {
+                assert_eq!(blocks, 2);
+                assert_eq!(certs, 1);
+            }
+            other => panic!("expected CountMismatch, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_export_round_trips_through_decode() {
+        // M132: a persisted demo chain survives replay, the exported snapshot blob decodes
+        // back, and the three cert-signed state roots agree (proves the snapshot is the
+        // post-finality state, not a partial re-apply).
+        let dir = tmpdir("snapshot-export");
+        persist_demo_chain(&dir);
+        let chain = replay_for_snapshot(&dir.to_string_lossy()).expect("replay for snapshot");
+        let bytes = zhixing_node::codec::encode_snapshot(&chain.state);
+        let back = zhixing_node::codec::decode_snapshot(&bytes).expect("decode snapshot");
+        assert_eq!(back.state_root(), chain.state.state_root(), "state_root");
+        assert_eq!(
+            back.merkle_root(),
+            chain.state.merkle_root(),
+            "accounts_root"
+        );
+        assert_eq!(
+            back.bridge_merkle_root(),
+            chain.state.bridge_merkle_root(),
+            "bridge_root"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inspect_snapshot_decodes_and_renders_summary() {
+        // M133: a snapshot blob, decoded by `inspect_snapshot`'s underlying codec, renders a
+        // summary line whose `state_root`/`merkle_root`/`bridge_root` all match the replayed
+        // source — so a CLI invocation would print the same roots the operator compares to a
+        // trusted header.
+        let dir = tmpdir("inspect-snapshot");
+        persist_demo_chain(&dir);
+        let chain = replay_for_snapshot(&dir.to_string_lossy()).expect("replay for snapshot");
+        let bytes = zhixing_node::codec::encode_snapshot(&chain.state);
+        let decoded = zhixing_node::codec::decode_snapshot(&bytes).expect("decode");
+        let summary = inspect_snapshot(&decoded);
+        // Heights + supply shape.
+        assert!(
+            summary.starts_with(&format!("height={} ", decoded.height)),
+            "{summary}"
+        );
+        assert!(summary.contains("supply_conserved=true"), "{summary}");
+        // The three roots match the chain.
+        let want_state = short(&chain.state.state_root());
+        let want_acct = short(&chain.state.merkle_root());
+        let want_bridge = short(&chain.state.bridge_merkle_root());
+        assert!(
+            summary.contains(&format!("state_root={want_state}")),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(&format!("accounts_root={want_acct}")),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(&format!("bridge_root={want_bridge}")),
+            "{summary}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inspect_snapshot_rejects_bad_blob() {
+        // M133: the helper's underlying decoder rejects an unknown version (the CLI turns this
+        // into a non-zero exit + stderr); a corrupt blob never yields a bogus summary.
+        let dir = tmpdir("inspect-bad");
+        persist_demo_chain(&dir);
+        let chain = replay_for_snapshot(&dir.to_string_lossy()).expect("replay");
+        let mut bytes = zhixing_node::codec::encode_snapshot(&chain.state);
+        bytes[0..4].copy_from_slice(&999u32.to_be_bytes()); // clobber the version
+        assert!(zhixing_node::codec::decode_snapshot(&bytes).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_snapshot_matches_tip_header() {
+        // M135: a snapshot taken at the tip cross-checks OK against that tip block's
+        // cert-signed header (height + the three roots), and a tampered snapshot is rejected.
+        let dir = tmpdir("check-snapshot");
+        persist_demo_chain(&dir);
+        let chain = replay_for_snapshot(&dir.to_string_lossy()).expect("replay");
+        let bytes = zhixing_node::codec::encode_snapshot(&chain.state);
+        // The tip block's header, hex-encoded as `GET /header/{h}` would return it.
+        let blog = BlockLog::open(dir.join("blocks.log")).expect("reopen");
+        let blocks = blog.read_all().expect("read");
+        let tip = blocks.last().expect("one block");
+        let header = zhixing_node::codec::BlockHeader::from_block(tip);
+        let header_hex = hex(&zhixing_node::codec::encode_header(&header));
+
+        match check_snapshot_against_header(&bytes, &header_hex) {
+            CheckOutcome::Ok { height } => assert_eq!(height, chain.state.height),
+            CheckOutcome::Mismatch { reason, .. } => panic!("expected Ok, got mismatch: {reason}"),
+        }
+
+        // A snapshot from a *different* state (extra balance) breaks the root match.
+        let mut forged = chain.state.clone();
+        if let Some(a) = forged.accounts.get_mut(&1) {
+            a.balance += 1;
+        }
+        let forged_bytes = zhixing_node::codec::encode_snapshot(&forged);
+        match check_snapshot_against_header(&forged_bytes, &header_hex) {
+            CheckOutcome::Mismatch { .. } => {}
+            CheckOutcome::Ok { .. } => panic!("expected mismatch for a forged snapshot"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hex_decode_round_trips() {
+        // M135: the CLI's hex decoder is the inverse of `hash::hex` and rejects bad input.
+        let b = [0u8, 1, 15, 16, 255, 0xAB];
+        assert_eq!(hex_decode(&hex(&b)), Some(b.to_vec()));
+        assert_eq!(hex_decode("0A1b"), Some(vec![0x0A, 0x1B])); // mixed case
+        assert_eq!(hex_decode("abc"), None); // odd length
+        assert_eq!(hex_decode("zz"), None); // non-hex
+    }
+
+    #[test]
+    fn snapshot_export_propagates_replay_mismatch() {
+        // M132: a length mismatch (more blocks than certs) surfaces as `SnapshotReplayError::Replay`
+        // (the CLI turns this into a non-zero exit + stderr). The `BlockLog::open` helper
+        // auto-creates an empty log, so a "missing" directory replay-verifies vacuously
+        // (covered by M128's vacuous-Ok test) — a mismatch is the right error surface.
+        let dir = tmpdir("snapshot-mismatch");
+        persist_demo_chain(&dir);
+        // Append a second block (a duplicate of the one already on disk) with no matching cert
+        // ⇒ the two logs' lengths differ by one.
+        let blog = BlockLog::open(dir.join("blocks.log")).expect("reopen blocks.log");
+        let existing = blog.read_all().expect("read blocks");
+        let extra = existing.first().expect("one demo block").clone();
+        blog.append(&extra).expect("append extra");
+        match replay_for_snapshot(&dir.to_string_lossy()) {
+            Err(SnapshotReplayError::Replay(zhixing_node::ReplayError::CountMismatch {
+                blocks,
+                certs,
+            })) => {
+                assert_eq!(blocks, 2);
+                assert_eq!(certs, 1);
+            }
+            Err(e) => panic!("expected Replay CountMismatch, got: {e}"),
+            Ok(_) => panic!("expected Replay error, got Ok"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3388,12 +5307,657 @@ mod tests {
         let (seed_hex, pub_hex) = keygen_derive(seed);
         // The written seed hex decodes back through the same path `encode-tx
         // --key-file` uses, so the generated file is a valid key file.
-        assert_eq!(config::decode_seed(&seed_hex, "--seed").expect("decode"), seed);
+        assert_eq!(
+            config::decode_seed(&seed_hex, "--seed").expect("decode"),
+            seed
+        );
         // The printed pubkey matches the direct Keypair API.
         assert_eq!(pub_hex, hex(&Keypair::from_seed(seed).public()));
         // Deterministic: same seed ⇒ identical outputs.
         assert_eq!(keygen_derive(seed), (seed_hex, pub_hex));
         // Distinct seeds ⇒ distinct pubkeys.
         assert_ne!(keygen_derive(seed_for(7)).1, keygen_derive(seed_for(8)).1);
+    }
+
+    // M94: a unique temp path per test case (no external tempfile dependency).
+    #[cfg(unix)]
+    fn tmp_key_path(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "zx-keyfile-{}-{}-{tag}",
+            std::process::id(),
+            line!()
+        ));
+        p
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_file_is_written_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_key_path("fresh");
+        let p = path.to_str().unwrap();
+        let _ = std::fs::remove_file(p);
+        write_key_file(p, "deadbeef").expect("write");
+        // A freshly created key file is owner-rw only (no group/other bits).
+        let mode = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "fresh key file must be 0600, got {mode:o}");
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "deadbeef");
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_file_overwrite_retightens_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_key_path("overwrite");
+        let p = path.to_str().unwrap();
+        // Pre-create a world-readable file: the creation `mode` would be a no-op, so the
+        // explicit re-assert is what must re-tighten it to 0600.
+        std::fs::write(p, "old").unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_key_file(p, "cafe").expect("overwrite");
+        let mode = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "overwrite must re-tighten to 0600, got {mode:o}"
+        );
+        // Content is fully replaced (truncated), not appended.
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "cafe");
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_file_round_trips_through_seed_decoder() {
+        // The 0600-written seed hex is still consumable by the `--seed` / `--key-file` decoder.
+        let path = tmp_key_path("roundtrip");
+        let p = path.to_str().unwrap();
+        let _ = std::fs::remove_file(p);
+        let seed = seed_for(42);
+        let (seed_hex, _pub_hex) = keygen_derive(seed);
+        write_key_file(p, &seed_hex).expect("write");
+        let read_back = std::fs::read_to_string(p).unwrap();
+        assert_eq!(
+            config::decode_seed(read_back.trim(), "--seed").expect("decode"),
+            seed
+        );
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn genesis_entry_toml_renders_expected() {
+        // M95: the emitted fragments use the exact field names the genesis parser expects.
+        assert_eq!(
+            genesis_account_toml(7, 1_000_000, "ab12"),
+            "[[accounts]]\nid = 7\nbalance_micro = 1000000\npubkey_hex = \"ab12\"\n"
+        );
+        assert_eq!(
+            genesis_validator_toml(7, "ab12", 5),
+            "[[validators]]\nid = 7\npubkey_hex = \"ab12\"\npower = 5\n"
+        );
+    }
+
+    #[test]
+    fn keygen_genesis_entries_gated_on_id() {
+        // M95: no `--genesis-id` ⇒ no genesis output (keygen keeps its original two lines).
+        let none: Vec<String> = vec!["--out".into(), "k".into()];
+        assert_eq!(keygen_genesis_entries(&none, "ab12"), None);
+
+        // `--genesis-id` alone ⇒ an accounts block (balance defaults to 0), no validators.
+        let acct: Vec<String> = vec!["--genesis-id".into(), "7".into()];
+        let out = keygen_genesis_entries(&acct, "ab12").expect("some");
+        assert!(
+            out.contains("[[accounts]]\nid = 7\nbalance_micro = 0\npubkey_hex = \"ab12\"\n"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("[[validators]]"),
+            "no power ⇒ no validator block: {out}"
+        );
+
+        // `--balance` + `--power` ⇒ both blocks, with the given values.
+        let full: Vec<String> = vec![
+            "--genesis-id".into(),
+            "7".into(),
+            "--balance".into(),
+            "42".into(),
+            "--power".into(),
+            "9".into(),
+        ];
+        let out = keygen_genesis_entries(&full, "ab12").expect("some");
+        assert!(out.contains("balance_micro = 42"), "{out}");
+        assert!(
+            out.contains("[[validators]]\nid = 7\npubkey_hex = \"ab12\"\npower = 9\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn keygen_genesis_entry_round_trips_through_loader() {
+        // M95: a complete genesis built from the emitted entries parses back through
+        // `config::load_genesis` → `to_genesis`, recovering the id/balance/pubkey/power.
+        let (_seed_hex, pub_hex) = keygen_derive(seed_for(11));
+        let args: Vec<String> = vec![
+            "--genesis-id".into(),
+            "3".into(),
+            "--balance".into(),
+            "500".into(),
+            "--power".into(),
+            "2".into(),
+        ];
+        let entries = keygen_genesis_entries(&args, &pub_hex).expect("some");
+        let toml = format!("base_emission_micro = 1000\nslash_bps = 500\n{entries}");
+
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "zx-genesis-{}-{}.toml",
+            std::process::id(),
+            line!()
+        ));
+        let p = path.to_str().unwrap();
+        std::fs::write(p, &toml).unwrap();
+        let g = config::load_genesis(p)
+            .expect("load_genesis")
+            .to_genesis()
+            .expect("to_genesis");
+        let _ = std::fs::remove_file(p);
+
+        assert_eq!(g.accounts.len(), 1);
+        assert_eq!(g.accounts[0].0, 3);
+        assert_eq!(g.accounts[0].1, 500);
+        assert_eq!(hex(&g.accounts[0].2), pub_hex);
+        assert_eq!(g.validators.len(), 1);
+        assert_eq!(g.validators[0].0, 3);
+        assert_eq!(hex(&g.validators[0].1), pub_hex);
+        assert_eq!(g.validators[0].2, 2);
+    }
+
+    // M96: write a (genesis.toml, node config) pair into a unique temp dir; return the
+    // config path. `genesis` is an absolute path so the load is CWD-independent.
+    fn write_check_config_fixture(
+        tag: &str,
+        genesis_body: &str,
+        validator_section: &str,
+    ) -> (String, std::path::PathBuf) {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "zx-checkcfg-{}-{}-{tag}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gpath = dir.join("genesis.toml");
+        std::fs::write(&gpath, genesis_body).unwrap();
+        let cfg = format!(
+            "genesis = \"{}\"\n[node]\nid = 1\nlisten = \"127.0.0.1:9021\"\ndata_dir = \"{}/data\"\n{validator_section}",
+            gpath.to_str().unwrap(),
+            dir.to_str().unwrap(),
+        );
+        let cpath = dir.join("node.toml");
+        std::fs::write(&cpath, cfg).unwrap();
+        (cpath.to_str().unwrap().to_string(), dir)
+    }
+
+    fn valid_genesis_body(pub_hex: &str) -> String {
+        format!(
+            "base_emission_micro = 1000\nslash_bps = 500\n\
+[[accounts]]\nid = 1\nbalance_micro = 1000000\npubkey_hex = \"{pub_hex}\"\n\
+[[validators]]\nid = 1\npubkey_hex = \"{pub_hex}\"\npower = 1\n"
+        )
+    }
+
+    #[test]
+    fn check_config_ok_for_follower() {
+        // M96: a valid config with no `[validator]` section ⇒ Ok, role "follower", with the
+        // genesis entity counts summarized.
+        let (seed_hex, pub_hex) = keygen_derive(seed_for(1));
+        let _ = seed_hex;
+        let (cpath, dir) =
+            write_check_config_fixture("follower", &valid_genesis_body(&pub_hex), "");
+        let summary = check_config(&cpath).expect("valid config");
+        assert!(summary.starts_with("ok config "), "{summary}");
+        assert!(summary.contains("\nrole follower\n"), "{summary}");
+        assert!(summary.contains("\naccounts 1\n"), "{summary}");
+        assert!(summary.contains("\nvalidators 1"), "{summary}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_config_ok_for_validator() {
+        // M96: an enabled `[validator]` with a valid seed ⇒ Ok, role "validator" (the key
+        // material is decoded as part of the dry-run).
+        let (seed_hex, pub_hex) = keygen_derive(seed_for(1));
+        let vsec = format!("[validator]\nenabled = true\nseed_hex = \"{seed_hex}\"\n");
+        let (cpath, dir) =
+            write_check_config_fixture("validator", &valid_genesis_body(&pub_hex), &vsec);
+        let summary = check_config(&cpath).expect("valid validator config");
+        assert!(summary.contains("\nrole validator\n"), "{summary}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_config_surfaces_bad_genesis() {
+        // M96: a malformed genesis (non-hex pubkey) ⇒ Err, returned (not a panic/exit) so the
+        // dry-run reports the typed error rather than failing at daemon start.
+        let bad = "base_emission_micro = 1000\nslash_bps = 500\n\
+[[accounts]]\nid = 1\nbalance_micro = 1\npubkey_hex = \"nothex\"\n";
+        let (cpath, dir) = write_check_config_fixture("badgenesis", bad, "");
+        assert!(
+            check_config(&cpath).is_err(),
+            "bad genesis pubkey must fail the dry-run"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn genesis_hash_is_deterministic_and_matches_chainstate() {
+        // M97: the printed genesis_hash equals what `ChainState::genesis` stamps, and the same
+        // genesis yields the same identity every time.
+        let (_seed_hex, pub_hex) = keygen_derive(seed_for(1));
+        let body = valid_genesis_body(&pub_hex);
+        let (cpath, dir) = write_check_config_fixture("gh", &body, "");
+        let out = genesis_identity(&cpath).expect("valid genesis");
+
+        // Independently stamp the same genesis and confirm the hash line matches.
+        let genesis = config::load_genesis(&format!("{}/genesis.toml", dir.to_str().unwrap()))
+            .expect("load")
+            .to_genesis()
+            .expect("to_genesis");
+        let (_state, gh) = ChainState::genesis(genesis);
+        assert!(
+            out.contains(&format!("genesis_hash {}\n", hex(&gh))),
+            "{out}"
+        );
+        assert!(out.contains("\nvalidators 1"), "{out}");
+        // Deterministic: a second run over the same config prints identical output.
+        assert_eq!(genesis_identity(&cpath).expect("again"), out);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn genesis_hash_differs_for_different_genesis() {
+        // M97: changing the genesis (a different account pubkey) changes the genesis_hash —
+        // the identity is a function of the genesis contents.
+        let (_s1, pub_a) = keygen_derive(seed_for(1));
+        let (_s2, pub_b) = keygen_derive(seed_for(2));
+        let (cpath_a, dir_a) = write_check_config_fixture("gha", &valid_genesis_body(&pub_a), "");
+        let (cpath_b, dir_b) = write_check_config_fixture("ghb", &valid_genesis_body(&pub_b), "");
+        let a = genesis_identity(&cpath_a).expect("a");
+        let b = genesis_identity(&cpath_b).expect("b");
+        assert_ne!(a, b, "distinct genesis ⇒ distinct identity");
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
+    fn genesis_hash_surfaces_bad_genesis() {
+        // M97: a malformed genesis is reported as a typed error (not a panic/exit).
+        let bad = "base_emission_micro = 1000\nslash_bps = 500\n\
+[[accounts]]\nid = 1\nbalance_micro = 1\npubkey_hex = \"nothex\"\n";
+        let (cpath, dir) = write_check_config_fixture("ghbad", bad, "");
+        assert!(genesis_identity(&cpath).is_err(), "bad genesis must fail");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inspect_genesis_lists_accounts_and_validators() {
+        // M102: the dump lists each account and validator with id/balance/power/pubkey, plus
+        // the scalar params.
+        let (_seed_hex, pub_hex) = keygen_derive(seed_for(1));
+        let (cpath, dir) = write_check_config_fixture("ig", &valid_genesis_body(&pub_hex), "");
+        let out = inspect_genesis(&cpath).expect("valid genesis");
+        assert!(out.contains("base_emission_micro 1000\n"), "{out}");
+        assert!(out.contains("slash_bps 500\n"), "{out}");
+        assert!(out.contains("accounts 1\n"), "{out}");
+        assert!(
+            out.contains(&format!("account 1 balance 1000000 pubkey {pub_hex}")),
+            "{out}"
+        );
+        assert!(out.contains("validators 1\n"), "{out}");
+        assert!(
+            out.contains(&format!("validator 1 power 1 pubkey {pub_hex}")),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inspect_genesis_lists_reviewers() {
+        // M102: a genesis carrying a reviewer lists it with its reputation (weight).
+        let (_seed_hex, pub_hex) = keygen_derive(seed_for(1));
+        let body = format!(
+            "base_emission_micro = 1000\nslash_bps = 500\n\
+[[accounts]]\nid = 1\nbalance_micro = 5\npubkey_hex = \"{pub_hex}\"\n\
+[[reviewers]]\nid = 10\nweight = 0.5\n"
+        );
+        let (cpath, dir) = write_check_config_fixture("igrev", &body, "");
+        let out = inspect_genesis(&cpath).expect("valid genesis");
+        assert!(out.contains("reviewers 1\n"), "{out}");
+        assert!(out.contains("reviewer 10 reputation 0.5"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inspect_genesis_surfaces_bad_genesis() {
+        // M102: a malformed genesis is a returned error (not a panic/exit).
+        let bad = "base_emission_micro = 1000\nslash_bps = 500\n\
+[[accounts]]\nid = 1\nbalance_micro = 1\npubkey_hex = \"nothex\"\n";
+        let (cpath, dir) = write_check_config_fixture("igbad", bad, "");
+        assert!(inspect_genesis(&cpath).is_err(), "bad genesis must fail");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rpc_get_request_formats_an_http_get() {
+        // M116: the read client sends a well-formed close-delimited GET.
+        assert_eq!(
+            rpc_get_request("127.0.0.1:9000", "/info"),
+            "GET /info HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn split_http_response_extracts_status_and_body() {
+        // M116: a full response splits into its status line and the body after the blank line.
+        let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nheight=7";
+        let (status, body) = split_http_response(resp);
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(body, "height=7");
+        // The status code token is the second whitespace field.
+        assert_eq!(status.split_whitespace().nth(1), Some("200"));
+    }
+
+    #[test]
+    fn split_http_response_handles_empty_body() {
+        // M116: a bodyless response (e.g. 304 / HEAD) yields an empty body, not a panic.
+        let resp = "HTTP/1.1 304 Not Modified\r\nETag: \"abc\"\r\n\r\n";
+        let (status, body) = split_http_response(resp);
+        assert_eq!(status, "HTTP/1.1 304 Not Modified");
+        assert_eq!(body, "");
+    }
+
+    #[test]
+    fn rpc_post_request_includes_content_length_and_body() {
+        // M117: a POST carries the body after a Content-Length header equal to its byte length.
+        let req = rpc_post_request("127.0.0.1:9000", "/validate", b"hello");
+        let text = String::from_utf8(req).unwrap();
+        assert!(text.starts_with("POST /validate HTTP/1.1\r\n"), "{text}");
+        assert!(text.contains("Host: 127.0.0.1:9000\r\n"), "{text}");
+        assert!(text.contains("Content-Length: 5\r\n"), "{text}");
+        assert!(text.ends_with("\r\n\r\nhello"), "{text}");
+    }
+
+    #[test]
+    fn rpc_post_request_preserves_binary_body() {
+        // M117: a binary (non-UTF-8) body — like a codec-encoded tx — passes through byte-for
+        // byte; the request is bytes, not a String, so nothing is mangled.
+        let body: Vec<u8> = vec![0x00, 0xff, 0x80, 0x01, 0xfe];
+        let req = rpc_post_request("h:1", "/submit_tx", &body);
+        assert!(req.ends_with(&body), "binary body preserved at the tail");
+        // Content-Length reflects the raw length.
+        assert!(String::from_utf8_lossy(&req).contains("Content-Length: 5\r\n"));
+    }
+
+    #[test]
+    fn rpc_post_request_empty_body() {
+        // M117: an empty body ⇒ Content-Length: 0 and nothing after the header terminator.
+        let req = rpc_post_request("h:1", "/x", b"");
+        let text = String::from_utf8(req).unwrap();
+        assert!(text.contains("Content-Length: 0\r\n"), "{text}");
+        assert!(text.ends_with("\r\n\r\n"), "{text}");
+    }
+
+    // M98: build a signed tx and its canonical encoding for inspect-tx tests.
+    fn signed_tx_bytes(author: u64, kp: &Keypair) -> Vec<u8> {
+        let tx = SubmissionTx {
+            author,
+            embedding: [0.0f32; DIM],
+            domain: 2,
+            stake: 1000,
+            reviews: vec![],
+            repl_success: 1,
+            repl_total: 2,
+            timestamp_days: 10.0,
+            signature: [0u8; 64],
+            fee: 0,
+            nonce: 0,
+        }
+        .signed(kp);
+        zhixing_node::codec::encode_tx(&tx)
+    }
+
+    #[test]
+    fn inspect_tx_renders_fields_and_hash() {
+        // M98: a decoded tx prints its fields + content hash; without a pubkey the signature
+        // validity is reported as unknown (a tx file carries no key).
+        let kp = Keypair::from_seed(seed_for(1));
+        let bytes = signed_tx_bytes(5, &kp);
+        let out = inspect_tx(&bytes, None).expect("decode");
+        assert!(out.contains("author 5\n"), "{out}");
+        assert!(out.contains("domain 2\n"), "{out}");
+        assert!(out.contains("stake 1000\n"), "{out}");
+        assert!(out.contains(&format!("embedding_dim {DIM}\n")), "{out}");
+        // The printed hash matches the tx's own content hash.
+        let tx = zhixing_node::codec::decode_tx(&bytes).unwrap();
+        assert!(
+            out.contains(&format!("hash {}\n", hex(&tx.hash()))),
+            "{out}"
+        );
+        assert!(out.contains("signature_valid unknown"), "{out}");
+    }
+
+    #[test]
+    fn inspect_tx_verifies_signature_with_pubkey() {
+        // M98: with the author's pubkey, the correct key verifies true and a wrong key false.
+        let kp = Keypair::from_seed(seed_for(1));
+        let bytes = signed_tx_bytes(5, &kp);
+        let good = inspect_tx(&bytes, Some(&hex(&kp.public()))).expect("decode");
+        assert!(good.contains("signature_valid true"), "{good}");
+        let wrong = Keypair::from_seed(seed_for(2));
+        let bad = inspect_tx(&bytes, Some(&hex(&wrong.public()))).expect("decode");
+        assert!(bad.contains("signature_valid false"), "{bad}");
+    }
+
+    #[test]
+    fn inspect_tx_surfaces_decode_and_pubkey_errors() {
+        // M98: undecodable bytes ⇒ Err; a decodable tx with a malformed --pubkey ⇒ Err.
+        assert!(
+            inspect_tx(b"not a tx", None).is_err(),
+            "garbage must fail to decode"
+        );
+        let kp = Keypair::from_seed(seed_for(1));
+        let bytes = signed_tx_bytes(5, &kp);
+        assert!(
+            inspect_tx(&bytes, Some("nothex")).is_err(),
+            "bad pubkey must error"
+        );
+    }
+
+    #[test]
+    fn derive_pubkey_matches_keygen() {
+        // M99: deriving the pubkey from a seed hex equals both the direct Keypair API and the
+        // keygen path's pubkey for the same seed.
+        let seed = seed_for(5);
+        let (seed_hex, pub_hex) = keygen_derive(seed);
+        assert_eq!(derive_pubkey(&seed_hex, "--seed").expect("derive"), pub_hex);
+        assert_eq!(
+            derive_pubkey(&seed_hex, "--seed").expect("derive"),
+            hex(&Keypair::from_seed(seed).public())
+        );
+        // A trailing newline (as a key file carries) is tolerated.
+        assert_eq!(
+            derive_pubkey(&format!("{seed_hex}\n"), "--key-file").expect("derive"),
+            pub_hex
+        );
+    }
+
+    #[test]
+    fn derive_pubkey_surfaces_bad_seed() {
+        // M99: a non-hex / wrong-length seed is a typed error (not a panic).
+        assert!(derive_pubkey("nothex", "--seed").is_err());
+        assert!(
+            derive_pubkey("abcd", "--seed").is_err(),
+            "too short must fail"
+        );
+    }
+
+    #[test]
+    fn derive_pubkey_reads_keygen_written_file() {
+        // M99: the pubkey derived from a seed file written by `write_key_file` (the keygen
+        // path) matches the expected pubkey — `node pubkey --key-file` round-trips keygen's out.
+        let seed = seed_for(9);
+        let (seed_hex, pub_hex) = keygen_derive(seed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("zx-pubkey-{}-{}.key", std::process::id(), line!()));
+        let p = path.to_str().unwrap();
+        write_key_file(p, &seed_hex).expect("write");
+        let contents = std::fs::read_to_string(p).unwrap();
+        assert_eq!(
+            derive_pubkey(&contents, "--key-file").expect("derive"),
+            pub_hex
+        );
+        let _ = std::fs::remove_file(p);
+    }
+
+    // M100: a block with zeroed roots + empty body vectors, carrying `txs`, for inspect-block.
+    fn test_block(height: u64, txs: Vec<SubmissionTx>) -> Block {
+        Block {
+            height,
+            prev_hash: [0u8; 32],
+            timestamp_days: 0.0,
+            next_validators_root: [0u8; 32],
+            state_root: [height as u8; 32],
+            accounts_root: [0u8; 32],
+            graph_root: [0u8; 32],
+            bridge_root: [0u8; 32],
+            txs,
+            validator_updates: vec![],
+            stake_ops: vec![],
+            slashing_evidence: vec![],
+            bridge_locks: vec![],
+            bridge_headers: vec![],
+            bridge_redeems: vec![],
+            proposer: 0,
+        }
+    }
+
+    fn test_tx(author: u64) -> SubmissionTx {
+        SubmissionTx {
+            author,
+            embedding: [0.0f32; DIM],
+            domain: 1,
+            stake: 100,
+            reviews: vec![],
+            repl_success: 0,
+            repl_total: 0,
+            timestamp_days: 0.0,
+            signature: [0u8; 64],
+            fee: 0,
+            nonce: 0,
+        }
+        .signed(&Keypair::from_seed(seed_for(author)))
+    }
+
+    #[test]
+    fn inspect_block_lists_all_blocks() {
+        // M100: with no --height, a one-line summary per block (body counts) + a header count.
+        let blocks = vec![test_block(1, vec![test_tx(5)]), test_block(2, vec![])];
+        let out = inspect_block(&blocks, None).expect("list");
+        assert!(out.starts_with("blocks 2\n"), "{out}");
+        assert!(
+            out.contains("height 1 txs 1 stake_ops 0 evidence 0 validator_updates 0"),
+            "{out}"
+        );
+        assert!(
+            out.contains("height 2 txs 0 stake_ops 0 evidence 0 validator_updates 0"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn inspect_block_detail_prints_header_and_txs() {
+        // M100: --height prints the block's header (hash/prev/roots) + contents + each tx.
+        let tx = test_tx(5);
+        let b = test_block(1, vec![tx.clone()]);
+        let out = inspect_block(std::slice::from_ref(&b), Some(1)).expect("detail");
+        assert!(out.starts_with("height 1\n"), "{out}");
+        assert!(out.contains(&format!("hash {}\n", hex(&b.hash()))), "{out}");
+        assert!(out.contains("txs 1\n"), "{out}");
+        assert!(
+            out.contains(&format!("tx 0 hash {} author 5", hex(&tx.hash()))),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn inspect_block_missing_height_errors() {
+        // M100: a height with no block is a returned error (not a panic).
+        let blocks = vec![test_block(1, vec![])];
+        assert!(
+            inspect_block(&blocks, Some(99)).is_err(),
+            "missing height must error"
+        );
+    }
+
+    // M101: a finality cert at `height` signed by `voters` (all precommits, round 0).
+    fn test_commit(height: u64, voters: &[u64]) -> Commit {
+        let bh = [height as u8; 32];
+        Commit {
+            height,
+            round: 0,
+            block_hash: bh,
+            precommits: voters
+                .iter()
+                .map(|&v| Vote::signed(v, height, 0, bh, VoteType::Precommit, &kp(v)))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn inspect_cert_lists_all_certs() {
+        // M101: with no --height, a one-line summary per cert (round, precommit count, hash).
+        let certs = vec![test_commit(1, &[21, 22, 23]), test_commit(2, &[21, 22])];
+        let out = inspect_cert(&certs, None).expect("list");
+        assert!(out.starts_with("certs 2\n"), "{out}");
+        assert!(
+            out.contains(&format!(
+                "height 1 round 0 precommits 3 block_hash {}",
+                hex(&[1u8; 32])
+            )),
+            "{out}"
+        );
+        assert!(out.contains("height 2 round 0 precommits 2"), "{out}");
+    }
+
+    #[test]
+    fn inspect_cert_detail_prints_voters() {
+        // M101: --height prints the cert's fields + each precommit's voter id and vote type.
+        let certs = vec![test_commit(1, &[21, 22, 23])];
+        let out = inspect_cert(&certs, Some(1)).expect("detail");
+        assert!(out.starts_with("height 1\n"), "{out}");
+        assert!(
+            out.contains(&format!("block_hash {}\n", hex(&[1u8; 32]))),
+            "{out}"
+        );
+        assert!(out.contains("precommits 3\n"), "{out}");
+        assert!(
+            out.contains("precommit 0 validator 21 round 0 vote_type precommit"),
+            "{out}"
+        );
+        assert!(
+            out.contains("precommit 2 validator 23 round 0 vote_type precommit"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn inspect_cert_missing_height_errors() {
+        // M101: a height with no cert is a returned error (not a panic).
+        let certs = vec![test_commit(1, &[21])];
+        assert!(
+            inspect_cert(&certs, Some(99)).is_err(),
+            "missing height must error"
+        );
     }
 }
