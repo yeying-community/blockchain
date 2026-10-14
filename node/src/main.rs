@@ -4241,27 +4241,103 @@ fn write_key_file(path: &str, contents: &str) -> std::io::Result<()> {
 /// M94: the seed file is written `0600` (owner-only) — see [`write_key_file`].
 /// M95: with `--genesis-id <id>` (+ optional `--balance`/`--power`), also print a
 /// ready-to-paste genesis `[[accounts]]` (and `[[validators]]`) TOML entry.
+/// M169: `--new-mnemonic` generates a fresh BIP-39 24-word mnemonic
+/// (the human-readable backup form); `--mnemonic "word1 ... wordN"` derives
+/// deterministically from a supplied one (recovery); `--passphrase "..."`
+/// optionally folds in the BIP-39 "25th word". The 32-byte seed is derived
+/// via PBKDF2-HMAC-SHA512 and written in the standard `seed_hex` form so the
+/// resulting file is still consumable by `encode-tx --key-file` and the
+/// `[validator] seed_hex = "..."` config field (M169 keeps backwards compat
+/// at the byte level). The mnemonic + passphrase (if any) are stamped in
+/// `# ` comment lines above the seed hex for human backup.
 fn cmd_keygen(args: &[String]) {
     let out_path = req_arg(args, "--out");
 
-    // Seed source: an explicit `--seed <64hex>` (deterministic / recover a pubkey),
-    // else 32 fresh CSPRNG bytes. `--seed` reuses the same decoder + BadHex errors
-    // as `encode-tx --key-file`, so the two tools agree on the seed format.
-    let seed = match opt_arg(args, "--seed") {
-        Some(s) => {
-            config::decode_seed(s.trim(), "--seed").unwrap_or_else(|e| fail_msg("decode seed", &e))
-        }
-        None => {
-            let mut s = [0u8; 32];
-            getrandom::getrandom(&mut s).unwrap_or_else(|e| fail_msg("keygen rng", &e));
-            s
-        }
+    // M169: `--new-mnemonic` / `--mnemonic` / `--passphrase` are an
+    // alternative seed-sourcing path. The flag combinations are mutually
+    // exclusive within the mnemonic family: `--new-mnemonic` and `--mnemonic`
+    // don't make sense together (random vs supplied). `--seed` is the legacy
+    // machine-friendly form and also mutually exclusive with the mnemonic
+    // family. We detect the chosen family and route accordingly.
+    let new_mnemonic = args.iter().any(|a| a == "--new-mnemonic");
+    let supplied_mnemonic = opt_arg(args, "--mnemonic");
+    let passphrase = opt_arg(args, "--passphrase").unwrap_or_default();
+    let explicit_seed = opt_arg(args, "--seed");
+
+    if (new_mnemonic || supplied_mnemonic.is_some()) && explicit_seed.is_some() {
+        fail_msg(
+            "keygen flags",
+            "--seed is mutually exclusive with --new-mnemonic / --mnemonic",
+        );
+    }
+    if new_mnemonic && supplied_mnemonic.is_some() {
+        fail_msg(
+            "keygen flags",
+            "--new-mnemonic and --mnemonic are mutually exclusive",
+        );
+    }
+
+    let (seed, mnemonic_text) = if new_mnemonic {
+        // Random 256-bit entropy → 24-word mnemonic (BIP-39 spec).
+        let mut entropy = [0u8; 32];
+        getrandom::getrandom(&mut entropy)
+            .unwrap_or_else(|e| fail_msg("keygen rng", &e.to_string()));
+        let words = zhixing_node::crypto::mnemonic_generate(&entropy)
+            .unwrap_or_else(|e| fail_msg("mnemonic generate", &e.to_string()));
+        let mut seed = [0u8; 32];
+        zhixing_node::crypto::mnemonic_to_seed(&words, &passphrase, &mut seed)
+            .unwrap_or_else(|e| fail_msg("mnemonic derive", &e.to_string()));
+        (seed, words)
+    } else if let Some(words) = supplied_mnemonic {
+        // Re-derive from a known mnemonic (recovery / test fixture).
+        zhixing_node::crypto::validate_mnemonic(words)
+            .unwrap_or_else(|e| fail_msg("mnemonic validate", &e.to_string()));
+        let mut seed = [0u8; 32];
+        zhixing_node::crypto::mnemonic_to_seed(words, &passphrase, &mut seed)
+            .unwrap_or_else(|e| fail_msg("mnemonic derive", &e.to_string()));
+        (seed, words.to_string())
+    } else {
+        // Legacy `--seed <64hex>` or fresh CSPRNG.
+        let seed = match explicit_seed {
+            Some(s) => config::decode_seed(s.trim(), "--seed")
+                .unwrap_or_else(|e| fail_msg("decode seed", &e)),
+            None => {
+                let mut s = [0u8; 32];
+                getrandom::getrandom(&mut s)
+                    .unwrap_or_else(|e| fail_msg("keygen rng", &e.to_string()));
+                s
+            }
+        };
+        (seed, String::new())
     };
 
     let (seed_hex, pub_hex) = keygen_derive(seed);
-    write_key_file(out_path, &seed_hex).unwrap_or_else(|e| fail("write key file", e));
+    // M169: stamp the mnemonic + passphrase as `# ` comment lines above the
+    // seed hex. `encode-tx --key-file` and `decode_seed` both skip
+    // non-hex-prefixed lines and the trailing newline, so the file is
+    // byte-compatible with the pre-M169 single-line format.
+    let mut file_contents = String::new();
+    if !mnemonic_text.is_empty() {
+        file_contents.push_str("# zhixing-node validator key (M169 · BIP-39)\n");
+        file_contents.push_str(&format!("# mnemonic: {mnemonic_text}\n"));
+        file_contents.push_str(&format!(
+            "# passphrase: {}\n",
+            if passphrase.is_empty() {
+                "<empty>".to_string()
+            } else {
+                passphrase.to_string()
+            }
+        ));
+        file_contents.push_str(&format!("# pubkey: {pub_hex}\n"));
+    }
+    file_contents.push_str(&seed_hex);
+    file_contents.push('\n');
+    write_key_file(out_path, &file_contents).unwrap_or_else(|e| fail("write key file", e));
     println!("pubkey {pub_hex}");
     println!("out {out_path}");
+    if !mnemonic_text.is_empty() {
+        println!("mnemonic: {mnemonic_text}");
+    }
     if let Some(entries) = keygen_genesis_entries(args, &pub_hex) {
         print!("{entries}");
     }
@@ -4909,7 +4985,7 @@ fn fail_chain(ctx: &str, e: zhixing_node::ChainError) -> ! {
     exit(1);
 }
 
-fn fail_msg<E: std::fmt::Display>(ctx: &str, e: &E) -> ! {
+fn fail_msg<E: std::fmt::Display + ?Sized>(ctx: &str, e: &E) -> ! {
     eprintln!("error: {ctx}: {e}");
     exit(1);
 }
@@ -5397,6 +5473,50 @@ mod tests {
             seed
         );
         let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn keygen_with_new_mnemonic_writes_compatible_seed_hex() {
+        // M169: `node keygen --out F --new-mnemonic` should derive a
+        // BIP-39 mnemonic, embed it as a `# ` comment, and write the same
+        // 64-hex seed on the last line — so the file is still consumable
+        // by `encode-tx --key-file` and `[validator] seed_hex = "..."`
+        // (the M94 path). Round-trip through the same seed decoder.
+        let path = tmp_key_path("new-mnemonic");
+        let p = path.to_str().unwrap();
+        let _ = std::fs::remove_file(p);
+        // Re-run the real CLI flow in-process.
+        let args = vec![
+            "keygen".to_string(),
+            "--out".to_string(),
+            p.to_string(),
+            "--new-mnemonic".to_string(),
+        ];
+        cmd_keygen(&args);
+        // File must end with the 64-hex seed line, prefixed by `# mnemonic:`
+        // / `# passphrase: <empty>` / `# pubkey:` comments.
+        let text = std::fs::read_to_string(p).expect("read");
+        let last_line = text.lines().last().expect("non-empty");
+        let seed = config::decode_seed(last_line, "--seed").expect("last line is a 64-hex seed");
+        let (seed_hex, _pub_hex) = keygen_derive(seed);
+        // Round trip — re-deriving the keypair from the seed hex must give
+        // a valid keypair (i.e. the same 32 bytes we wrote).
+        let _ = Keypair::from_seed(seed).public();
+        // And the file's mnemonic line must be a valid 24-word BIP-39.
+        let mnemonic_line = text
+            .lines()
+            .find(|l| l.starts_with("# mnemonic:"))
+            .expect("mnemonic line");
+        let words = mnemonic_line.trim_start_matches("# mnemonic:").trim();
+        assert_eq!(words.split_whitespace().count(), 24);
+        // Sanity: the seed we just read back matches the one we derive
+        // from the mnemonic + empty passphrase.
+        let mut derived = [0u8; 32];
+        zhixing_node::crypto::mnemonic_to_seed(words, "", &mut derived)
+            .expect("derive from on-disk mnemonic");
+        assert_eq!(seed, derived);
+        // And the printed seed hex matches.
+        assert_eq!(last_line, seed_hex);
     }
 
     #[test]

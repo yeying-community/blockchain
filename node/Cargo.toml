@@ -52,6 +52,11 @@ sha2 = "0.10"
 getrandom = "0.2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# M169: BIP-39 PBKDF2-HMAC-SHA512 — pull the audited RustCrypto crate
+# rather than hand-rolling the XOR-accumulator (M169 already inlines the
+# 2048-word BIP-39 English list, so adding one tiny dep is on budget).
+pbkdf2 = { version = "0.12", default-features = false, features = ["simple", "hmac"] }
+hmac = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "signal"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

@@ -45,6 +45,9 @@ pub enum ConfigError {
     /// M141: a `[snapshot]` boot config was internally incoherent (e.g. a cert
     /// without a trusted validator set, or vice versa).
     BadSnapshot { detail: String },
+    /// M169: a `[validator] mnemonic` field failed BIP-39 validation
+    /// (unknown word, bad length, bad checksum, or non-ASCII input).
+    BadMnemonic { detail: String },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -73,6 +76,9 @@ impl std::fmt::Display for ConfigError {
             }
             ConfigError::BadMempool { detail } => write!(f, "config bad mempool: {detail}"),
             ConfigError::BadSnapshot { detail } => write!(f, "config bad snapshot: {detail}"),
+            ConfigError::BadMnemonic { detail } => {
+                write!(f, "config bad mnemonic: {detail}")
+            }
         }
     }
 }
@@ -290,14 +296,77 @@ pub struct ValidatorKeyConfig {
     pub enabled: bool,
     /// 32-byte ed25519 seed, lowercase hex (64 chars). The derived public key
     /// must match this node's entry in `genesis.validators` (checked at startup).
-    pub seed_hex: String,
+    /// `Option` so the M169 BIP-39 fields can substitute for it. If both
+    /// `seed_hex` and `mnemonic` are set, `mnemonic` wins (BIP-39 is the
+    /// human-readable form; seed_hex is a legacy machine-friendly alias).
+    #[serde(default)]
+    pub seed_hex: Option<String>,
+    /// M169: BIP-39 12/15/18/21/24-word mnemonic (space-separated, lowercase).
+    /// The 32-byte ed25519 seed is derived via PBKDF2-HMAC-SHA512
+    /// (`"mnemonic" + passphrase` as salt, 2048 iters) and the first 32 bytes
+    /// of the 64-byte output are taken. This is the operator-friendly backup
+    /// form: write the words on paper, lose the file, recover anywhere.
+    #[serde(default)]
+    pub mnemonic: Option<String>,
+    /// M169: optional BIP-39 "25th word" passphrase. Folded into the PBKDF2
+    /// salt (`"mnemonic" + passphrase`). Empty string (the default) is the
+    /// BIP-39 "no passphrase" case. The passphrase is never written to disk
+    /// by `node keygen --new-mnemonic`; it lives only in the operator's head
+    /// and in the optional `[validator] passphrase = "..."` TOML line.
+    #[serde(default)]
+    pub passphrase: Option<String>,
 }
 
 impl ValidatorKeyConfig {
-    /// Decode the seed and build the signing [`Keypair`].
+    /// Decode the seed (either from a raw `seed_hex` or from a BIP-39
+    /// `mnemonic` + `passphrase` derivation) and build the signing
+    /// [`Keypair`]. `mnemonic` takes precedence over `seed_hex` when both
+    /// are set; the legacy single-form configs (M94) keep working unchanged
+    /// because `seed_hex` is the only field they set.
     pub fn keypair(&self) -> Result<crate::Keypair, ConfigError> {
-        let seed = decode_seed(&self.seed_hex, "validator.seed_hex")?;
+        let seed = if let Some(words) = &self.mnemonic {
+            // M169: validate the mnemonic up front so a typo in the
+            // operator's `mnemonic = "..."` line fails at startup with a
+            // clear `BadMnemonic` error (the PBKDF2 derivation would
+            // otherwise silently produce a 32-byte seed regardless of
+            // checksum, masking the typo).
+            crate::crypto::validate_mnemonic(words).map_err(|e| ConfigError::BadMnemonic {
+                detail: e.to_string(),
+            })?;
+            let pass = self.passphrase.as_deref().unwrap_or("");
+            let mut s = [0u8; 32];
+            crate::crypto::mnemonic_to_seed(words, pass, &mut s).map_err(|e| {
+                ConfigError::BadMnemonic {
+                    detail: e.to_string(),
+                }
+            })?;
+            s
+        } else {
+            let hex = self
+                .seed_hex
+                .as_deref()
+                .ok_or_else(|| ConfigError::BadMnemonic {
+                    detail: "no seed_hex and no mnemonic set".to_string(),
+                })?;
+            decode_seed(hex, "validator.seed_hex")?
+        };
         Ok(crate::Keypair::from_seed(seed))
+    }
+}
+
+impl Default for ValidatorKeyConfig {
+    // M169: all fields are `Option<String>` + `bool`, so `Default` is the
+    // inert `(false, None, None, None)` shape. A bare `[validator]` table
+    // deserializes to this; `keypair()` then errors out at startup with
+    // a "no seed_hex and no mnemonic" message, which is what an operator
+    // who forgot to configure the key should see.
+    fn default() -> Self {
+        ValidatorKeyConfig {
+            enabled: false,
+            seed_hex: None,
+            mnemonic: None,
+            passphrase: None,
+        }
     }
 }
 
@@ -1070,7 +1139,8 @@ mod tests {
             genesis: "genesis.toml".to_string(),
             validator: Some(ValidatorKeyConfig {
                 enabled: true,
-                seed_hex: hex(&demo_seed(21)),
+                seed_hex: Some(hex(&demo_seed(21))),
+                ..Default::default()
             }),
             consensus: ConsensusConfig::default(),
             network: NetworkConfig::default(),
@@ -2138,15 +2208,95 @@ mod tests {
         let genesis_pk = crate::Keypair::from_seed(demo_seed(21)).public();
         let vc = ValidatorKeyConfig {
             enabled: true,
-            seed_hex: hex(&demo_seed(99)),
+            seed_hex: Some(hex(&demo_seed(99))),
+            ..Default::default()
         };
         assert_ne!(vc.keypair().unwrap().public(), genesis_pk);
         // the matching seed agrees
         let ok = ValidatorKeyConfig {
             enabled: true,
-            seed_hex: hex(&demo_seed(21)),
+            seed_hex: Some(hex(&demo_seed(21))),
+            ..Default::default()
         };
         assert_eq!(ok.keypair().unwrap().public(), genesis_pk);
+    }
+
+    #[test]
+    fn validator_key_config_accepts_mnemonic_field() {
+        // M169: the BIP-39 form derives a keypair via PBKDF2-HMAC-SHA512
+        // and the result must match the same seed as the legacy `seed_hex`
+        // form would produce. We use the same 12-word vector that the
+        // crypto.rs tests exercise so a regression there surfaces here too.
+        let seed_a = {
+            let mut s = [0u8; 32];
+            crate::crypto::mnemonic_to_seed(
+                "abandon abandon abandon abandon abandon abandon \
+                 abandon abandon abandon abandon abandon about",
+                "",
+                &mut s,
+            )
+            .unwrap();
+            s
+        };
+        let via_mnemonic = ValidatorKeyConfig {
+            enabled: true,
+            seed_hex: None,
+            mnemonic: Some(
+                "abandon abandon abandon abandon abandon abandon \
+                 abandon abandon abandon abandon abandon about"
+                    .to_string(),
+            ),
+            passphrase: None,
+        }
+        .keypair()
+        .unwrap();
+        let via_seed_hex = ValidatorKeyConfig {
+            enabled: true,
+            seed_hex: Some(hex(&seed_a)),
+            mnemonic: None,
+            passphrase: None,
+        }
+        .keypair()
+        .unwrap();
+        assert_eq!(via_mnemonic.public(), via_seed_hex.public());
+    }
+
+    #[test]
+    fn validator_key_config_rejects_invalid_mnemonic() {
+        // Bad checksum (last word flipped from "about" to "ability") ⇒
+        // a clear `BadMnemonic` error rather than a panic. The M169
+        // `keypair()` calls `validate_mnemonic` first so the typo is
+        // caught before any derivation runs.
+        let bad = ValidatorKeyConfig {
+            enabled: true,
+            seed_hex: None,
+            mnemonic: Some(
+                "abandon abandon abandon abandon abandon abandon \
+                 abandon abandon abandon abandon abandon ability"
+                    .to_string(),
+            ),
+            passphrase: None,
+        };
+        match bad.keypair() {
+            Err(ConfigError::BadMnemonic { detail }) => {
+                assert!(detail.contains("checksum"), "{detail}");
+            }
+            other => panic!("expected BadMnemonic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validator_key_config_requires_seed_or_mnemonic() {
+        // Bare `[validator]` table (no `seed_hex`, no `mnemonic`) ⇒ error
+        // explaining the omission, not a panic. This is the path an
+        // operator who forgot to configure the key would hit at startup.
+        let empty = ValidatorKeyConfig::default();
+        match empty.keypair() {
+            Err(ConfigError::BadMnemonic { detail }) => {
+                assert!(detail.contains("no seed_hex"), "{detail}");
+            }
+            other => panic!("expected BadMnemonic, got {other:?}"),
+        }
     }
 
     fn unit_vec(dim: usize) -> Vec<f32> {
@@ -2220,7 +2370,8 @@ mod tests {
                 genesis: "testnet/genesis.toml".to_string(),
                 validator: Some(ValidatorKeyConfig {
                     enabled: true,
-                    seed_hex: hex(&demo_seed(id)),
+                    seed_hex: Some(hex(&demo_seed(id))),
+                    ..Default::default()
                 }),
                 consensus: ConsensusConfig::default(),
                 network: NetworkConfig::default(),

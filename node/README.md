@@ -1451,6 +1451,23 @@ M156/M158 在 `[rpc] auth_token` 与 `[metrics] auth_token` 处用 `t == auth_to
 - **测试（+1 → 624）**：`ct_str_eq_basic_properties`——空串等/等长等/等长差一字节（位置 2）/长度差 ×2/大小写差共 6 断言；时间性质（长度除外不常时）单元测不直接观测。
 - **已知边界**：长度差不常时（攻击者已从 HTTP 头框知长度，不算新增泄露）；失败响应延迟无 jitter（顺沿 M156/M158）；多 token/scope/轮换/审计日志/真用 `subtle` 均属后续运维篮子。
 
+## 助记词密钥 BIP-39（Milestone 169 · 备份/恢复）
+
+M94 给 `node keygen --out F --seed HEX` 写了 32 字节 ed25519 种子的 64 字符 lowercase hex 文件——机器友好但**人备份/恢复体验糟糕**（抄 64 hex 容易错；丢文件 = 丢身份 = 重做创世）。M169 加 BIP-39 助记词路径：12/15/18/21/24 词字典（2048 词）作人可读备份，可选 passphrase 作 25th word 第二因子。
+
+- **`[validator] mnemonic` / `passphrase` 配置字段**（`config.rs`）：`seed_hex` 改为 `Option<String>`（`#[serde(default)]` 保 M94 向后兼容），新增 `mnemonic`/`passphrase` 字段；`keypair()` 优先用 `mnemonic + passphrase` 派生（PBKDF2-HMAC-SHA512），否则走 `seed_hex`。**M169 启动时主动 `validate_mnemonic`**——typo 不再 silent 派生随机种子，启动期即报 `BadMnemonic`。
+- **`node keygen --new-mnemonic`**（`main.rs`）：随机 256 位熵 → 24 词 → 派 32 字节种子；`--mnemonic "word1 ... word24"` 从已知助记词恢复；`--passphrase "..."` 可选。`--seed`/`--new-mnemonic`/`--mnemonic` 三者互斥。
+- **文件格式升级**（仍字节兼容 M94）：seed hex **行字节位置不变**——`# ` 注释 + 末行 64 hex 都能被 `encode-tx --key-file` 与 `decode_seed` 跳过非 hex 字符容错解析。`encode-tx --key-file F`（M94 路径）仍能用新文件无修改。
+- **PBKDF2-HMAC-SHA512** 用 `pbkdf2` crate（0.12，添加为新 dep）——M165 决定不引新 dep，但 M169 PBKDF2 XOR-累加器手写实现反复在 spec 测上失败（XOR 累加器 off-by-one 极难写对），改用审计过的 crate；BIP-39 词表 2048 词仍内嵌（避免再引 `bip39` crate）。
+- **BIP-39 词表内嵌 ~25 KB**（`crypto.rs` `BIP39_WORDLIST`）：2048 个公开标准英文词；M170 可考虑换 `bip39` crate。
+- **mTLS（M43）兼容**：mnemonic→seed→`Keypair::from_seed` 派与 `seed_hex` 派**同 pubkey**（新测 `validator_key_config_accepts_mnemonic_field` 验），mTLS 证书 / pin 字节相同。
+- **不碰** 共识/codec/wire/合法路径字节（`--seed` 路径未动）；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+9 → 642）**：
+  - `crypto.rs` +5：`mnemonic_to_seed_known_vector`（BIP-39 spec 测 + 25th-word "TREZOR" + 已知 seed）、`mnemonic_round_trip_generate_validate_derive`（generate→validate→derive→sign/verify）、`validate_mnemonic_rejects_bad_inputs`（length / unknown word / bad checksum / non-ASCII）、`mnemonic_to_seed_rejects_non_ascii_passphrase`（M169 ASCII-only 护栏）。
+  - `config.rs` +3：`validator_key_config_accepts_mnemonic_field`（mnemonic 派 == seed_hex 派）、`validator_key_config_rejects_invalid_mnemonic`（typo→启动期 `BadMnemonic`）、`validator_key_config_requires_seed_or_mnemonic`（空配置→清晰错）。
+  - `main.rs` +1：`keygen_with_new_mnemonic_writes_compatible_seed_hex`（CLI 端到端：键 gen→写文件→re-derive→`decode_seed` 闭环）。
+- **已知边界**：ASCII-only（拒绝非 ASCII 助记词 / passphrase）——BIP-39 spec 要求 NFKD normalization 但 2048 词字典全 ASCII + 大多数 passphrase 也 ASCII，**完美 NFKD 兼容属 M170**。**未做** Ethereum v3 风格口令加密 keystore（scrypt + AES-128-CTR over seed，属 M170 follow-up）、**未做**严格密钥轮换（多 keystore slot + 旧密钥归档）。轻节点 RPC TLS / bearer、持久 cert、OTel push exporter 属其他篮子。
+
 ## `/config` 暴露 mempool opt-in 调参（Milestone 159 · 运维可观测）
 
 `/config` 自 M119 起只吐共识计时 + 角色 + `mempool_capacity`/`mempool_per_account_limit` 两项 mempool 调参，但 M143/M144/M145/M157 陆续加的四个 opt-in 旋钮（`nonce_lookahead` / `replace_by_fee` / `min_fee_bump` / `min_fee`）从未进读面——运维无法经 wire 核对它们实际生效的值。M159 把这四项补进 `/config` 的文本与 JSON 两种表示。
