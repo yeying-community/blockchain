@@ -1429,6 +1429,17 @@ M156/M158/M160/M163 把 bearer 鉴权做齐：缺/错 token 返 401 + 常时比�
 - **测试（+1 → 632）**：新纯 `jitter_401_distribution_is_bounded`（256 样本全部 `< max_nanos` + 至少一个 > 0 + 顺便验证 `tokio::time::sleep` 实际跑过）；扩展 M163 `metrics_endpoint_bearer_auth_gates_scrapes` 4 次未授权 scrape 断言**至少有一次延迟 > 最小延迟**（证明 jitter 真在 sleep）——**不**断言绝对上限（CI 调度抖动大）。
 - **已知边界**：5 ms uniform 是**最简有用版本**——下界 0 仍快于合法路径 ~ms，攻击者要可靠区分 0 vs ~ms 仍要做大量采样平均 + 多次测量。**完美防御**需常时 handler（每个分支字节相同 + 无 syscall 边界），M167 不达此。5 ms 是工程量（与典型 LAN RTT 同数量级），过大影响合法 scrape/健康检查延迟。RNG syscall ~μs 开销对 ms 量级端到端延迟无影响。counter `_created` 时间戳、mTLS/持久 cert、助记词 keystore、真正 `encode_unbonding` codec 入口属后续篮子。
 
+## Prometheus counter `_created` 时间戳（Milestone 168 · OpenMetrics 0.16+）
+
+M52 起 13 个 Prometheus counter 上线，但都没 `_created` 时间戳——这是 OpenMetrics 0.16+ 标准实践。`_created` 让 `rate()` / `increase()` 在 counter reset 时准确推断 fresh-value 边界（counter restart 后前两个 sample 不可信；`_created` 给 Prometheus 算"series 自此点存在多久"）。本轮给 13 个 counter 全部加 `_created`，纯渲染增量。
+
+- **`counter_created_ts()`**（`daemon.rs`，照 M52 counter 闭包旁）：`OnceLock<u64>` 懒初始化于首次 metrics 渲染；返回 Unix epoch 秒。process 生命周期内**单调不减**——所有 13 counter 共享同一值，符合 OpenMetrics 语义"series 创建时间"。
+- **`counter` 闭包**（`daemon.rs:2425`）从 3 行 emit 增至 5 行：每 counter 多 emit `# TYPE <name>_created gauge` + `<name>_created <ts>`，紧接在 `# TYPE <name> counter` 之后、value 行之前（标准 OpenMetrics 顺序）。
+- **无新 dep**——`OnceLock` std + `SystemTime::UNIX_EPOCH` std；不动 metrics 端点、不动 counter 状态、不动 wire/codec/共识。
+- **不碰** 合法路径字节；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+1 → 633）**：新纯 `counter_created_ts_is_positive_and_recent`（`ts > 0` + `ts ≤ now+60` + 重复调返同值证 `OnceLock` 缓存）；扩展 M52 `render_prometheus_emits_counters`（13 counter 全断言 `# TYPE <name>_created gauge` 存在 + `<name>_created <ts>` 数字 > `1_000_000_000`，证是合法 Unix 时间戳）。
+- **已知边界**：`_created` 实际值 = 首次 metrics 渲染时点（不是 process-start 时点），OpenMetrics spec 容忍二者任一（process 生命周期内单调不减；Prometheus 算 rate 只看 series 相对时序）。counter 实际值行字节模式不变（`_created` 是**额外的**行），既有 M163 字节匹配测零回归。助记词 keystore、真正 `encode_unbonding` codec 入口、轻节点 RPC TLS/bearer、OTel push exporter 属后续篮子。
+
 ## bearer 鉴权常时比较（Milestone 160 · 鉴权加固）
 
 M156/M158 在 `[rpc] auth_token` 与 `[metrics] auth_token` 处用 `t == auth_token` 逐字节短路比较——第一个不等字节即返 `false`，对公网监听/共享 token 部署构成**逐字节时序侧信道**（攻击者经端到端延迟推 prefix）。M160 改用**常时字符串相等**比较。

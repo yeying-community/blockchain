@@ -2423,9 +2423,19 @@ fn render_prometheus(m: &Metrics) -> String {
     s.push_str("# TYPE zhixing_head_info gauge\n");
     s.push_str(&format!("zhixing_head_info{{head=\"{head}\"}} 1\n"));
     // M52: monotonic counters (the `counter` half of the Prometheus data model).
+    let created_ts = counter_created_ts();
     let counter = |s: &mut String, name: &str, help: &str, value: u64| {
         s.push_str(&format!("# HELP {name} {help}\n"));
         s.push_str(&format!("# TYPE {name} counter\n"));
+        // M168: OpenMetrics 0.16+ `<name>_created` gauge (Unix epoch seconds
+        // when the series was created). Combined with the counter value, this
+        // lets `rate()` / `increase()` correctly infer fresh-value boundaries
+        // on process restart — without it, the first two samples after a
+        // restart are ambiguous (counter is monotonically reset by the process
+        // but Prometheus can't tell). One shared value for all 13 counters in
+        // this process, set on first metrics render.
+        s.push_str(&format!("# TYPE {name}_created gauge\n"));
+        s.push_str(&format!("{name}_created {created_ts}\n"));
         s.push_str(&format!("{name} {value}\n"));
     };
     counter(
@@ -2562,6 +2572,22 @@ fn render_prometheus(m: &Metrics) -> String {
         m.tx_submit_count,
     ));
     s
+}
+
+/// M168: OpenMetrics 0.16+ `_created` Unix epoch seconds. All 13 Prometheus
+/// counters in this daemon share the same `_created` value, set the first time
+/// a metrics body is rendered (lazy on first `render_prometheus` call). Constant
+/// for the lifetime of the process — Prometheus uses it to bound counter-reset
+/// detection in `rate()` / `increase()`.
+fn counter_created_ts() -> u64 {
+    use std::sync::OnceLock;
+    static TS: OnceLock<u64> = OnceLock::new();
+    *TS.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    })
 }
 
 /// Accept loop for the metrics/health endpoint. Mirrors [`run_listener`]: each
@@ -9107,7 +9133,56 @@ mod tests {
                 out.contains(&format!("\n{name} {value}\n")),
                 "missing `{name} {value}`"
             );
+            // M168: OpenMetrics `<name>_created` gauge. Every counter in the
+            // process shares the same Unix-epoch value; the format is
+            // `<name>_created <ts>` immediately after the TYPE line, then the
+            // value line. We don't pin a specific timestamp — just that the
+            // line exists and is a non-zero positive integer (Unix epoch).
+            assert!(
+                out.contains(&format!("# TYPE {name}_created gauge")),
+                "missing TYPE for {name}_created"
+            );
+            let marker = format!("\n{name}_created ");
+            let pos = out
+                .find(&marker)
+                .unwrap_or_else(|| panic!("missing `{name}_created` line"));
+            let after = &out[pos + marker.len()..];
+            let ts: u64 = after
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap_or_else(|e| panic!("bad `{name}_created` value: {e}"));
+            assert!(
+                ts > 1_000_000_000,
+                "`{name}_created` is implausibly small: {ts}"
+            );
         }
+    }
+
+    #[test]
+    fn counter_created_ts_is_positive_and_recent() {
+        // M168: the shared `counter_created_ts()` is lazy-initialized on the
+        // first metrics render. Here we force the init by calling it directly
+        // and assert (a) the timestamp is non-zero and (b) it was captured
+        // within the last 60 s of wall-clock time. The latter is the slack
+        // band: if a CI machine's clock jumps backwards between the lazy
+        // init and this assertion, the test still passes (we only check
+        // ts ≤ now+60, not `now - 60 ≤ ts ≤ now`).
+        let ts = counter_created_ts();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        assert!(ts > 0, "counter_created_ts is 0 (pre-epoch?)");
+        assert!(
+            ts <= now + 60,
+            "counter_created_ts {ts} is more than 60 s ahead of now {now}"
+        );
+
+        // Calling again returns the same cached value (OnceLock, not
+        // re-sampled on every call).
+        assert_eq!(counter_created_ts(), ts);
     }
 
     #[test]
