@@ -3165,6 +3165,27 @@ fn effective_limit(requested: Option<usize>) -> usize {
     }
 }
 
+/// M165: cursor-pagination seam. Given a slice of keys sorted in the same order
+/// the corresponding listing is iterated (BTreeMap order, `Vec` insertion
+/// order, etc. — caller's responsibility) and an optional `cursor`, return the
+/// index of the first row whose key is strictly greater than `cursor`.
+/// `cursor == None` ⇒ 0 (start of the listing). If every key is `≤ cursor`,
+/// returns `keys.len()` (no further rows; the page is empty). Pure, unit-tested
+/// directly.
+fn key_after<K: Ord>(keys: &[K], cursor: Option<&K>) -> usize {
+    match cursor {
+        None => 0,
+        Some(c) => keys.partition_point(|k| k <= c),
+    }
+}
+
+/// M165: the natural content key of the last row in a non-empty key slice,
+/// used to build the next-page cursor. Returns `None` for an empty slice (the
+/// response then omits the `cursor=` line / emits `null`). Pure.
+fn last_key<K>(keys: &[K]) -> Option<&K> {
+    keys.last()
+}
+
 /// M69: outcome of `Accept`-header negotiation (RFC 7231 §5.3 q-values).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Negotiation {
@@ -3679,6 +3700,24 @@ fn format_page(items: &str, total: usize, next: Option<usize>) -> String {
     let mut s = format!("total={total}");
     if let Some(n) = next {
         s.push_str(&format!("\nnext={n}"));
+    }
+    if !items.is_empty() {
+        s.push('\n');
+        s.push_str(items);
+    }
+    s
+}
+
+/// M165: mirror of [`format_page`] using a stable `cursor=` token (the natural
+/// content-anchored key of the last row, e.g. a `lock_id` u64 or a tx `Hash` hex)
+/// instead of a positional `next=`. Used by list endpoints whose natural sort key
+/// is part of the row (see M165 table). `cursor=0` is never a valid cursor — the
+/// endpoint slices from the first row with `key > cursor`, so a "0" cursor returns
+/// the whole listing; if there's no further row, the `cursor=` line is omitted.
+fn format_page_cursor(items: &str, total: usize, cursor: Option<&str>) -> String {
+    let mut s = format!("total={total}");
+    if let Some(c) = cursor {
+        s.push_str(&format!("\ncursor={c}"));
     }
     if !items.is_empty() {
         s.push('\n');
@@ -4695,8 +4734,29 @@ fn json_page(items: &str, total: usize, next: Option<usize>) -> String {
     )
 }
 
+/// M165: JSON mirror of [`format_page_cursor`]. The `cursor` field carries the
+/// stable content-anchored key as a JSON string (u64-as-string for id cursors,
+/// hex for hash cursors) and is bare `null` once the page reaches the tail.
+/// Endpoints with a natural content key (see M165 table) emit this; endpoints
+/// without one keep using `json_page` (the offset-based variant).
+fn json_page_cursor(items: &str, total: usize, cursor: Option<&str>) -> String {
+    let cur = match cursor {
+        Some(c) => json_str(c),
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"total\":{},\"cursor\":{},\"items\":{}}}",
+        json_u64(total as u64),
+        cur,
+        items
+    )
+}
+
 /// M137: `/bonds` page with the whole-map bonded Σ (`total_bonded`, lossless quoted-u64)
 /// alongside the standard page envelope — lets a JSON client audit `Σ bonded == state.bonded`.
+/// M165: retained for tests that compare the offset-based envelope; `/bonds` itself now
+/// emits the cursor variant ([`json_bond_page_cursor`]).
+#[allow(dead_code)]
 fn json_bond_page(items: &str, total: usize, next: Option<usize>, total_bonded: u64) -> String {
     let next = match next {
         Some(n) => json_u64(n as u64),
@@ -4706,6 +4766,29 @@ fn json_bond_page(items: &str, total: usize, next: Option<usize>, total_bonded: 
         "{{\"total\":{},\"next\":{},\"total_bonded\":{},\"items\":{}}}",
         json_u64(total as u64),
         next,
+        json_u64(total_bonded),
+        items
+    )
+}
+
+/// M165: cursor-pagination variant of [`json_bond_page`] for `/bonds`. The
+/// `cursor` field carries the natural key of the last returned row
+/// (a `validator_id` u64, formatted as a JSON string) instead of the next
+/// offset.
+fn json_bond_page_cursor(
+    items: &str,
+    total: usize,
+    cursor: Option<&str>,
+    total_bonded: u64,
+) -> String {
+    let cur = match cursor {
+        Some(c) => json_str(c),
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"total\":{},\"cursor\":{},\"total_bonded\":{},\"items\":{}}}",
+        json_u64(total as u64),
+        cur,
         json_u64(total_bonded),
         items
     )
@@ -5702,20 +5785,32 @@ async fn serve_rpc_conn(
                             // `DEFAULT_PAGE_LIMIT` and any requested limit is clamped to
                             // `MAX_PAGE_LIMIT` (no read can return an unbounded body); the
                             // `next` envelope still signals the remaining pages.
-                            let offset = usize_param(query, "offset").unwrap_or(0);
-                            let limit = Some(effective_limit(usize_param(query, "limit")));
-                            let total = listing.len();
-                            let page = paginate(&listing, offset, limit);
-                            let start = offset.min(total);
-                            let next = if start + page.len() < total {
-                                Some(start + page.len())
+                            // M165: `?cursor=<lock_id>` is preferred over `?offset=`
+                            // when both are absent the cursor takes the page; the
+                            // response envelope switches to `cursor=<lock_id>` (a
+                            // content-anchored token, stable across inserts).
+                            let keys: Vec<u64> = listing.iter().map(|row| row.0).collect();
+                            let cursor = usize_param(query, "cursor")
+                                .filter(|&c| c <= u64::MAX as usize)
+                                .map(|c| c as u64);
+                            let start = if cursor.is_some() {
+                                key_after(&keys, cursor.as_ref())
                             } else {
-                                None
+                                usize_param(query, "offset").unwrap_or(0)
                             };
+                            let limit = effective_limit(usize_param(query, "limit"));
+                            let total = listing.len();
+                            let page = &listing[start..(start + limit).min(total)];
+                            let cur =
+                                last_key(&keys[start..(start + page.len())]).map(|k| k.to_string());
                             ok_body(
                                 fmt,
-                                &format_page(&format_lock_listing(page), total, next),
-                                &json_page(&json_lock_listing(page), total, next),
+                                &format_page_cursor(
+                                    &format_lock_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
+                                &json_page_cursor(&json_lock_listing(page), total, cur.as_deref()),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -5726,26 +5821,40 @@ async fn serve_rpc_conn(
                 // M83: plain validator-set directory — always a (possibly empty) `200`.
                 // Reuses the whole M72/M79/M81 pagination stack verbatim, the second
                 // consumer after `/bridge/locks` (proving the renderers are generic).
+                // M165: stable `?cursor=<id>` cursor with `cursor=` envelope; the
+                // listing is sorted by `Validator.id` so the cursor is monotonic.
                 let (reply, rx) = oneshot::channel();
                 if cmd.send(Cmd::QueryValidators { reply }).is_err() {
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
                         Ok(listing) => {
-                            let offset = usize_param(query, "offset").unwrap_or(0);
-                            let limit = Some(effective_limit(usize_param(query, "limit")));
-                            let total = listing.len();
-                            let page = paginate(&listing, offset, limit);
-                            let start = offset.min(total);
-                            let next = if start + page.len() < total {
-                                Some(start + page.len())
+                            let keys: Vec<u64> = listing.iter().map(|v| v.id).collect();
+                            let cursor = usize_param(query, "cursor")
+                                .filter(|&c| c <= u64::MAX as usize)
+                                .map(|c| c as u64);
+                            let start = if cursor.is_some() {
+                                key_after(&keys, cursor.as_ref())
                             } else {
-                                None
+                                usize_param(query, "offset").unwrap_or(0)
                             };
+                            let limit = effective_limit(usize_param(query, "limit"));
+                            let total = listing.len();
+                            let page = &listing[start..(start + limit).min(total)];
+                            let cur =
+                                last_key(&keys[start..(start + page.len())]).map(|k| k.to_string());
                             ok_body(
                                 fmt,
-                                &format_page(&format_validator_listing(page), total, next),
-                                &json_page(&json_validator_listing(page), total, next),
+                                &format_page_cursor(
+                                    &format_validator_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
+                                &json_page_cursor(
+                                    &json_validator_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -5756,26 +5865,39 @@ async fn serve_rpc_conn(
                 // M84: plain account/balances directory — always a (possibly empty) `200`.
                 // Third consumer of the pagination stack (after `/bridge/locks` and
                 // `/validators`), reusing `format_account`/`json_account` per item.
+                // M165: stable `?cursor=<account_id>` cursor.
                 let (reply, rx) = oneshot::channel();
                 if cmd.send(Cmd::QueryAccounts { reply }).is_err() {
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
                         Ok(listing) => {
-                            let offset = usize_param(query, "offset").unwrap_or(0);
-                            let limit = Some(effective_limit(usize_param(query, "limit")));
-                            let total = listing.len();
-                            let page = paginate(&listing, offset, limit);
-                            let start = offset.min(total);
-                            let next = if start + page.len() < total {
-                                Some(start + page.len())
+                            let keys: Vec<u64> = listing.iter().map(|(id, _)| *id).collect();
+                            let cursor = usize_param(query, "cursor")
+                                .filter(|&c| c <= u64::MAX as usize)
+                                .map(|c| c as u64);
+                            let start = if cursor.is_some() {
+                                key_after(&keys, cursor.as_ref())
                             } else {
-                                None
+                                usize_param(query, "offset").unwrap_or(0)
                             };
+                            let limit = effective_limit(usize_param(query, "limit"));
+                            let total = listing.len();
+                            let page = &listing[start..(start + limit).min(total)];
+                            let cur =
+                                last_key(&keys[start..(start + page.len())]).map(|k| k.to_string());
                             ok_body(
                                 fmt,
-                                &format_page(&format_account_listing(page), total, next),
-                                &json_page(&json_account_listing(page), total, next),
+                                &format_page_cursor(
+                                    &format_account_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
+                                &json_page_cursor(
+                                    &json_account_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -5785,27 +5907,40 @@ async fn serve_rpc_conn(
             GetRoute::Reviewers => {
                 // M85: plain reviewer directory — always a (possibly empty) `200`. Fourth
                 // consumer of the pagination stack (after `/bridge/locks`, `/validators`,
-                // `/accounts`), reusing `format_entity`/`json_entity` per item.
+                // `/accounts`), reusing `format_entity`/`json_entity` per item. M165:
+                // stable `?cursor=<reviewer_id>` cursor.
                 let (reply, rx) = oneshot::channel();
                 if cmd.send(Cmd::QueryReviewers { reply }).is_err() {
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
                         Ok(listing) => {
-                            let offset = usize_param(query, "offset").unwrap_or(0);
-                            let limit = Some(effective_limit(usize_param(query, "limit")));
-                            let total = listing.len();
-                            let page = paginate(&listing, offset, limit);
-                            let start = offset.min(total);
-                            let next = if start + page.len() < total {
-                                Some(start + page.len())
+                            let keys: Vec<u64> = listing.iter().map(|(id, _)| *id).collect();
+                            let cursor = usize_param(query, "cursor")
+                                .filter(|&c| c <= u64::MAX as usize)
+                                .map(|c| c as u64);
+                            let start = if cursor.is_some() {
+                                key_after(&keys, cursor.as_ref())
                             } else {
-                                None
+                                usize_param(query, "offset").unwrap_or(0)
                             };
+                            let limit = effective_limit(usize_param(query, "limit"));
+                            let total = listing.len();
+                            let page = &listing[start..(start + limit).min(total)];
+                            let cur =
+                                last_key(&keys[start..(start + page.len())]).map(|k| k.to_string());
                             ok_body(
                                 fmt,
-                                &format_page(&format_reviewer_listing(page), total, next),
-                                &json_page(&json_reviewer_listing(page), total, next),
+                                &format_page_cursor(
+                                    &format_reviewer_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
+                                &json_page_cursor(
+                                    &json_reviewer_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -5816,27 +5951,38 @@ async fn serve_rpc_conn(
                 // M86: plain cognitive-graph directory — always a (possibly empty) `200`.
                 // Fifth consumer of the pagination stack (after `/bridge/locks`,
                 // `/validators`, `/accounts`, `/reviewers`), reusing `format_entity`/
-                // `json_entity` per item.
+                // `json_entity` per item. M165: stable `?cursor=<node_id>` cursor;
+                // graph nodes are append-only (node_id == index) so the cursor is
+                // monotonically aligned with the listing order.
                 let (reply, rx) = oneshot::channel();
                 if cmd.send(Cmd::QueryGraphNodes { reply }).is_err() {
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
                         Ok(listing) => {
-                            let offset = usize_param(query, "offset").unwrap_or(0);
-                            let limit = Some(effective_limit(usize_param(query, "limit")));
-                            let total = listing.len();
-                            let page = paginate(&listing, offset, limit);
-                            let start = offset.min(total);
-                            let next = if start + page.len() < total {
-                                Some(start + page.len())
+                            let keys: Vec<u64> =
+                                listing.iter().enumerate().map(|(i, _)| i as u64).collect();
+                            let cursor = usize_param(query, "cursor")
+                                .filter(|&c| c <= u64::MAX as usize)
+                                .map(|c| c as u64);
+                            let start = if cursor.is_some() {
+                                key_after(&keys, cursor.as_ref())
                             } else {
-                                None
+                                usize_param(query, "offset").unwrap_or(0)
                             };
+                            let limit = effective_limit(usize_param(query, "limit"));
+                            let total = listing.len();
+                            let page = &listing[start..(start + limit).min(total)];
+                            let cur =
+                                last_key(&keys[start..(start + page.len())]).map(|k| k.to_string());
                             ok_body(
                                 fmt,
-                                &format_page(&format_graph_listing(page), total, next),
-                                &json_page(&json_graph_listing(page), total, next),
+                                &format_page_cursor(
+                                    &format_graph_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
+                                &json_page_cursor(&json_graph_listing(page), total, cur.as_deref()),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -5851,6 +5997,8 @@ async fn serve_rpc_conn(
                 // micro-$COG Σ of the *whole* bonds map (the value folded into `state.bonded`
                 // and visible at `/supply` as `bonded=`) so an operator can audit a single
                 // invariant (`Σ bonded == state.bonded`) without joining two endpoints.
+                // M165: stable `?cursor=<validator_id>` cursor; bond *amounts* may
+                // change every stake-op, so the cursor anchors on id, not amount.
                 let (reply, rx) = oneshot::channel();
                 if cmd.send(Cmd::QueryBonds { reply }).is_err() {
                     http_response("503 Service Unavailable", "node stopped")
@@ -5858,25 +6006,29 @@ async fn serve_rpc_conn(
                     match rx.await {
                         Ok(listing) => {
                             let total_bonded: u64 = listing.iter().map(|&(_, b)| b).sum();
-                            let offset = usize_param(query, "offset").unwrap_or(0);
-                            let limit = Some(effective_limit(usize_param(query, "limit")));
-                            let total = listing.len();
-                            let page = paginate(&listing, offset, limit);
-                            let start = offset.min(total);
-                            let next = if start + page.len() < total {
-                                Some(start + page.len())
+                            let keys: Vec<u64> = listing.iter().map(|(id, _)| *id).collect();
+                            let cursor = usize_param(query, "cursor")
+                                .filter(|&c| c <= u64::MAX as usize)
+                                .map(|c| c as u64);
+                            let start = if cursor.is_some() {
+                                key_after(&keys, cursor.as_ref())
                             } else {
-                                None
+                                usize_param(query, "offset").unwrap_or(0)
                             };
+                            let limit = effective_limit(usize_param(query, "limit"));
+                            let total = listing.len();
+                            let page = &listing[start..(start + limit).min(total)];
+                            let cur =
+                                last_key(&keys[start..(start + page.len())]).map(|k| k.to_string());
                             let summary = format!("total_bonded={total_bonded}");
                             let items = format!("{summary}\n{}", format_bond_listing(page));
                             ok_body(
                                 fmt,
-                                &format_page(&items, total, next),
-                                &json_bond_page(
+                                &format_page_cursor(&items, total, cur.as_deref()),
+                                &json_bond_page_cursor(
                                     &json_bond_listing(page),
                                     total,
-                                    next,
+                                    cur.as_deref(),
                                     total_bonded,
                                 ),
                             )
@@ -5992,26 +6144,36 @@ async fn serve_rpc_conn(
                 // M91: connected-peer directory — always a (possibly empty) `200`. Tenth
                 // consumer of the pagination stack and the first daemon-level read (peers live
                 // on the actor, not chain state), reusing `format_peer`/`json_peer` per item.
+                // M165: stable `?cursor=<peer_id>` cursor; the listing is sorted by
+                // `peer_id` (M91 doc) so the cursor is monotonic.
                 let (reply, rx) = oneshot::channel();
                 if cmd.send(Cmd::QueryPeers { reply }).is_err() {
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
                         Ok(listing) => {
-                            let offset = usize_param(query, "offset").unwrap_or(0);
-                            let limit = Some(effective_limit(usize_param(query, "limit")));
-                            let total = listing.len();
-                            let page = paginate(&listing, offset, limit);
-                            let start = offset.min(total);
-                            let next = if start + page.len() < total {
-                                Some(start + page.len())
+                            let keys: Vec<u64> = listing.iter().map(|(id, _)| *id).collect();
+                            let cursor = usize_param(query, "cursor")
+                                .filter(|&c| c <= u64::MAX as usize)
+                                .map(|c| c as u64);
+                            let start = if cursor.is_some() {
+                                key_after(&keys, cursor.as_ref())
                             } else {
-                                None
+                                usize_param(query, "offset").unwrap_or(0)
                             };
+                            let limit = effective_limit(usize_param(query, "limit"));
+                            let total = listing.len();
+                            let page = &listing[start..(start + limit).min(total)];
+                            let cur =
+                                last_key(&keys[start..(start + page.len())]).map(|k| k.to_string());
                             ok_body(
                                 fmt,
-                                &format_page(&format_peer_listing(page), total, next),
-                                &json_page(&json_peer_listing(page), total, next),
+                                &format_page_cursor(
+                                    &format_peer_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
+                                &json_page_cursor(&json_peer_listing(page), total, cur.as_deref()),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -6078,27 +6240,43 @@ async fn serve_rpc_conn(
             }
             GetRoute::BlockTxs(height) => {
                 // M114: the tx references of a committed block — a paginated list, or 404 when
-                // there is no committed block at `height`.
+                // there is no committed block at `height`. M165: stable `?cursor=<tx_hash_hex>`
+                // cursor inside the block (the outer anchor `height` is unchanged); once
+                // committed, block contents are immutable, so a hash cursor is a perfect
+                // stable key.
                 let (reply, rx) = oneshot::channel();
                 if cmd.send(Cmd::QueryBlockTxs { height, reply }).is_err() {
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
                         Ok(Some(listing)) => {
-                            let offset = usize_param(query, "offset").unwrap_or(0);
-                            let limit = Some(effective_limit(usize_param(query, "limit")));
-                            let total = listing.len();
-                            let page = paginate(&listing, offset, limit);
-                            let start = offset.min(total);
-                            let next = if start + page.len() < total {
-                                Some(start + page.len())
+                            let keys: Vec<crate::Hash> = listing.iter().map(|(h, _)| *h).collect();
+                            let cursor = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("cursor="))
+                                .and_then(crate::hash::from_hex);
+                            let start = if cursor.is_some() {
+                                key_after(&keys, cursor.as_ref())
                             } else {
-                                None
+                                usize_param(query, "offset").unwrap_or(0)
                             };
+                            let limit = effective_limit(usize_param(query, "limit"));
+                            let total = listing.len();
+                            let page = &listing[start..(start + limit).min(total)];
+                            let cur = last_key(&keys[start..(start + page.len())])
+                                .map(|h| crate::hash::hex(h));
                             ok_body(
                                 fmt,
-                                &format_page(&format_block_tx_listing(page), total, next),
-                                &json_page(&json_block_tx_listing(page), total, next),
+                                &format_page_cursor(
+                                    &format_block_tx_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
+                                &json_page_cursor(
+                                    &json_block_tx_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
                             )
                         }
                         Ok(None) => {
@@ -6117,27 +6295,45 @@ async fn serve_rpc_conn(
             GetRoute::MempoolList => {
                 // M111: pending-tx directory (hash + author) — always a (possibly empty) `200`.
                 // The missing pending-pool list beside `/stake-ops` and `/evidence`; reuses the
-                // pagination stack + `format_pending_tx`/`json_pending_tx` per item.
+                // pagination stack + `format_pending_tx`/`json_pending_tx` per item. M165:
+                // stable `?cursor=<tx_hash_hex>` cursor; the listing is sorted by content
+                // hash (M111 doc) so the cursor is a stable monotonic content token.
                 let (reply, rx) = oneshot::channel();
                 if cmd.send(Cmd::QueryMempool { reply }).is_err() {
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
                         Ok(listing) => {
-                            let offset = usize_param(query, "offset").unwrap_or(0);
-                            let limit = Some(effective_limit(usize_param(query, "limit")));
-                            let total = listing.len();
-                            let page = paginate(&listing, offset, limit);
-                            let start = offset.min(total);
-                            let next = if start + page.len() < total {
-                                Some(start + page.len())
+                            let keys: Vec<crate::Hash> = listing.iter().map(|(h, _)| *h).collect();
+                            // Parse `?cursor=<64-char lowercase hex>`; any unparseable
+                            // cursor is silently treated as "no cursor" (matches the
+                            // M81 `usize_param` contract for offset).
+                            let cursor = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("cursor="))
+                                .and_then(crate::hash::from_hex);
+                            let start = if cursor.is_some() {
+                                key_after(&keys, cursor.as_ref())
                             } else {
-                                None
+                                usize_param(query, "offset").unwrap_or(0)
                             };
+                            let limit = effective_limit(usize_param(query, "limit"));
+                            let total = listing.len();
+                            let page = &listing[start..(start + limit).min(total)];
+                            let cur = last_key(&keys[start..(start + page.len())])
+                                .map(|h| crate::hash::hex(h));
                             ok_body(
                                 fmt,
-                                &format_page(&format_mempool_listing(page), total, next),
-                                &json_page(&json_mempool_listing(page), total, next),
+                                &format_page_cursor(
+                                    &format_mempool_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
+                                &json_page_cursor(
+                                    &json_mempool_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -10104,7 +10300,7 @@ mod tests {
         );
         assert_eq!(
             body_of(&paged_json),
-            "{\"total\":\"0\",\"next\":null,\"items\":[]}",
+            "{\"total\":\"0\",\"cursor\":null,\"items\":[]}",
             "empty window → total=0 JSON envelope"
         );
 
@@ -10160,7 +10356,9 @@ mod tests {
         }
         let pubkey_hex = crate::hash::hex(&kp(24).public());
 
-        // Plain directory → 200 with the single genesis validator.
+        // Plain directory → 200 with the single genesis validator. M165: the
+        // envelope now carries `cursor=<id>` (the natural key of the last row)
+        // instead of M79's positional `next=`.
         let resp = get(rpc_addr, "/validators").await;
         assert!(
             resp.starts_with("HTTP/1.1 200 OK"),
@@ -10168,11 +10366,13 @@ mod tests {
         );
         assert_eq!(
             body_of(&resp),
-            format!("total=1\nvalidator_id=24 power=1 pubkey={pubkey_hex}"),
-            "single-validator text envelope"
+            format!("total=1\ncursor=24\nvalidator_id=24 power=1 pubkey={pubkey_hex}"),
+            "single-validator text envelope (with M165 cursor)"
         );
 
-        // JSON representation → the `total`/`next`/`items` envelope with the validator.
+        // JSON representation → the `total`/`cursor`/`items` envelope with the validator
+        // (M165: `cursor=` replaces the M79 `next=` field, anchored to the natural
+        // `validator_id` key rather than a byte offset).
         let as_json = get(rpc_addr, "/validators?format=json").await;
         assert!(
             as_json.starts_with("HTTP/1.1 200 OK"),
@@ -10185,13 +10385,13 @@ mod tests {
         assert_eq!(
             body_of(&as_json),
             format!(
-                "{{\"total\":\"1\",\"next\":null,\"items\":\
+                "{{\"total\":\"1\",\"cursor\":\"24\",\"items\":\
                  [{{\"validator_id\":\"24\",\"power\":\"1\",\"pubkey\":\"{pubkey_hex}\"}}]}}"
             ),
             "single-validator JSON envelope"
         );
 
-        // `?offset=1` windows past the only validator → empty page, no `next` (end reached).
+        // `?offset=1` windows past the only validator → empty page, no `cursor` (end reached).
         let past = get(rpc_addr, "/validators?offset=1").await;
         assert!(past.starts_with("HTTP/1.1 200 OK"), "offset status: {past}");
         assert_eq!(
@@ -10200,7 +10400,10 @@ mod tests {
             "offset past end → total=1, empty page"
         );
 
-        // `?limit=0` is an explicit empty page, but another page remains → `next=0`.
+        // `?limit=0` is an explicit empty page; the listing has 1 row, so `total=1`
+        // alone signals "more pages exist" (the client can request `?limit=1`).
+        // M165: an empty page emits no `cursor=` line (matches the original M79
+        // contract for `?limit=0`; clients consult `total` to know there's more).
         let empty = get(rpc_addr, "/validators?limit=0").await;
         assert!(
             empty.starts_with("HTTP/1.1 200 OK"),
@@ -10208,8 +10411,8 @@ mod tests {
         );
         assert_eq!(
             body_of(&empty),
-            "total=1\nnext=0",
-            "limit=0 → empty page with next=0"
+            "total=1",
+            "limit=0 → empty page, no cursor (total still says 1 row remains)"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -10274,7 +10477,8 @@ mod tests {
             nonce: 0,
         };
 
-        // Plain directory → 200 with the single account.
+        // Plain directory → 200 with the single account. M165: the envelope now
+        // carries `cursor=<account_id>` (the natural key of the last row).
         let resp = get(rpc_addr, "/accounts").await;
         assert!(
             resp.starts_with("HTTP/1.1 200 OK"),
@@ -10282,11 +10486,13 @@ mod tests {
         );
         assert_eq!(
             body_of(&resp),
-            format!("total=1\n{}", format_account(1, &want)),
-            "single-account text envelope"
+            format!("total=1\ncursor=1\n{}", format_account(1, &want)),
+            "single-account text envelope (with M165 cursor)"
         );
 
-        // JSON representation → the `total`/`next`/`items` envelope with the account.
+        // JSON representation → the `total`/`cursor`/`items` envelope with the account
+        // (M165: `cursor=` replaces the M79 `next=` field, anchored to the natural
+        // `account_id` key rather than a byte offset).
         let as_json = get(rpc_addr, "/accounts?format=json").await;
         assert!(
             as_json.starts_with("HTTP/1.1 200 OK"),
@@ -10299,13 +10505,13 @@ mod tests {
         assert_eq!(
             body_of(&as_json),
             format!(
-                "{{\"total\":\"1\",\"next\":null,\"items\":[{}]}}",
+                "{{\"total\":\"1\",\"cursor\":\"1\",\"items\":[{}]}}",
                 json_account(1, &want)
             ),
             "single-account JSON envelope"
         );
 
-        // `?offset=1` windows past the only account → empty page, no `next`.
+        // `?offset=1` windows past the only account → empty page, no `cursor`.
         let past = get(rpc_addr, "/accounts?offset=1").await;
         assert!(past.starts_with("HTTP/1.1 200 OK"), "offset status: {past}");
         assert_eq!(
@@ -10314,7 +10520,9 @@ mod tests {
             "offset past end → total=1, empty page"
         );
 
-        // `?limit=0` is an explicit empty page, but another page remains → `next=0`.
+        // `?limit=0` is an explicit empty page; `total=1` signals more pages exist
+        // (M165: empty page emits no `cursor=` line — same as the M79 contract for
+        // `?limit=0`; clients consult `total` to know there's more).
         let empty = get(rpc_addr, "/accounts?limit=0").await;
         assert!(
             empty.starts_with("HTTP/1.1 200 OK"),
@@ -10322,8 +10530,8 @@ mod tests {
         );
         assert_eq!(
             body_of(&empty),
-            "total=1\nnext=0",
-            "limit=0 → empty page with next=0"
+            "total=1",
+            "limit=0 → empty page, no cursor"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -10387,7 +10595,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
 
-        // Plain directory → 200 with all three reviewers (id order).
+        // Plain directory → 200 with all three reviewers (id order). M165: envelope
+        // now carries `cursor=12` (the natural key of the last row, reviewer_id 12).
         let resp = get(rpc_addr, "/reviewers").await;
         assert!(
             resp.starts_with("HTTP/1.1 200 OK"),
@@ -10395,11 +10604,13 @@ mod tests {
         );
         assert_eq!(
             body_of(&resp),
-            format!("total=3\n{text_lines}"),
-            "reviewer text envelope"
+            format!("total=3\ncursor=12\n{text_lines}"),
+            "reviewer text envelope (with M165 cursor)"
         );
 
-        // JSON representation → the `total`/`next`/`items` envelope with the reviewers.
+        // JSON representation → the `total`/`cursor`/`items` envelope with the reviewers
+        // (M165: `cursor=` replaces the M79 `next=` field; the cursor value is the natural
+        // `reviewer_id` of the last row, here 12).
         let as_json = get(rpc_addr, "/reviewers?format=json").await;
         assert!(
             as_json.starts_with("HTTP/1.1 200 OK"),
@@ -10411,26 +10622,27 @@ mod tests {
         );
         assert_eq!(
             body_of(&as_json),
-            format!("{{\"total\":\"3\",\"next\":null,\"items\":[{json_items}]}}"),
+            format!("{{\"total\":\"3\",\"cursor\":\"12\",\"items\":[{json_items}]}}"),
             "reviewer JSON envelope"
         );
 
-        // `?offset=1&limit=1` windows the middle reviewer, with a `next` cursor.
+        // `?offset=1&limit=1` windows the middle reviewer, with a `cursor` token = 11
+        // (the last id in the page — passing `?cursor=11` next yields the row after 11).
         let mid = get(rpc_addr, "/reviewers?offset=1&limit=1").await;
         assert!(mid.starts_with("HTTP/1.1 200 OK"), "offset status: {mid}");
         assert_eq!(
             body_of(&mid),
             format!(
-                "total=3\nnext=2\n{}",
+                "total=3\ncursor=11\n{}",
                 format_entity(&EntityView::Reviewer {
                     id: 11,
                     reputation: 1.0
                 })
             ),
-            "middle window → total=3, next=2, one line"
+            "middle window → total=3, cursor=11, one line"
         );
 
-        // `?offset=3` windows past the last reviewer → empty page, no `next`.
+        // `?offset=3` windows past the last reviewer → empty page, no `cursor`.
         let past = get(rpc_addr, "/reviewers?offset=3").await;
         assert!(
             past.starts_with("HTTP/1.1 200 OK"),
@@ -10498,16 +10710,19 @@ mod tests {
             embedding: unit(0),
         };
 
-        // Plain directory → 200 with the single node.
+        // Plain directory → 200 with the single node. M165: envelope now carries
+        // `cursor=0` (the natural key of the last row, node_id 0).
         let resp = get(rpc_addr, "/graph").await;
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "graph status: {resp}");
         assert_eq!(
             body_of(&resp),
-            format!("total=1\n{}", format_entity(&want)),
+            format!("total=1\ncursor=0\n{}", format_entity(&want)),
             "graph text envelope"
         );
 
-        // JSON representation → the `total`/`next`/`items` envelope with the node.
+        // JSON representation → the `total`/`cursor`/`items` envelope with the node
+        // (M165: `cursor=` replaces the M79 `next=` field; cursor value is the natural
+        // `node_id` of the last row, here 0).
         let as_json = get(rpc_addr, "/graph?format=json").await;
         assert!(
             as_json.starts_with("HTTP/1.1 200 OK"),
@@ -10520,13 +10735,13 @@ mod tests {
         assert_eq!(
             body_of(&as_json),
             format!(
-                "{{\"total\":\"1\",\"next\":null,\"items\":[{}]}}",
+                "{{\"total\":\"1\",\"cursor\":\"0\",\"items\":[{}]}}",
                 json_entity(&want)
             ),
             "graph JSON envelope"
         );
 
-        // `?offset=1` windows past the only node → empty page, no `next`.
+        // `?offset=1` windows past the only node → empty page, no `cursor`.
         let past = get(rpc_addr, "/graph?offset=1").await;
         assert!(past.starts_with("HTTP/1.1 200 OK"), "offset status: {past}");
         assert_eq!(
@@ -10596,7 +10811,9 @@ mod tests {
             "bonds text envelope (empty directory, with M137 Σ)"
         );
 
-        // JSON representation → the `total`/`next`/`total_bonded`/`items` envelope (empty array).
+        // JSON representation → the `total`/`cursor`/`total_bonded`/`items` envelope
+        // (empty array). M165: `cursor=` replaces M79's `next=`; same JSON ordering as
+        // `json_bond_page_cursor`.
         let as_json = get(rpc_addr, "/bonds?format=json").await;
         assert!(
             as_json.starts_with("HTTP/1.1 200 OK"),
@@ -10608,7 +10825,7 @@ mod tests {
         );
         assert_eq!(
             body_of(&as_json),
-            "{\"total\":\"0\",\"next\":null,\"total_bonded\":\"0\",\"items\":[]}",
+            "{\"total\":\"0\",\"cursor\":null,\"total_bonded\":\"0\",\"items\":[]}",
             "bonds JSON envelope (empty directory, with M137 Σ)"
         );
 
@@ -10905,7 +11122,8 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "peers status: {resp}");
         assert_eq!(body_of(&resp), "total=0", "peers text envelope (no peers)");
 
-        // JSON representation → the `total`/`next`/`items` envelope with an empty array.
+        // JSON representation → the `total`/`cursor`/`items` envelope with an empty
+        // array (M165: `cursor=` replaces M79's `next=`; cursor is `null` for empty listings).
         let as_json = get(rpc_addr, "/peers?format=json").await;
         assert!(
             as_json.starts_with("HTTP/1.1 200 OK"),
@@ -10917,7 +11135,7 @@ mod tests {
         );
         assert_eq!(
             body_of(&as_json),
-            "{\"total\":\"0\",\"next\":null,\"items\":[]}",
+            "{\"total\":\"0\",\"cursor\":null,\"items\":[]}",
             "peers JSON envelope (no peers)"
         );
 
@@ -12644,6 +12862,82 @@ mod tests {
             "{\"total\":\"0\",\"next\":null,\"items\":[]}"
         );
         assert_eq!(format_page("", 0, None), "total=0");
+    }
+
+    #[test]
+    fn cursor_pagination_helpers() {
+        // M165: `key_after` and `last_key` are the cursor-pagination primitives. A
+        // sorted `keys` slice is partitioned at the first key strictly greater than
+        // the cursor; the last key of a non-empty window is the next-page cursor.
+        // Empty cursor ⇒ start at 0; missing-then-found cursor ⇒ correct partition;
+        // cursor past every key ⇒ `keys.len()`; empty keys ⇒ cursor of `None`.
+        let keys: Vec<u64> = vec![10, 20, 30, 40, 50];
+        assert_eq!(key_after(&keys, None), 0);
+        assert_eq!(key_after(&keys, Some(&0)), 0);
+        assert_eq!(key_after(&keys, Some(&10)), 1); // strictly greater than 10
+        assert_eq!(key_after(&keys, Some(&25)), 2); // partition between 20 and 30
+        assert_eq!(key_after(&keys, Some(&30)), 3);
+        assert_eq!(key_after(&keys, Some(&49)), 4);
+        assert_eq!(key_after(&keys, Some(&50)), 5); // past every key
+        assert_eq!(key_after(&keys, Some(&1000)), 5);
+
+        // last_key: end-of-page token, None on empty.
+        let empty: Vec<u64> = vec![];
+        assert_eq!(last_key(&empty), None);
+        assert_eq!(last_key(&keys[..0]), None);
+        assert_eq!(last_key(&keys[..1]), Some(&10));
+        assert_eq!(last_key(&keys), Some(&50));
+
+        // Hash-keyed: content-anchored cursor (the natural use case for /mempool
+        // and /block/{h}/txs). All 32-byte values are Ord-comparable.
+        let h = |a, b| {
+            let mut out = [0u8; 32];
+            out[0] = a;
+            out[1] = b;
+            out
+        };
+        let hk: Vec<[u8; 32]> = vec![h(0, 1), h(1, 0), h(2, 2)];
+        assert_eq!(key_after(&hk, Some(&h(0, 0))), 0);
+        assert_eq!(key_after(&hk, Some(&h(0, 1))), 1);
+        assert_eq!(key_after(&hk, Some(&h(1, 0))), 2);
+        assert_eq!(key_after(&hk, Some(&h(2, 2))), 3);
+        assert_eq!(last_key(&hk[..1]), Some(&h(0, 1)));
+    }
+
+    #[test]
+    fn cursor_page_envelopes() {
+        // M165: `format_page_cursor` / `json_page_cursor` carry a content-anchored
+        // `cursor=<key>` token instead of the M79 positional `next=<offset>`. The
+        // cursor value is the natural key of the last row in the page (a u64
+        // formatted as a JSON string, a hex hash for hash-keyed listings); the
+        // `cursor=` line / `cursor` field is absent / `null` once the page reaches
+        // the tail. M79's offset-based helpers are unchanged for endpoints without
+        // a natural key (/unbonding, /stake-ops, /evidence).
+        assert_eq!(
+            json_page_cursor("[{\"x\":1}]", 3, Some("42")),
+            "{\"total\":\"3\",\"cursor\":\"42\",\"items\":[{\"x\":1}]}"
+        );
+        assert_eq!(
+            format_page_cursor("lock_id=0 …", 3, Some("42")),
+            "total=3\ncursor=42\nlock_id=0 …"
+        );
+
+        // Tail of the listing: cursor is `None` / JSON `null`, identical to M79.
+        assert_eq!(
+            json_page_cursor("[{\"x\":9}]", 3, None),
+            "{\"total\":\"3\",\"cursor\":null,\"items\":[{\"x\":9}]}"
+        );
+        assert_eq!(
+            format_page_cursor("lock_id=2 …", 3, None),
+            "total=3\nlock_id=2 …"
+        );
+
+        // Empty listing: empty items, no cursor.
+        assert_eq!(
+            json_page_cursor("[]", 0, None),
+            "{\"total\":\"0\",\"cursor\":null,\"items\":[]}"
+        );
+        assert_eq!(format_page_cursor("", 0, None), "total=0");
     }
 
     #[test]

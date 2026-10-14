@@ -1367,6 +1367,19 @@ M156/M158 给 RPC 写路径与 `/metrics` 加了可选 bearer 鉴权，M160 把�
 - **测试（+0 → 624）**：扩展 `metrics_endpoint_bearer_auth_gates_scrapes`（两次 401 后正确 scrape 断言 `zhixing_metrics_auth_failures_total 2`）+ `render_prometheus_emits_counters`（两新 counter 入期望表）。
 - **已知边界**：`Relaxed` 顺序足够（单调自增 + 读快照，无跨变量不变量）；轻节点 RPC（M152）/metrics（M155）走独立 `LightActor` 无 bearer，不涉及。bearer 失败响应延迟 jitter、counter `_created` 时间戳属后续篮子。
 
+## 列表读端点稳定游标分页（Milestone 165 · 游标协议）
+
+M72/M79/M81 的 `?offset=` / `?limit=` + `next=` 信封用**列表内字节偏移**作游标——客户端在分页期间若新行被插入（M141 验人集扩、`/bonds` 金额变化、`/mempool` 持续 churn），结果会**重复或漏行**。M165 给 8 个有自然内容键的列表端点加**稳定游标**（content-anchored）。
+
+- **新协议**（`daemon.rs`）：`?cursor=<key>` 优先于 `?offset=`；响应信封 `next=<offset>` → `cursor=<key>`（最后行的自然键）。`?offset=` 仍 100% 向后兼容（运营脚本无须立刻改）。新增 `key_after`/`last_key` 纯函数 + `format_page_cursor`/`json_page_cursor` 渲染 + `json_bond_page_cursor`。
+- **采纳端点（8 + 1）**：`/bridge/locks`（lock_id u64）、`/validators`（id u64）、`/accounts`（account_id u64）、`/reviewers`（reviewer_id u64）、`/graph`（node_id == index u64）、`/bonds`（validator_id u64；金额不计）、`/mempool`（tx `Hash` hex）、`/peers`（peer_id u64）、`/block/{h}/txs`（tx `Hash` hex）。每端点：解析 `?cursor=` ⇒ `key_after` 切 ⇒ `last_key` 算下一页 cursor。
+- **保留 `next=` 的 3 端点**（无自然键）：`/unbonding`/`/stake-ops`/`/evidence`（入池顺序 + 每块 drain）。README 标"offset-based, not stable across blocks"；这是 M165 信封字段分裂为代价换**准确性**——为这 3 端编造 cursor 不诚实。
+- **Hash 游标**：`crate::hash::from_hex` 新加（严格 64 字符 lowercase），失败时静默当未设（同 `usize_param` 行为）；游标值由 `crate::hash::hex` 生成。
+- **空页 + limit=0**：page 为空时**不**发 `cursor=` 行（与 M79 一致）；客户端看 `total=N` 知道有更多。
+- **不碰** `paginate`/`effective_limit`/`usize_param` 分页基础原语；不碰 `/unbonding`/`/stake-ops`/`/evidence` 协议；不碰共识/codec/wire；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+2 → 630）**：新纯 `cursor_pagination_helpers`（`key_after`/`last_key` 各种 cursor 场景含 hash）+ `cursor_page_envelopes`（`format_page_cursor`/`json_page_cursor` 5 断言）；扩展 6 个端点既有 in-process 测（`rpc_*_list_over_tcp`）更新为 `cursor=` 信封。
+- **已知边界**：8 端点**端点契约小破坏**——响应字段名 `next`→`cursor`，值语义从位置变内容键。运营脚本要更新；3 端点仍 `next=`。`/unbonding`/`/stake-ops`/`/evidence` 内容键（tx hash 或复合键）属后续篮子。`?cursor=garbage` 静默忽略（不返 400）以保持 `?offset=` 风格的宽容度。
+
 ## mempool 剩余拒绝路径计数指标（Milestone 162 · 反垃圾可观测收尾）
 
 M161 补了 min-fee floor 的 counter，但 mempool 另外四条 opt-in 拒路径仍无计数——运维无从判断 `[mempool] capacity / nonce_lookahead / replace_by_fee` 及反重放实际拦了多少。M162 一次性补齐，全部照 M161 范式（mempool 内部 `rejected_*: u64` + getter → `Metrics` 字段 → `render_prometheus` counter，**仅 `insert` 路径计数**）。
