@@ -38,6 +38,44 @@ pub struct Mempool {
     /// M57: cumulative admissions rejected by the per-account quota (observability;
     /// surfaced as a metrics counter).
     rejected_quota: u64,
+    /// M143: how many future nonces beyond an account's current one the pool will
+    /// buffer. `0` ⇒ strict (only `tx.nonce == acct.nonce` admitted — byte-identical
+    /// to the pre-M143 one-pending-tx-per-account behavior; the default). `N` ⇒ an
+    /// account may hold txs with `acct.nonce <= tx.nonce <= acct.nonce + N`, which the
+    /// builder then lays into one block in nonce order.
+    nonce_lookahead: usize,
+    /// M144: when `true`, admitting a tx at a `(author, nonce)` already held by a
+    /// pending tx *replaces* it iff the newcomer bids a strictly higher fee (else the
+    /// newcomer is rejected). `false` (default) keeps the pre-M144 behavior — same-slot
+    /// competitors coexist and the builder picks the highest fee at build time.
+    replace_by_fee: bool,
+    /// M145: minimum fee increment a replace-by-fee bid must clear — a replacement is
+    /// admitted only when `new.fee >= incumbent.fee + min_fee_bump`. Default `1`, which
+    /// for integer fees is exactly "strictly higher" (byte-identical to M144). A larger
+    /// value dampens replacement churn (anti-spam); `0` permits equal-fee replacement.
+    /// Only consulted when `replace_by_fee` is on.
+    min_fee_bump: u64,
+    /// M157: operator-configured minimum fee a tx must pay to be admitted (anti-spam
+    /// floor). `0` (default) ⇒ no floor — behavior-preserving. A local admission policy,
+    /// not a consensus rule: a block carrying a below-floor tx still applies.
+    min_fee: u64,
+    /// M161: cumulative admissions rejected by the M157 min-fee floor since boot
+    /// (observability; surfaced as the `zhixing_txs_min_fee_rejected_total` counter).
+    /// `0` while `min_fee == 0` (the floor is off).
+    rejected_min_fee: u64,
+    /// M162: cumulative admissions rejected by the M54 global capacity bound
+    /// (`zhixing_txs_full_rejected_total`; `0` while capacity is unbounded).
+    rejected_full: u64,
+    /// M162: cumulative admissions rejected as a stale (already-consumed) nonce — a
+    /// replay (`zhixing_txs_bad_nonce_rejected_total`).
+    rejected_bad_nonce: u64,
+    /// M162: cumulative admissions rejected for a nonce past the M143 pipelining window
+    /// (`zhixing_txs_nonce_too_far_rejected_total`; `0` under the strict default).
+    rejected_nonce_too_far: u64,
+    /// M162: cumulative admissions rejected because an M144 replace-by-fee bid did not
+    /// clear the incumbent by `min_fee_bump` (`zhixing_txs_replace_fee_rejected_total`;
+    /// `0` while `replace_by_fee` is off).
+    rejected_replace_fee: u64,
 }
 
 impl Mempool {
@@ -49,6 +87,15 @@ impl Mempool {
             per_author: BTreeMap::new(),
             per_account_limit: usize::MAX,
             rejected_quota: 0,
+            nonce_lookahead: 0,
+            replace_by_fee: false,
+            min_fee_bump: 1,
+            min_fee: 0,
+            rejected_min_fee: 0,
+            rejected_full: 0,
+            rejected_bad_nonce: 0,
+            rejected_nonce_too_far: 0,
+            rejected_replace_fee: 0,
         }
     }
 
@@ -79,6 +126,79 @@ impl Mempool {
     /// M57: cumulative admissions rejected by the per-account quota since boot.
     pub fn rejected_quota(&self) -> u64 {
         self.rejected_quota
+    }
+
+    /// M161: cumulative admissions rejected by the M157 min-fee floor since boot
+    /// (monotonic counter; `0` while the floor is off).
+    pub fn rejected_min_fee(&self) -> u64 {
+        self.rejected_min_fee
+    }
+
+    /// M162: cumulative admissions rejected by the M54 global capacity bound since boot.
+    pub fn rejected_full(&self) -> u64 {
+        self.rejected_full
+    }
+
+    /// M162: cumulative admissions rejected as a stale (replayed) nonce since boot.
+    pub fn rejected_bad_nonce(&self) -> u64 {
+        self.rejected_bad_nonce
+    }
+
+    /// M162: cumulative admissions rejected past the M143 nonce pipelining window.
+    pub fn rejected_nonce_too_far(&self) -> u64 {
+        self.rejected_nonce_too_far
+    }
+
+    /// M162: cumulative admissions rejected by an under-bid M144 replace-by-fee attempt.
+    pub fn rejected_replace_fee(&self) -> u64 {
+        self.rejected_replace_fee
+    }
+
+    /// M143: set the nonce pipelining window — how many future nonces beyond an
+    /// account's current one may be buffered. `0` ⇒ strict one-pending-tx-per-account
+    /// (the default, byte-identical to pre-M143). See the field doc.
+    pub fn set_nonce_lookahead(&mut self, lookahead: usize) {
+        self.nonce_lookahead = lookahead;
+    }
+
+    /// M143: the configured nonce pipelining window (`0` ⇒ strict / off).
+    pub fn nonce_lookahead(&self) -> usize {
+        self.nonce_lookahead
+    }
+
+    /// M144: enable/disable replace-by-fee admission. When on, a new tx at a
+    /// `(author, nonce)` already held replaces the incumbent iff it bids a strictly
+    /// higher fee. `false` (default) keeps the pre-M144 coexist-and-pick-at-build rule.
+    pub fn set_replace_by_fee(&mut self, enabled: bool) {
+        self.replace_by_fee = enabled;
+    }
+
+    /// M144: whether replace-by-fee admission is enabled.
+    pub fn replace_by_fee(&self) -> bool {
+        self.replace_by_fee
+    }
+
+    /// M145: set the minimum fee increment a replace-by-fee bid must clear (a
+    /// replacement needs `new.fee >= incumbent.fee + min_fee_bump`). Default `1`
+    /// (= strictly higher). Only consulted when replace-by-fee is on.
+    pub fn set_min_fee_bump(&mut self, min_fee_bump: u64) {
+        self.min_fee_bump = min_fee_bump;
+    }
+
+    /// M145: the configured replace-by-fee minimum increment (default `1`).
+    pub fn min_fee_bump(&self) -> u64 {
+        self.min_fee_bump
+    }
+
+    /// M157: set the minimum-fee admission floor (anti-spam). `0` ⇒ no floor (the
+    /// behavior-preserving default).
+    pub fn set_min_fee(&mut self, min_fee: u64) {
+        self.min_fee = min_fee;
+    }
+
+    /// M157: the configured minimum-fee admission floor (`0` ⇒ off).
+    pub fn min_fee(&self) -> u64 {
+        self.min_fee
     }
 
     pub fn len(&self) -> usize {
@@ -117,11 +237,84 @@ impl Mempool {
     /// account cannot monopolize the pool. Checked after `validate_tx` (the author
     /// is signature-authenticated first) and after the global capacity gate.
     pub fn insert(&mut self, chain: &Chain, tx: SubmissionTx) -> Result<Hash, ChainError> {
-        chain.state.validate_tx(&tx)?;
+        // M157: cheap anti-spam gate first — reject a below-floor fee before the
+        // (costlier) signature/state validation. `min_fee == 0` ⇒ no floor.
+        if self.min_fee > 0 && tx.fee < self.min_fee {
+            self.rejected_min_fee += 1;
+            return Err(ChainError::FeeBelowMinimum {
+                got: tx.fee,
+                min: self.min_fee,
+            });
+        }
+        // M143: validate everything except the nonce, then apply the pipelining window
+        // instead of the strict `tx.nonce == acct.nonce` gate. With `nonce_lookahead == 0`
+        // this is exactly the strict rule (only the current nonce admits), so behavior is
+        // byte-identical to pre-M143.
+        chain.state.validate_tx_ignoring_nonce(&tx)?;
+        let acct_nonce = chain
+            .state
+            .accounts
+            .get(&tx.author)
+            .expect("account existence proven by validate_tx_ignoring_nonce")
+            .nonce;
+        if tx.nonce < acct_nonce {
+            // Stale (already-consumed) nonce — a replay.
+            self.rejected_bad_nonce += 1;
+            return Err(ChainError::BadNonce {
+                account: tx.author,
+                expected: acct_nonce,
+                got: tx.nonce,
+            });
+        }
+        let limit = acct_nonce.saturating_add(self.nonce_lookahead as u64);
+        if tx.nonce > limit {
+            self.rejected_nonce_too_far += 1;
+            return Err(ChainError::NonceTooFarAhead {
+                account: tx.author,
+                got: tx.nonce,
+                limit,
+            });
+        }
         let h = tx.hash();
+        // M144: replace-by-fee. If an incumbent (different content) holds this
+        // `(author, nonce)` slot, replace it only when the newcomer bids a strictly
+        // higher fee; otherwise reject. A same-hash re-insert is not a replacement — it
+        // falls through to the idempotent path below. Collect the incumbent as owned
+        // values first so the immutable borrow ends before we mutate the pool.
+        if self.replace_by_fee {
+            let incumbent = self
+                .pending
+                .iter()
+                .find(|(ih, t)| t.author == tx.author && t.nonce == tx.nonce && **ih != h)
+                .map(|(ih, t)| (*ih, t.fee));
+            if let Some((inc_hash, inc_fee)) = incumbent {
+                // M145: require the bid to clear the incumbent's fee by at least
+                // `min_fee_bump` (default 1 = strictly higher for integer fees).
+                if tx.fee >= inc_fee.saturating_add(self.min_fee_bump) {
+                    // Drop the incumbent first so the capacity/quota gates below see the
+                    // freed slot — a replacement keeps the pool and quota size unchanged.
+                    self.pending.remove(&inc_hash);
+                    if let Some(count) = self.per_author.get_mut(&tx.author) {
+                        *count -= 1;
+                        if *count == 0 {
+                            self.per_author.remove(&tx.author);
+                        }
+                    }
+                } else {
+                    self.rejected_replace_fee += 1;
+                    return Err(ChainError::FeeTooLowToReplace {
+                        author: tx.author,
+                        nonce: tx.nonce,
+                        existing_fee: inc_fee,
+                        got_fee: tx.fee,
+                    });
+                }
+            }
+        }
         let is_new = !self.pending.contains_key(&h);
         if is_new {
             if self.pending.len() >= self.capacity {
+                self.rejected_full += 1;
                 return Err(ChainError::MempoolFull {
                     capacity: self.capacity,
                 });
@@ -140,30 +333,55 @@ impl Mempool {
         Ok(h)
     }
 
-    /// Build the next block on top of `chain.head`, executing candidates in
-    /// canonical (hash) order against a trial clone and including only those
-    /// that apply cleanly, up to `max_txs`. The returned block is guaranteed to
-    /// commit onto `chain`, and is identical for any builder with the same
-    /// pending set and state. Returns `None` if no candidate would apply.
+    /// Build the next block on top of `chain.head`, executing candidates against a
+    /// trial clone and including only those that apply cleanly, up to `max_txs`. The
+    /// returned block is guaranteed to commit onto `chain`, and is identical for any
+    /// builder with the same pending set and state. Returns `None` if no candidate
+    /// would apply.
+    ///
+    /// M143: candidates are taken in fee-priority order (fee desc, content-hash asc
+    /// tie-break) but a tx is only *eligible* when its `nonce` equals the author's
+    /// current trial nonce, so an account's txs are laid in strict nonce order while
+    /// still competing on fee across accounts. Applying a tx advances its account's
+    /// trial nonce, exposing its successor; a multi-pass loop picks those up until a
+    /// full pass makes no progress. When no account has more than one admissible tx
+    /// (`nonce_lookahead == 0`), every candidate is eligible on the first pass and this
+    /// is byte-identical to the pre-M143 single fee-sorted pass.
     pub fn build_block(&self, chain: &Chain, timestamp_days: f32) -> Option<Block> {
         let mut trial = chain.state.clone();
         trial.now_days = timestamp_days;
-        let mut included = Vec::new();
-        // M122: fee-priority selection — highest fee first, with the content hash
-        // (the BTreeMap key) as the deterministic tie-break so every honest builder
-        // lays out the same block. `apply_tx` is a try-apply: a tx that fails (bad
-        // nonce ordering, insufficient balance after a prior tx, …) leaves `trial`
-        // untouched and is simply skipped, deferring it to a later block.
         let mut candidates: Vec<(&Hash, &SubmissionTx)> = self.pending.iter().collect();
         candidates.sort_by(|(ha, ta), (hb, tb)| tb.fee.cmp(&ta.fee).then(ha.cmp(hb)));
-        for (_, tx) in candidates {
-            if included.len() >= self.max_txs {
-                break;
+        let mut used = vec![false; candidates.len()];
+        let mut included = Vec::new();
+        'outer: loop {
+            let mut progressed = false;
+            for i in 0..candidates.len() {
+                if used[i] {
+                    continue;
+                }
+                if included.len() >= self.max_txs {
+                    break 'outer;
+                }
+                let (_, tx) = candidates[i];
+                // Eligible only at the author's current trial nonce — preserves per-account
+                // nonce order. A future-nonce tx is left untouched (not `used`) so a later
+                // pass can pick it up once its predecessor applies.
+                if trial.accounts.get(&tx.author).map(|a| a.nonce) != Some(tx.nonce) {
+                    continue;
+                }
+                // apply_tx never partially mutates on error, so a failed candidate leaves
+                // `trial` untouched. Mark it `used` either way: on success it is included; on
+                // failure (e.g. insufficient balance) it cannot apply at this nonce, and a
+                // cheaper same-nonce sibling later in this pass may still apply instead.
+                if trial.apply_tx(tx).is_ok() {
+                    included.push(tx.clone());
+                    progressed = true;
+                }
+                used[i] = true;
             }
-            // apply_tx never partially mutates on error (see validate_tx), so a
-            // failed candidate leaves `trial` untouched and is simply skipped.
-            if trial.apply_tx(tx).is_ok() {
-                included.push(tx.clone());
+            if !progressed {
+                break;
             }
         }
         if included.is_empty() {
@@ -204,6 +422,37 @@ impl Mempool {
     pub fn remove_included(&mut self, block: &Block) {
         for tx in &block.txs {
             if self.pending.remove(&tx.hash()).is_some() {
+                if let Some(count) = self.per_author.get_mut(&tx.author) {
+                    *count -= 1;
+                    if *count == 0 {
+                        self.per_author.remove(&tx.author);
+                    }
+                }
+            }
+        }
+    }
+
+    /// M143: drop pending txs whose `nonce` is now below the author's account nonce —
+    /// stale entries left after a commit advanced the account (replays, and same-nonce
+    /// duplicates whose sibling won inclusion). Call after `remove_included` so a
+    /// pipelining pool does not accumulate dead txs (and their per-account quota slots).
+    /// A tx whose author no longer exists in state is also dropped.
+    pub fn prune_stale(&mut self, chain: &Chain) {
+        let state = &chain.state;
+        let stale: Vec<Hash> = self
+            .pending
+            .iter()
+            .filter(|(_, tx)| {
+                state
+                    .accounts
+                    .get(&tx.author)
+                    .map(|a| tx.nonce < a.nonce)
+                    .unwrap_or(true)
+            })
+            .map(|(h, _)| *h)
+            .collect();
+        for h in stale {
+            if let Some(tx) = self.pending.remove(&h) {
                 if let Some(count) = self.per_author.get_mut(&tx.author) {
                     *count -= 1;
                     if *count == 0 {
@@ -398,6 +647,8 @@ mod tests {
             Err(ChainError::MempoolFull { capacity: 1 })
         ));
         assert_eq!(mp.len(), 1);
+        // M162: the capacity rejection is counted; the admission is not.
+        assert_eq!(mp.rejected_full(), 1);
     }
 
     #[test]
@@ -499,5 +750,353 @@ mod tests {
         }
         assert_eq!(mp.len(), 5);
         assert_eq!(mp.rejected_quota(), 0);
+    }
+
+    // --- M143: nonce pipelining ------------------------------------------------
+
+    /// M143: explicit fee + nonce variant for pipelining tests.
+    fn tx_fee(
+        author: u64,
+        dim: usize,
+        domain: u32,
+        stake: u64,
+        fee: u64,
+        nonce: u64,
+    ) -> SubmissionTx {
+        SubmissionTx {
+            author,
+            embedding: unit(dim),
+            domain,
+            stake,
+            fee,
+            nonce,
+            reviews: reviews(),
+            repl_success: 3,
+            repl_total: 3,
+            timestamp_days: 1.0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(author))
+    }
+
+    #[test]
+    fn lookahead_zero_rejects_future_nonce() {
+        // Default (lookahead 0) preserves the strict one-pending-tx-per-account rule:
+        // nonce 0 admits, nonce 1 is rejected as too far ahead (window = [0, 0]).
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        assert_eq!(mp.nonce_lookahead(), 0);
+        assert!(mp.insert(&chain, tx_nonce(1, 1, 1, 2 * MICRO, 0)).is_ok());
+        assert!(matches!(
+            mp.insert(&chain, tx_nonce(1, 2, 2, 2 * MICRO, 1)),
+            Err(ChainError::NonceTooFarAhead {
+                account: 1,
+                got: 1,
+                limit: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn pipeline_admits_consecutive_nonces_when_lookahead_set() {
+        // With a window, one account may buffer several consecutive future nonces.
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_nonce_lookahead(4);
+        assert!(mp.insert(&chain, tx_nonce(1, 1, 1, 2 * MICRO, 0)).is_ok());
+        assert!(mp.insert(&chain, tx_nonce(1, 2, 2, 2 * MICRO, 1)).is_ok());
+        assert!(mp.insert(&chain, tx_nonce(1, 3, 3, 2 * MICRO, 2)).is_ok());
+        assert_eq!(mp.len(), 3);
+    }
+
+    #[test]
+    fn pipeline_builds_account_txs_in_nonce_order_in_one_block() {
+        // The three buffered nonces land in ONE block, in strict nonce order, and the
+        // block commits cleanly with supply conserved.
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_nonce_lookahead(4);
+        mp.insert(&chain, tx_nonce(1, 1, 1, 2 * MICRO, 0)).unwrap();
+        mp.insert(&chain, tx_nonce(1, 2, 2, 2 * MICRO, 1)).unwrap();
+        mp.insert(&chain, tx_nonce(1, 3, 3, 2 * MICRO, 2)).unwrap();
+
+        let mut blk = mp.build_block(&chain, 1.0).unwrap();
+        let nonces: Vec<u64> = blk.txs.iter().map(|t| t.nonce).collect();
+        assert_eq!(nonces, vec![0, 1, 2], "account txs in strict nonce order");
+
+        let mut c = chain;
+        c.seal(&mut blk).unwrap();
+        assert!(c.commit(&mut blk).is_ok());
+        assert!(c.state.supply_conserved());
+        assert_eq!(c.state.accounts[&1].nonce, 3, "all three nonces consumed");
+    }
+
+    #[test]
+    fn build_fee_priority_across_accounts_respects_per_account_nonce_order() {
+        // Account 2 pays a high fee (nonce 0); account 1 pays low fees (nonce 0, 1).
+        // Expected block order: 2's tx first (fee priority), then 1's nonce 0, then 1's
+        // nonce 1 (an account's own txs never reorder by fee — nonce order wins).
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_nonce_lookahead(4);
+        mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 1, 0)).unwrap();
+        mp.insert(&chain, tx_fee(1, 2, 2, 2 * MICRO, 1, 1)).unwrap();
+        mp.insert(&chain, tx_fee(2, 1, 1, 2 * MICRO, 100, 0))
+            .unwrap();
+
+        let blk = mp.build_block(&chain, 1.0).unwrap();
+        let order: Vec<(u64, u64)> = blk.txs.iter().map(|t| (t.author, t.nonce)).collect();
+        assert_eq!(order, vec![(2, 0), (1, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn pipeline_rejects_stale_and_too_far_ahead() {
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_nonce_lookahead(2);
+        // too far ahead: window is [0, 2], nonce 3 is rejected.
+        assert!(matches!(
+            mp.insert(&chain, tx_nonce(1, 1, 1, 2 * MICRO, 3)),
+            Err(ChainError::NonceTooFarAhead {
+                account: 1,
+                got: 3,
+                limit: 2
+            })
+        ));
+        // M162: the window rejection is counted.
+        assert_eq!(mp.rejected_nonce_too_far(), 1);
+        // commit nonce 0 so the account advances to nonce 1.
+        mp.insert(&chain, tx_nonce(1, 1, 1, 2 * MICRO, 0)).unwrap();
+        let mut blk = mp.build_block(&chain, 1.0).unwrap();
+        let mut c = chain.clone();
+        c.seal(&mut blk).unwrap();
+        c.commit(&mut blk).unwrap();
+        mp.remove_included(&blk);
+        assert_eq!(c.state.accounts[&1].nonce, 1);
+        // stale: nonce 0 is now below the account nonce (1) — a replay.
+        assert!(matches!(
+            mp.insert(&c, tx_nonce(1, 5, 9, 2 * MICRO, 0)),
+            Err(ChainError::BadNonce {
+                account: 1,
+                expected: 1,
+                got: 0
+            })
+        ));
+        // M162: the replay rejection is counted (independently of the window counter).
+        assert_eq!(mp.rejected_bad_nonce(), 1);
+        assert_eq!(mp.rejected_nonce_too_far(), 1);
+    }
+
+    #[test]
+    fn prune_stale_drops_committed_and_stale_duplicates() {
+        // Two same-nonce (0) duplicates from account 1 are both admitted (lookahead 0
+        // still allows multiple txs AT the current nonce). The builder includes one; the
+        // other is stale once the account advances. prune_stale drops it + frees quota.
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 5, 0)).unwrap();
+        mp.insert(&chain, tx_fee(1, 2, 2, 2 * MICRO, 1, 0)).unwrap();
+        assert_eq!(mp.len(), 2);
+
+        let mut blk = mp.build_block(&chain, 1.0).unwrap();
+        assert_eq!(blk.txs.len(), 1, "only one tx can take nonce 0");
+        let mut c = chain;
+        c.seal(&mut blk).unwrap();
+        c.commit(&mut blk).unwrap();
+        mp.remove_included(&blk);
+        assert_eq!(mp.len(), 1, "the losing duplicate is still pending");
+
+        mp.prune_stale(&c);
+        assert_eq!(mp.len(), 0, "stale duplicate pruned");
+        // quota freed: account 1 can be admitted again at the new nonce.
+        assert!(mp.insert(&c, tx_nonce(1, 3, 3, 2 * MICRO, 1)).is_ok());
+    }
+
+    // --- M144: replace-by-fee --------------------------------------------------
+
+    #[test]
+    fn rbf_replaces_lower_fee_at_same_slot() {
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_replace_by_fee(true);
+        mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 1, 0)).unwrap();
+        let hi = mp.insert(&chain, tx_fee(1, 2, 2, 2 * MICRO, 5, 0)).unwrap();
+        assert_eq!(mp.len(), 1, "same slot holds exactly one tx");
+        assert!(mp.contains(&hi), "the higher-fee tx is the one retained");
+    }
+
+    #[test]
+    fn rbf_rejects_not_higher_fee() {
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_replace_by_fee(true);
+        mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 5, 0)).unwrap();
+        // equal fee → rejected.
+        assert!(matches!(
+            mp.insert(&chain, tx_fee(1, 2, 2, 2 * MICRO, 5, 0)),
+            Err(ChainError::FeeTooLowToReplace {
+                author: 1,
+                nonce: 0,
+                existing_fee: 5,
+                got_fee: 5
+            })
+        ));
+        // lower fee → rejected.
+        assert!(matches!(
+            mp.insert(&chain, tx_fee(1, 3, 3, 2 * MICRO, 3, 0)),
+            Err(ChainError::FeeTooLowToReplace {
+                existing_fee: 5,
+                got_fee: 3,
+                ..
+            })
+        ));
+        assert_eq!(mp.len(), 1, "incumbent (fee 5) stays");
+        // M162: both under-bid replacements are counted.
+        assert_eq!(mp.rejected_replace_fee(), 2);
+    }
+
+    #[test]
+    fn rbf_idempotent_same_tx() {
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_replace_by_fee(true);
+        let t = tx_fee(1, 1, 1, 2 * MICRO, 5, 0);
+        let h = mp.insert(&chain, t.clone()).unwrap();
+        assert_eq!(mp.insert(&chain, t).unwrap(), h, "re-insert is idempotent");
+        assert_eq!(mp.len(), 1);
+    }
+
+    #[test]
+    fn rbf_different_nonces_coexist() {
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_replace_by_fee(true);
+        mp.set_nonce_lookahead(4);
+        mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 1, 0)).unwrap();
+        mp.insert(&chain, tx_fee(1, 2, 2, 2 * MICRO, 1, 1)).unwrap();
+        assert_eq!(
+            mp.len(),
+            2,
+            "different (author,nonce) slots are not replaced"
+        );
+    }
+
+    #[test]
+    fn rbf_replacement_preserves_quota() {
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_replace_by_fee(true);
+        mp.set_per_account_limit(1);
+        mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 1, 0)).unwrap(); // fills the quota
+                                                                      // replacement at the same slot does not exceed the quota.
+        let hi = mp.insert(&chain, tx_fee(1, 2, 2, 2 * MICRO, 5, 0)).unwrap();
+        assert_eq!(mp.len(), 1);
+        assert!(mp.contains(&hi));
+    }
+
+    #[test]
+    fn rbf_off_by_default_keeps_same_slot_duplicates() {
+        // Default (off): two same-(author,nonce) competitors coexist (pre-M144 behavior).
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        assert!(!mp.replace_by_fee());
+        mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 1, 0)).unwrap();
+        mp.insert(&chain, tx_fee(1, 2, 2, 2 * MICRO, 5, 0)).unwrap();
+        assert_eq!(mp.len(), 2);
+    }
+
+    // --- M145: replace-by-fee minimum bump -------------------------------------
+
+    #[test]
+    fn rbf_default_min_bump_is_one_strictly_higher() {
+        // Default min_fee_bump == 1: for integer fees this is exactly "strictly higher".
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        assert_eq!(mp.min_fee_bump(), 1);
+        mp.set_replace_by_fee(true);
+        mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 5, 0)).unwrap();
+        // +1 clears the bump → replaces.
+        let hi = mp.insert(&chain, tx_fee(1, 2, 2, 2 * MICRO, 6, 0)).unwrap();
+        assert_eq!(mp.len(), 1);
+        assert!(mp.contains(&hi));
+    }
+
+    #[test]
+    fn rbf_min_bump_requires_larger_increment() {
+        // With a min bump of 10, a +5 bid is rejected; a +10 bid replaces.
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_replace_by_fee(true);
+        mp.set_min_fee_bump(10);
+        mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 100, 0))
+            .unwrap();
+        // +5 (105) does not clear 100 + 10 → rejected, incumbent stays.
+        assert!(matches!(
+            mp.insert(&chain, tx_fee(1, 2, 2, 2 * MICRO, 105, 0)),
+            Err(ChainError::FeeTooLowToReplace {
+                existing_fee: 100,
+                got_fee: 105,
+                ..
+            })
+        ));
+        assert_eq!(mp.len(), 1);
+        // +10 (110) clears the bump → replaces.
+        let hi = mp
+            .insert(&chain, tx_fee(1, 3, 3, 2 * MICRO, 110, 0))
+            .unwrap();
+        assert_eq!(mp.len(), 1);
+        assert!(mp.contains(&hi));
+    }
+
+    #[test]
+    fn rbf_min_bump_zero_allows_equal_fee_replacement() {
+        // min_fee_bump == 0 permits equal-fee replacement (new content wins the slot).
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_replace_by_fee(true);
+        mp.set_min_fee_bump(0);
+        let lo = mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 5, 0)).unwrap();
+        let eq = mp.insert(&chain, tx_fee(1, 2, 2, 2 * MICRO, 5, 0)).unwrap();
+        assert_eq!(mp.len(), 1);
+        assert!(
+            mp.contains(&eq) && !mp.contains(&lo),
+            "equal-fee newcomer took the slot"
+        );
+    }
+
+    // --- M157: minimum-fee admission floor ----------------------------------------
+
+    #[test]
+    fn min_fee_floor_rejects_below_and_admits_at_or_above() {
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        assert_eq!(mp.min_fee(), 0);
+        assert_eq!(mp.rejected_min_fee(), 0);
+        mp.set_min_fee(10);
+        // Below the floor → rejected.
+        assert!(matches!(
+            mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 9, 0)),
+            Err(ChainError::FeeBelowMinimum { got: 9, min: 10 })
+        ));
+        assert!(mp.is_empty());
+        // M161: the rejection is counted for observability.
+        assert_eq!(mp.rejected_min_fee(), 1);
+        // At the floor → admitted.
+        assert!(mp.insert(&chain, tx_fee(2, 2, 2, 2 * MICRO, 10, 0)).is_ok());
+        // Above the floor → admitted.
+        assert!(mp.insert(&chain, tx_fee(3, 3, 3, 2 * MICRO, 50, 0)).is_ok());
+        assert_eq!(mp.len(), 2);
+        // Admissions do not bump the rejection counter.
+        assert_eq!(mp.rejected_min_fee(), 1);
+    }
+
+    #[test]
+    fn min_fee_floor_off_by_default_admits_zero_fee() {
+        // Default floor is 0 (off): a zero-fee tx is admitted, so the pre-M157 path and
+        // localnet (fee 0) are byte-identical.
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        assert!(mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 0, 0)).is_ok());
+        assert_eq!(mp.len(), 1);
     }
 }

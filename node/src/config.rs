@@ -151,6 +151,46 @@ pub struct NodeConfig {
     /// `GET /header/{h}` returns.
     #[serde(default)]
     pub snapshot: Option<SnapshotBootConfig>,
+    /// M154: opt-in weak-subjectivity checkpoint for a light node (`node light-run`).
+    /// When `Some`, the light node seeds its tracker from this pinned
+    /// `(height, head, validator set)` anchor and follows forward — no snapshot blob,
+    /// no cert. Ignored by the full node. Mutually exclusive with `snapshot`.
+    #[serde(default)]
+    pub checkpoint: Option<CheckpointConfig>,
+}
+
+/// M154: a weak-subjectivity checkpoint a light node trusts as its subjectivity anchor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointConfig {
+    /// The checkpoint height (the light node follows `height + 1` onward).
+    pub height: u64,
+    /// Hex of the checkpoint block's hash — the head the next header must chain to.
+    pub head_hex: String,
+    /// The validator set active at the checkpoint (certifies `height + 1`). Reuses the
+    /// genesis `[[validators]]` encoding (id/pubkey_hex/power).
+    pub validators: Vec<ValidatorConfig>,
+}
+
+impl CheckpointConfig {
+    /// M154: decode into `(head hash, ValidatorSet)`. Rejects a malformed `head_hex`,
+    /// a bad validator pubkey, or an empty validator set.
+    pub fn decode(&self) -> Result<([u8; 32], crate::validator::ValidatorSet), ConfigError> {
+        let head = decode_hex_n::<32>(&self.head_hex, "checkpoint.head_hex")?;
+        if self.validators.is_empty() {
+            return Err(ConfigError::BadSnapshot {
+                detail: "checkpoint.validators must be non-empty".into(),
+            });
+        }
+        let mut vals = Vec::with_capacity(self.validators.len());
+        for v in &self.validators {
+            vals.push(crate::validator::Validator {
+                id: v.id,
+                pubkey: decode_pubkey(&v.pubkey_hex, "checkpoint.validators.pubkey_hex")?,
+                power: v.power,
+            });
+        }
+        Ok((head, crate::validator::ValidatorSet::new(vals)))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,6 +437,20 @@ pub struct MetricsConfig {
     pub enabled: bool,
     /// Address the metrics HTTP listener binds, e.g. `"127.0.0.1:9600"`.
     pub listen: String,
+    /// M158: optional bearer token gating scrapes. Empty (the default) ⇒ open (the
+    /// pre-M158 behavior). When set, every request must carry `Authorization:
+    /// Bearer <token>`, else `401` — for private deployments that don't want metrics
+    /// readable by anyone who can reach the port.
+    #[serde(default)]
+    pub auth_token: String,
+    /// M164: optional encryption-only TLS for this endpoint. Off by default (the
+    /// M37 plaintext behavior); `true` ⇒ every accepted connection is wrapped in
+    /// TLS using an ephemeral self-signed cert — mirrors `[network] enable_tls` for
+    /// the P2P transport. A scraper must connect via TLS (e.g. trust-on-first-use
+    /// or `AcceptAnyServerCert`); a plaintext probe of the port fails the TLS
+    /// handshake. Ephemeral cert rotates on every restart, matching P2P.
+    #[serde(default)]
+    pub enable_tls: bool,
 }
 
 impl Default for MetricsConfig {
@@ -404,6 +458,8 @@ impl Default for MetricsConfig {
         Self {
             enabled: false,
             listen: "127.0.0.1:9600".into(),
+            auth_token: String::new(),
+            enable_tls: false,
         }
     }
 }
@@ -431,6 +487,20 @@ pub struct RpcConfig {
     pub enabled: bool,
     /// Address the RPC HTTP listener binds, e.g. `"127.0.0.1:9700"`.
     pub listen: String,
+    /// M156: optional bearer token gating the *write* path (tx submission). Empty
+    /// (the default) ⇒ no auth — the write path is open exactly as pre-M156. When set,
+    /// a `POST` that submits a tx must carry `Authorization: Bearer <token>` (reads —
+    /// every `GET`, plus the read-only `POST /batch`/`/validate` — stay public).
+    #[serde(default)]
+    pub auth_token: String,
+    /// M164: optional encryption-only TLS for this endpoint. Off by default (the
+    /// M53 plaintext behavior); `true` ⇒ every accepted connection is wrapped in
+    /// TLS using an ephemeral self-signed cert. A submitter must connect via TLS;
+    /// a plaintext probe fails the handshake. Composable with `auth_token` (TLS
+    /// encrypts the bearer token so it's no longer sniffable). Ephemeral cert
+    /// rotates on every restart, matching `[network] enable_tls`.
+    #[serde(default)]
+    pub enable_tls: bool,
 }
 
 impl Default for RpcConfig {
@@ -438,6 +508,8 @@ impl Default for RpcConfig {
         Self {
             enabled: false,
             listen: "127.0.0.1:9700".into(),
+            auth_token: String::new(),
+            enable_tls: false,
         }
     }
 }
@@ -487,6 +559,24 @@ pub struct MempoolConfig {
     /// sentinel as `seen_cache`. A value above `capacity` is legal but never binds
     /// (the global cap trips first).
     pub per_account_limit: usize,
+    /// M143: nonce pipelining window — how many future nonces beyond an account's
+    /// current one the pool will buffer so they can be laid into one block in nonce
+    /// order. `0` ⇒ strict one-pending-tx-per-account (the behavior-preserving
+    /// default; byte-identical to pre-M143).
+    pub nonce_lookahead: usize,
+    /// M144: when `true`, a tx at a `(author, nonce)` already held is admitted by
+    /// *replacing* the incumbent iff it bids a strictly higher fee. `false` (the
+    /// behavior-preserving default) keeps same-slot competitors coexisting.
+    pub replace_by_fee: bool,
+    /// M145: minimum fee increment a replace-by-fee bid must clear
+    /// (`new.fee >= incumbent.fee + min_fee_bump`). Default `1` (= strictly higher,
+    /// byte-identical to M144); larger dampens replacement churn; only used when
+    /// `replace_by_fee` is on.
+    pub min_fee_bump: u64,
+    /// M157: minimum fee a tx must pay to be admitted to the mempool (anti-spam floor).
+    /// `0` (the behavior-preserving default) ⇒ no floor. A local admission policy, not a
+    /// consensus rule.
+    pub min_fee: u64,
 }
 
 impl Default for MempoolConfig {
@@ -500,6 +590,10 @@ impl Default for MempoolConfig {
             per_peer_tx_burst: 256.0,
             seen_cache: 0,
             per_account_limit: 0,
+            nonce_lookahead: 0,
+            replace_by_fee: false,
+            min_fee_bump: 1,
+            min_fee: 0,
         }
     }
 }
@@ -985,6 +1079,7 @@ mod tests {
             logging: None,
             mempool: MempoolConfig::default(),
             snapshot: None,
+            checkpoint: None,
         };
         let s = toml::to_string(&cfg).unwrap();
         let back: NodeConfig = toml::from_str(&s).unwrap();
@@ -2134,6 +2229,7 @@ mod tests {
                 logging: None,
                 mempool: MempoolConfig::default(),
                 snapshot: None,
+                checkpoint: None,
             };
             std::fs::write(
                 dir.join(format!("node{id}.toml")),
@@ -2144,6 +2240,52 @@ mod tests {
 
         // Remove the now-obsolete pre-M33 keystore if a prior run left one.
         let _ = std::fs::remove_file(dir.join("keystore.toml"));
+    }
+
+    #[test]
+    fn mempool_config_nonce_lookahead_defaults_zero() {
+        // M143: a `[mempool]` section without `nonce_lookahead` (or no section at all)
+        // defaults to 0 — strict one-pending-tx-per-account, behavior-preserving.
+        let toml = r#"
+            genesis = "genesis.toml"
+
+            [node]
+            id = 21
+            listen = "127.0.0.1:9021"
+            data_dir = "/tmp/x"
+
+            [mempool]
+            capacity = 100
+        "#;
+        let cfg: NodeConfig = toml::from_str(toml).expect("parse mempool config");
+        assert_eq!(cfg.mempool.capacity, 100);
+        assert_eq!(cfg.mempool.nonce_lookahead, 0);
+        assert_eq!(MempoolConfig::default().nonce_lookahead, 0);
+    }
+
+    #[test]
+    fn mempool_config_replace_by_fee_defaults_false() {
+        // M144: a `[mempool]` without `replace_by_fee` defaults to false (off).
+        let toml = r#"
+            genesis = "genesis.toml"
+
+            [node]
+            id = 21
+            listen = "127.0.0.1:9021"
+            data_dir = "/tmp/x"
+
+            [mempool]
+            capacity = 100
+        "#;
+        let cfg: NodeConfig = toml::from_str(toml).expect("parse mempool config");
+        assert!(!cfg.mempool.replace_by_fee);
+        assert!(!MempoolConfig::default().replace_by_fee);
+        // M145: min_fee_bump defaults to 1 (= strictly higher).
+        assert_eq!(cfg.mempool.min_fee_bump, 1);
+        assert_eq!(MempoolConfig::default().min_fee_bump, 1);
+        // M157: min_fee defaults to 0 (no floor).
+        assert_eq!(cfg.mempool.min_fee, 0);
+        assert_eq!(MempoolConfig::default().min_fee, 0);
     }
 
     #[test]
@@ -2221,5 +2363,41 @@ mod tests {
             set_only.validate(),
             Err(ConfigError::BadSnapshot { .. })
         ));
+    }
+
+    #[test]
+    fn checkpoint_config_decodes_and_rejects_bad_input() {
+        // M154: a well-formed checkpoint decodes to (head, set); bad hex / empty set reject.
+        let ok = CheckpointConfig {
+            height: 7,
+            head_hex: hex(&[9u8; 32]),
+            validators: vec![ValidatorConfig {
+                id: 21,
+                pubkey_hex: hex(&demo_seed(21)),
+                power: 1,
+            }],
+        };
+        let (head, set) = ok.decode().expect("valid checkpoint decodes");
+        assert_eq!(head, [9u8; 32]);
+        assert_eq!(set.len(), 1);
+
+        // Empty validator set → error.
+        let empty = CheckpointConfig {
+            height: 7,
+            head_hex: hex(&[9u8; 32]),
+            validators: vec![],
+        };
+        assert!(matches!(
+            empty.decode(),
+            Err(ConfigError::BadSnapshot { .. })
+        ));
+
+        // Malformed head hex → BadHex.
+        let bad_head = CheckpointConfig {
+            height: 7,
+            head_hex: "zz".into(),
+            validators: ok.validators.clone(),
+        };
+        assert!(matches!(bad_head.decode(), Err(ConfigError::BadHex { .. })));
     }
 }

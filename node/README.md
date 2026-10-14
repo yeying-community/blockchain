@@ -1339,7 +1339,267 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 - **测试（+3 → 529）**：新纯 `route_get_parses_node`（`/node` ⇒ `Node`、`/node/` ⇒ `Health`）/`node_renders_text_and_json`（validator/follower 两态的文本与 JSON），新 TCP `rpc_node_over_tcp`（以验证人 52 启动 ⇒ `node_id=52`/`role=validator`/crate 版本）。
 - **不变量保持**：纯读面增量、无 `serde_json`、无引擎 / codec / crypto / wire / 共识 / 状态变更、无新依赖，RPC 默认关，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
 
-**已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
+**已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图、bearer 失败响应延迟 jitter；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
+
+## `/metrics` + RPC 端点可选 TLS（Milestone 164 · 端点加密）
+
+M156/M158/M160/M163 把 bearer 鉴权 + 常时比较 + 401 计数做齐了，但 token 走**明文 HTTP** 传输，嗅探者可在客户端 ↔ 节点链路上截获重放。M164 给 `[metrics]` 与 `[rpc]` 各加 `enable_tls: bool`（opt-in 默认关），**复用** M41 已有的 `build_encrypt_only_tls_setup`（ephemeral 自签 cert + `AcceptAnyServerCert`），client 配 trust-on-first-use / pin-by-hash。
+
+- **复用 P2P seam**：`trait PeerStream: AsyncRead+AsyncWrite+Unpin+Send`（`daemon.rs:268`）已存在；新 `wrap_optional_tls(tcp, Option<TlsAcceptor>) -> Box<dyn PeerStream>` 镜像 `server_wrap` 减去 `AuthContext`/channel-binding 包袱（ingress 端点不验身份，只加密）。
+- **签名改动**（`daemon.rs`）：`run_metrics`/`run_rpc` 各加 `tls: Option<TlsAcceptor>` 参 + accept loop 用 `wrap_optional_tls`；`serve_metrics_conn`/`serve_rpc_conn` 收 `Box<dyn PeerStream>` 而非 `TcpStream`（函数体只用 trait 方法，内部零改动）。
+- **`Node::start`**（`daemon.rs`）：照 P2P `tls` 范式在 metrics/RPC 各构造独立 acceptor（`Some(build_encrypt_only_tls_setup()?.acceptor)`）——不复用 P2P 那个，避免 P2P `MtlsMaterial` 把 ingress 一起拉成 mTLS。
+- **Config**（`config.rs`）：`MetricsConfig`/`RpcConfig` 各加 `pub enable_tls: bool`（`#[serde(default)]` 默认 `false`），Default + 既有测试字面量同步。
+- **不引 mTLS**：ingress 端点只加密（`AcceptAnyServerCert`）；bearer token 仍是身份断言层。P2P `MtlsMaterial` 不动。
+- **不碰** 共识/codec/wire/P2P transport；端点 TLS 默认关 ⇒ 既有 624 测零回归；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+2 → 626）**：
+  - `metrics_endpoint_tls_encrypts_scrape`——`enable_tls=true` 后：(a) 明文 probe 拿不到 `zhixing_height`（TLS handshake 拒）；(b) TLS client（`rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(AcceptAnyServerCert).with_no_client_auth()`）连接 + `GET /metrics` ⇒ 200 + `zhixing_height 0`。
+  - `rpc_endpoint_tls_encrypts_write`——镜像：TLS 走 `POST /submit_tx`，断言 2xx/4xx（验证 body 到 RPC handler，端到端 TLS 通）。
+- **已知边界**：ephemeral cert 每次重启变（与 P2P 一致）——scraper/client 须 trust-on-first-use 或 pin-by-hash；mTLS/`require_client_cert`、持久 cert（`tls_cert_path`/`tls_key_path`）属后续篮子；轻节点 RPC TLS 同属后续。
+
+## 401 鉴权失败计数指标（Milestone 163 · auth 层可观测）
+
+M156/M158 给 RPC 写路径与 `/metrics` 加了可选 bearer 鉴权，M160 把比较改常时。但鉴权失败（401）本身无计数——运维看不到有多少请求因缺/错 token 被拒，无法从 `/metrics` 察觉凭证配置错误或正被扫探。M161/M162 刚把 mempool 五条拒绝路径都加了 counter；M163 把同样的可观测性延伸到 auth 层。
+
+- **共享原子计数器**（`daemon.rs`）：401 发生在每连接 spawn 的 serve 任务里（只持 `cmd` 句柄、不碰 actor 状态），故用 `Arc<AtomicU64>`——serve 任务写 401 前 `fetch_add(1, Relaxed)`，actor 在 `Cmd::Metrics` 臂 `load(Relaxed)` 读进快照。无新 `Cmd` 变体、无 actor-loop 改动。
+- **两个 counter**：`zhixing_rpc_auth_failures_total`（M156 写路径 401：缺/错 token；malformed header 的 400 是协议错不计）、`zhixing_metrics_auth_failures_total`（M158 scrape 401）。
+- **布线**：`Node::start` 建两 Arc → clone 进 `Actor` + clone 进 `run_rpc`/`run_metrics`（透传 `serve_rpc_conn`/`serve_metrics_conn`）；`Metrics` 加两字段 + `render_prometheus` 紧跟 mempool counter 组渲两 counter。
+- **不碰** apply/codec/wire/共识；RPC/metrics 默认关 ⇒ 计数恒 0、端点不绑；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+0 → 624）**：扩展 `metrics_endpoint_bearer_auth_gates_scrapes`（两次 401 后正确 scrape 断言 `zhixing_metrics_auth_failures_total 2`）+ `render_prometheus_emits_counters`（两新 counter 入期望表）。
+- **已知边界**：`Relaxed` 顺序足够（单调自增 + 读快照，无跨变量不变量）；轻节点 RPC（M152）/metrics（M155）走独立 `LightActor` 无 bearer，不涉及。bearer 失败响应延迟 jitter、counter `_created` 时间戳属后续篮子。
+
+## mempool 剩余拒绝路径计数指标（Milestone 162 · 反垃圾可观测收尾）
+
+M161 补了 min-fee floor 的 counter，但 mempool 另外四条 opt-in 拒路径仍无计数——运维无从判断 `[mempool] capacity / nonce_lookahead / replace_by_fee` 及反重放实际拦了多少。M162 一次性补齐，全部照 M161 范式（mempool 内部 `rejected_*: u64` + getter → `Metrics` 字段 → `render_prometheus` counter，**仅 `insert` 路径计数**）。
+
+- **四个新 counter**（`mempool.rs` 字段 + getter + `insert` 返 `Err` 前 `+= 1`；`daemon.rs` Metrics 字段 + `Cmd::Metrics` 填充 + 渲染）：
+  - `zhixing_txs_full_rejected_total`（M54 容量满 `MempoolFull`）
+  - `zhixing_txs_bad_nonce_rejected_total`（stale/replay nonce `BadNonce`）
+  - `zhixing_txs_nonce_too_far_rejected_total`（M143 流水线窗口外 `NonceTooFarAhead`）
+  - `zhixing_txs_replace_fee_rejected_total`（M144 RBF 出价不够 `FeeTooLowToReplace`）
+- （M57 `AccountQuotaFull` 的 `zhixing_txs_quota_rejected_total` 早已存在，不重复。）
+- **顺序**：render 里按 `insert` 内拒绝触发顺序排（min-fee→capacity→bad-nonce→too-far→replace-fee），便于对照代码。
+- **不碰** apply/codec/wire/共识；opt-in 关闭时新计数恒 0、metrics 默认关；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+0 → 624）**：扩展既有 `insert_rejects_when_at_capacity`（`rejected_full()==1`）/`pipeline_rejects_stale_and_too_far_ahead`（`rejected_nonce_too_far()==1`、`rejected_bad_nonce()==1`）/`rbf_rejects_not_higher_fee`（`rejected_replace_fee()==2`）+ `render_prometheus_emits_counters`（四新 counter 入期望表）。
+- **已知边界**：boot 起单调累加（Prometheus counter，重启归零用 `rate()`）；仅 `insert` 计数不含块级。401 鉴权失败计数、bearer 失败延迟 jitter、`_created` 时间戳属后续篮子。
+
+## min-fee 拒绝计数指标（Milestone 161 · mempool 反垃圾可观测）
+
+M157 的最低费用门槛（`[mempool] min_fee`）在 `insert` 最前置拒掉低于门槛的 tx，但这条拒绝路径此前**无计数**——运维无法从 `/metrics` 看出门槛实际拦了多少 tx。相邻两条拒绝路径都已有计数器（M54 速率限制 `zhixing_txs_rate_limited_total`、M57 配额 `zhixing_txs_quota_rejected_total`）。M161 补齐第三条，暴露 `zhixing_txs_min_fee_rejected_total`。
+
+- **mempool 内部计数器**（`mempool.rs`，照 M57 `rejected_quota`）：新字段 `rejected_min_fee: u64`（`new` 初始化 0），M157 门控臂在返 `FeeBelowMinimum` 前 `+= 1`，新 getter `rejected_min_fee()`。
+- **Metrics 字段 + 填充**（`daemon.rs`）：`Metrics.txs_min_fee_rejected: u64`，`Cmd::Metrics` 臂从 `actor.node.mempool.rejected_min_fee()` 拉。
+- **Prometheus 渲染**（`daemon.rs`）：`render_prometheus` 在 `zhixing_txs_quota_rejected_total` 后紧跟渲一个 counter `zhixing_txs_min_fee_rejected_total`。
+- **不碰** apply/codec/wire/共识；`min_fee==0` 默认时计数恒 0、metrics 默认关；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+0 → 624）**：扩展 M157 `min_fee_floor_rejects_below_and_admits_at_or_above`（拒后 `rejected_min_fee()==1`、准入不递增）+ `render_prometheus_emits_counters`（新 counter 在期望表）。
+- **已知边界**：boot 起单调累加（Prometheus counter，重启归零，运维用 `rate()`）；仅 `insert` 路径计数，块级无费用门槛（M157 设计）故不含块内低费 tx，与门槛「本地准入策略非共识规则」定位一致。同理给 nonce-too-far/replace-by-fee/mempool-full 各补计数器、401 鉴权失败计数属后续篮子。
+
+## bearer 鉴权常时比较（Milestone 160 · 鉴权加固）
+
+M156/M158 在 `[rpc] auth_token` 与 `[metrics] auth_token` 处用 `t == auth_token` 逐字节短路比较——第一个不等字节即返 `false`，对公网监听/共享 token 部署构成**逐字节时序侧信道**（攻击者经端到端延迟推 prefix）。M160 改用**常时字符串相等**比较。
+
+- **新辅助** `ct_str_eq(a, b) -> bool`（`daemon.rs`）：长度先短路（长度从 HTTP 头框可读，**不**当秘密；不常时不算新泄露），等长则 XOR 累加所有字节到 `u8` accumulator，无早退；最后 `acc == 0`。
+- **两处闸门换比较**（`daemon.rs`）：`serve_metrics_conn` 块（M158）+ `serve_rpc_conn` 的 `/submit_tx` 闸门（M156），`t == auth_token` → `ct_str_eq(&t, &auth_token)`。
+- **不引 `subtle`**：纯 std。`aarch64`/`x86_64` 上 Rust 编译产物累加循环一般不被分支化；审计严苛场景后续换 `subtle::ConstantTimeEq` 即可。
+- **不碰** 鉴权 parse/响应/失败语义/codec/wire/共识；现有 M156/M158 TCP 测（正确 token 准/错 token 拒）在新比较下行为等价。
+- **测试（+1 → 624）**：`ct_str_eq_basic_properties`——空串等/等长等/等长差一字节（位置 2）/长度差 ×2/大小写差共 6 断言；时间性质（长度除外不常时）单元测不直接观测。
+- **已知边界**：长度差不常时（攻击者已从 HTTP 头框知长度，不算新增泄露）；失败响应延迟无 jitter（顺沿 M156/M158）；多 token/scope/轮换/审计日志/真用 `subtle` 均属后续运维篮子。
+
+## `/config` 暴露 mempool opt-in 调参（Milestone 159 · 运维可观测）
+
+`/config` 自 M119 起只吐共识计时 + 角色 + `mempool_capacity`/`mempool_per_account_limit` 两项 mempool 调参，但 M143/M144/M145/M157 陆续加的四个 opt-in 旋钮（`nonce_lookahead` / `replace_by_fee` / `min_fee_bump` / `min_fee`）从未进读面——运维无法经 wire 核对它们实际生效的值。M159 把这四项补进 `/config` 的文本与 JSON 两种表示。
+
+- **`ConfigView`**（`daemon.rs`）：加 `mempool_nonce_lookahead: usize`、`mempool_replace_by_fee: bool`、`mempool_min_fee_bump: u64`、`mempool_min_fee: u64` 四字段。
+- **`Cmd::QueryConfig`** 处理臂从 `actor.node.mempool.{nonce_lookahead,replace_by_fee,min_fee_bump,min_fee}()` getter 填充。
+- **`format_config`** 追加四行文本（`mempool_min_fee` 为末行）；**`json_config`** 追加四键（数值沿用 `json_u64` 引号串约定，`replace_by_fee` 用 `json_bool` 裸布尔）。
+- **不碰** 共识/codec/wire，RPC 默认关；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+0 → 623）**：扩展 `config_renders_text_and_json` 断言四项新 key 在文本与 JSON 两种表示中出现，且文本末行为 `mempool_min_fee`。
+
+## `/metrics` 端点 bearer 鉴权（Milestone 158 · metrics 端加固）
+
+M37 的全节点 `[metrics]` 端点对能连上端口的任何人开放（暴露内部状态/peer 计数等）。M158 加**可选** bearer——`[metrics] auth_token` 空（默认）= M37 行为；非空时任何 scrape 须带 `Authorization: Bearer <token>` 否则 401。
+
+- **Config**（`config.rs`）：`MetricsConfig.auth_token: String`（`#[serde(default)]` 空=关）。
+- **编解码**：复用 M156 的 `parse_authorization_bearer` + `unauthorized_bearer_response`（`401 + WWW-Authenticate: Bearer realm=...`，RFC 6750 §3）。
+- **`run_metrics`/`serve_metrics_conn`** 串 token；`serve_metrics_conn` 改为累积请求头（而非 M37 的"读完即丢"），过 bearer 闸门再问 actor 拿快照。
+- **不碰** Prometheus 渲染 / 共识/codec/wire；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+1 → 623）**：`metrics_endpoint_bearer_auth_gates_scrapes`（无 token→401+challenge、错 token→401、正确→200 含 `zhixing_height`）。
+- **已知边界**：与 M156 同——byte-精确比较（不防计时攻击，单运维场景可接受）；多 token/scope/轮转/审计属后续运维篮子。
+
+## mempool 最低费用门槛（Milestone 157 · 反垃圾）
+
+mempool 此前接受任意费用（含 0）。M157 加**可选最低费用门槛**：`[mempool] min_fee` 非 0 时，低于该费的 tx 在准入处拒绝。opt-in（默认 0 = 关），且是**本地准入策略非共识规则**——携带低费 tx 的块仍正常应用（故 head 不变）。
+
+- **`insert` 最前置门控**（`mempool.rs`）：`min_fee > 0 && tx.fee < min_fee` → `ChainError::FeeBelowMinimum { got, min }`，在（更贵的）签名/状态校验**之前**，让垃圾尽早被拒。
+- **新字段** `Mempool.min_fee` + `set_min_fee`/getter（照 M54/M57/M143/M145 opt-in 范式）；`MempoolConfig.min_fee`（`#[serde(default)]`=0）；`GossipNode::set_mempool_min_fee` 代理；`Node::start` 在 `min_fee > 0` 时布线（0 → 不调用 → 逐字节不变）。
+- **不碰** apply/codec/wire（`apply_tx` 不设费用门槛——块级无条件应用）；localnet 头仍 wire v1 `a045426e…3b87bc`（默认 0，fee=0 tx 仍准入）。
+- **测试（+2 → 622）**：`min_fee_floor_rejects_below_and_admits_at_or_above`（门槛 10：fee 9 拒、10/50 准）、`min_fee_floor_off_by_default_admits_zero_fee`（默认 0 → fee 0 准入）；config 测扩展断言 `min_fee` 缺省 0。
+
+## RPC 写路径 bearer 鉴权（Milestone 156 · RPC 运营加固）
+
+M53 的外部 tx-ingress `POST /submit_tx` 此前对任何能连上端口的客户端开放。本轮加**可选** bearer 鉴权：`[rpc] auth_token` 留空（默认）→ 行为完全同 M53；非空时 tx 提交 POST 必须带 `Authorization: Bearer <token>`，否则 401。**读路径（`/batch`、`/validate`、所有 `GET`）保持公开**——只锁写。
+
+- **Config**（`config.rs`）：`RpcConfig.auth_token: String`（`#[serde(default)]` → 默认空）；空 = 关。
+- **编解码**（`daemon.rs`）：`parse_authorization_bearer(headers) -> Result<Option<String>, String>` 提 `Authorization: Bearer …`（header 名大小写无关，scheme 大小写都接受；空 token / 错 scheme 返 Err）；`unauthorized_bearer_response()` 给 `401 Unauthorized` + `WWW-Authenticate: Bearer realm="zhixing-rpc"`（RFC 6750 §3），连接关。
+- **`run_rpc`/`serve_rpc_conn` 串 token**：`run_rpc` 把 `auth_token` 克隆进每个 `serve_rpc_conn`；后者在 `/validate` 处理后、tx-submission body 读前门控——`/batch` 在此之前已返（读路径不受影响）。
+- **不碰** 共识/codec/wire；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+2 → 620）**：`rpc_bearer_auth_gates_the_write_path`（无 token → 401+`WWW-Authenticate: Bearer`、错 token → 401、正确 token → 200、`GET /height` 无 token 仍 200）、`parse_authorization_bearer_cases`（大小写、缺、错 scheme、空 token）。
+- **已知边界（顺延）**：byte-精确比较（不防计时攻击——单运维场景可接受）；多 token/角色、scope、刷新轮转、审计日志是后续运维篮子。
+
+## 轻节点 Prometheus `/metrics`（Milestone 155 · light daemon Phase 3 收尾）
+
+M152 的轻 RPC 加 `GET /metrics` Prometheus 读面，收尾 light daemon 可观测性。
+
+- **端点**：`GET /metrics`（同一 `[rpc]` 监听器）返 Prometheus 文本（`text/plain; version=0.0.4`，忽略 `?format=json`）——gauge `zhixing_height`（tracked 高度）、info-gauge `zhixing_head_info{...} <h>`（head hash 作标签）、`zhixing_peers_connected`（连接 peer 数）、`zhixing_addrs_known`（发现地址簿大小）。命名/格式照全节点 `render_prometheus`。
+- **`LightCmd::Metrics(oneshot<LightMetrics>)`** + `LightActor` 处理（读 `outbound.len()`/`addrs.len()`/tracker）；`LightNode::metrics()` 句柄。
+- **不碰** 共识/codec/wire；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（618，扩展 `light_rpc_status_over_tcp`）**：GET `/metrics` 返 200 Prometheus 文本含 `zhixing_height 3` + `zhixing_peers_connected` gauge。
+
+## 轻节点弱主观性检查点引导（Milestone 154 · light daemon Phase 3e）
+
+M149 的快照种子要下载完整 `ChainState` 快照 + cert。M154 加**最轻引导**：轻节点信任一个运维钉死的 `(height, head, 验证人集)` 锚点（无快照 blob、无 cert），从该高度向前跟踪、对每个后续头用该集 cert 校验。锚点真实性是运维的信任假设——正如 `from_genesis` 信任创世集，故曰*弱主观性*。
+
+- **`ValidatorTracker::from_checkpoint(set, head, height)`**（`light.rs`）：仅置 set/head/height，bonds/pubkeys 空（header-only 跟踪的 `follow_header` 从不读它们）。
+- **`LightGossipNode::from_checkpoint(id, set, head, height, peers)`**（`net.rs`）：种子 tracker、`base_height=height`。
+- **config**（`config.rs`）：`CheckpointConfig { height, head_hex, validators }` + `NodeConfig.checkpoint: Option<_>`（`#[serde(default)]`，复用 genesis `[[validators]]` 编码）；`decode()` → `(head, ValidatorSet)`，拒坏 hex/空集。
+- **`LightNode::start`**：`[checkpoint]` 存在则 `from_checkpoint`；与 `[snapshot]` 互斥（快照是 cert 验证的 ChainState，检查点是纯信任锚）——两者皆设则报错。
+- **不碰** 共识/codec/wire；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+2 → 618）**：`light_from_checkpoint_follows_forward_over_wire`（高度 1 检查点种子 → 经 `LightNetwork` 跟到尖端 3、集匹配权威集）、`checkpoint_config_decodes_and_rejects_bad_input`（合法解码 + 空集/坏 hex 拒）。
+
+## 轻节点 peer discovery（Milestone 153 · light daemon Phase 3d）
+
+M148 的轻节点只连静态配置的 peer——若该 peer 挂了就孤立。M153 给它 peer discovery（复用全节点 M39 地址簿范式）：经 `Peers` gossip 学新 full-node peer 并自动拨号，网络更有韧性。
+
+- **`LightActor` 加 M39 式字段**：`my_id`/`peer_exchange`/`addrs: HashMap<u64,String>`/`dialing: HashSet<u64>`/`auth: Arc<AuthContext>`/`self_tx`。
+- **`peers_msg`/`gossip_peers`/`on_peers`**（`daemon.rs`，镜像全节点）：`on_peers` first-wins 合并地址簿、跳过自身、对**更高 id** 的新 peer 自动 `tokio::spawn(run_connector::<LightCmd>)`（dial-higher-id 不变量——低 id 侧从同一 gossip 学到我们的 addr 并拨我们）。
+- **`run_light_actor`**：`Register` 时（若 `peer_exchange`）附发 `peers_msg`；`Inbound` 拦截 `GossipMsg::Peers` 走 `on_peers`（纯 light 核心丢弃它）；`Announce` 加 `gossip_peers()` 周期传播。
+- **`LightNode::start`**：地址簿种自身 listen（`self_advertise_addr`）+ 配置 peer，高 id 配置 peer 标记已 dialing（boot 连接器覆盖）。gated by `cfg.network.enable_peer_exchange`（默认关 → M148 行为不变）。
+- **顺带清理**：M147 删 oracle 后遗留的 `main.rs` `committed_sets` 死代码移除。
+- **不碰** 共识/codec/wire；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+1 → 616）**：`light_on_peers_learns_and_dials_higher_ids`（确定性单测：学全 peer、跳自身、只拨更高 id、`peer_exchange` 关则 no-op；TCP 端到端 discovery 由全节点 M39 测 + M148 同步测覆盖）。
+
+## 轻节点只读 RPC（Milestone 152 · light daemon Phase 3c）
+
+M148–M151 的轻守护进程此前是黑盒——运维无从查其同步高度。M152 给它一个**只读 RPC** 读面（opt-in `[rpc]`），复用全节点 HTTP framing。
+
+- **端点**：`GET /status`（别名 `/info`）返 tracked `height`+`head`（文本 `height=…\nhead=…` / `?format=json` 返 `{"height":"…","head":"…"}`）；`GET /version` 返软件版本；`GET /`（及未知路径）200 健康探针。
+- **只读**：轻节点无写路径，任何非 GET 方法 → `405 Method Not Allowed`（带 `Allow: GET`，RFC 9110 §15.5.6）。
+- **复用**（`daemon.rs`）：`http_response`/`ok_body`/`RespFormat`/`response_format`/`split_query`/`json_u64`/`json_str`/`MAX_RPC_HEADER`/`NODE_VERSION`——自包含 `serve_light_rpc_conn` + `run_light_rpc`，经 `LightCmd::Status` 查询。`LightNode::start` 在 `cfg.rpc` enabled 时 bind（照全节点 `run_rpc` 范式）。
+- **不碰** 共识/codec/wire；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+1 → 615）**：`light_rpc_status_over_tcp`（快照种子到高度 3 的轻节点 over loopback TCP：`GET /status` 文本 `height=3`、JSON `{"height":"3",…}`、`POST` → 405 带 `Allow: GET`）。
+
+## 轻节点 header 持久化（Milestone 151 · light daemon Phase 3b）
+
+M148 的轻守护进程不落盘，每次重启从创世/快照重新全量同步。M151 让它**持久化已验证的 headers**：重启从磁盘重放恢复到上次高度，而非重新同步。
+
+- **`HeaderLog`**（`store.rs`）：复用现有 `u32 长度前缀 + payload` 追加日志范式，存 `(CertifiedHeader, ValidatorSet)` 对（记录内 `u32 header_len ‖ encode_certified_header ‖ encode_validator_set` 分隔两变长 payload）；torn-tail 照既有检测报错。
+- **`LightGossipNode::next_sets()`** 访问器（`net.rs`，与 `headers()` 平行）——暴露每个 header 采纳的验证人集供持久化。
+- **`LightActor` 持久化**（`daemon.rs`）：`hlog: Option<HeaderLog>` + `appended`，每次 `Inbound` apply 后 `persist()` 追加新 `(header, next_set)` 对（镜像全节点 actor 的 persist；写失败不崩，内存仍服务、重启再同步兜底）。
+- **`LightNode::start` 重放**：`data_dir` 非空时开 `{data_dir}/headers.log`、`read_all` 后经 `apply_header` 重放到刚建的基节点（创世或快照种子），`appended = 持久化数`；重放失败（与基不一致）报错。`data_dir` 空 → 持久化关（M148 的 ephemeral 行为）。
+- **不碰** 共识/codec/wire；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+2 → 614）**：`store::header_log_round_trips`（`(header, set)` 对往返）；`light_resumes_from_persisted_headers`（预置 headers.log 的 3 块链 → 轻节点**无 peer** 启动即重放恢复到高度 3，证明重启免重同步）。
+
+## `HeadersWithSets` 仅变更附集压缩（Milestone 150 · light wire 效率）
+
+M147 的 `HeadersWithSets` 每个头都附**完整**验证人集，即便集未变——对长批次（256 头、集罕变）是巨大冗余。M150 改为 `Vec<(CertifiedHeader, Option<ValidatorSet>)>`：`None` = 「该高度集未变，复用当前集」，`Some(set)` 只在真实换集时携带。
+
+- **serve**（`net.rs` `headers_with_sets_from`）：单趟重放中比较每块 apply 前后 `validators.merkle_root()`，相等 → `None`、否则 `Some(新集)`（未变时连 clone 都省）。
+- **consume**（`on_headers_with_sets`）：`None` → `next = tracker.validators().clone()`（当前跟踪集即认证该头的集）；`apply_header` 仍验 `next.merkle_root() == header.next_validators_root`，故服务端谎报（该变却发 None）会被根校验拒——**压缩不削弱 soundness**。
+- **wire**（`encode_gossip`/`decode_gossip`）：每条目 1 presence 字节（0=None / 1=Some + 长度前缀集），镜像 `Proof` 的 Option 编码。
+- **不碰** 共识/块 codec；localnet 头仍 wire v1 `a045426e…3b87bc`（gossip 信封，不折入哈希）。
+- **测试（+1 → 612，另改 2 测）**：`light_syncs_unchanged_set_via_none_entries`（常集链每头 serve 皆 None，轻节点靠复用当前集同步到尖端）；`headers_with_sets_serve_pairs_each_header_with_its_next_set` 改为断言换集头 Some+含新验证人、未变头 None；`gossip_wire_round_trips_headers_with_sets` 改为往返 Some+None 两形；跨变更 soundness 测 `light_syncs_across_validator_set_change_over_wire` 仍绿（Some 与 None 混合）。
+
+## 轻守护进程快照种子（Milestone 149 · light daemon Phase 3a）
+
+M148 的 `node light-run` 是从创世跟踪的 MVP。M149 接上 fast-sync 收尾：让轻守护进程经 `[snapshot]` 配置（M141 的 cert + trusted_validators）**快照种子起步**，使 M142 的 `from_verified_snapshot` 在生产中可达。
+
+- **`load_light_snapshot_seed`**（`daemon.rs`）：解码 snapshot/header/cert + 建 trusted `ValidatorSet`（复用 `snapshot_trusted_set`），调 `LightGossipNode::from_verified_snapshot`（M134/M142：cert 达 trusted 集 >2/3 + 绑头 + 三根重算一致）。`LightNode::start` 在 `cfg.snapshot` 为 `Some` 时走此、否则 `::new`。
+- **轻节点必须 cert**：轻节点无本地状态重算三根，`[snapshot]` 缺 cert → 报错（不像全节点有 M135 承诺回退）。
+- **CLI**：`cmd_run` 的 `--snapshot*` 解析抽成共享 `merge_snapshot_flags`，`node light-run` 复用——`node light-run --config F --snapshot FILE --snapshot-header HEX --snapshot-cert HEX --snapshot-validators FILE`。
+- **不碰** `net.rs`（`from_verified_snapshot` 已全）/共识/codec；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+2 → 611）**：`light_snapshot_seed_starts_at_tip`（配 snapshot+cert+trusted → 轻节点直接在快照尖端起步，`status().height == snapshot.height`）、`light_snapshot_seed_requires_cert`（缺 cert → 报错）。
+
+**顺延 Phase 3 余项**：轻 RPC/metrics 读面、peer discovery、headers 持久化、弱主观性引导、`HeadersWithSets` 仅变更附集压缩。
+
+## `node light-run` — 生产级轻客户端守护进程（Milestone 148 · light daemon Phase 2）
+
+M131–M147 把 fast-sync 的协议与库件做齐，但轻客户端至今只有 demo/测试用的进程内 `LightNetwork`，没有真正长跑的守护进程。M148 建 **`node light-run --config F`**：长跑轻节点 over TCP 连全节点 peer、拉 `GetHeadersWithSets`（M147）、用 `LightGossipNode` 跟踪验证人集。**headers-only——无块体、无共识、无 mempool、无 ChainState 执行、无落盘。**
+
+- **传输层泛型化**（`daemon.rs`，最小 seam）：`handle_conn` 对 `Cmd` 的耦合只在 3 个构造点（register/inbound/unregister）。引入 `trait TransportCmd { register/inbound/unregister }`，`handle_conn`/`run_listener`/`run_connector` 泛型化，`impl TransportCmd for Cmd`——auth/TLS/握手/framing 分支**一字不改**，全节点 607 测守护等价。首选此而非复制 ~60 行安全敏感握手码。
+- **轻 actor**（`daemon.rs`）：`LightCmd`（register/inbound/unregister/announce/status 五变体）+ `LightActor { node: LightGossipNode, outbound }` + `run_light_actor`——`Register` 回 Status、`Inbound` 走 `node.on_message`+route、`Announce` 走 `node.announce()`、`Status` 回 `(height, head)`。无 persist/broadcast/reconcile。
+- **`LightNode::start` + `daemon::light_run`**（`daemon.rs`）：复用 `AuthContext` build（`kp: None`、`enable_tls` 加密模式）、`run_listener::<LightCmd>`/`run_connector::<LightCmd>`（拨 `id > my_id`）、announce 心跳。fail-fast：`require_peer_auth`/`require_peer_certs` 开启则报错（轻节点无 key）。`LightNode` 句柄带 `status() -> (height, head)`。
+- **CLI**（`main.rs`）：`node light-run --config F`（镜像 `cmd_run`，不解析 validator key），dispatch + help。
+- **复用边界**：`read_frame`/`write_frame`/`auth_handshake`/TLS/`AuthContext`/`run_listener`/`run_connector`/`LightGossipNode` 全复用；全节点已 serve `GetHeadersWithSets`（M147），故轻守护进程能连**未改动的**全节点 peer。
+- **不碰** `net.rs`/`config.rs`（`NodeConfig` 原样复用——轻节点只是不读 `[validator]`/`[consensus]`/`[mempool]`）/共识/codec/块 wire；`localnet` 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+2 → 609）**：`light_run_syncs_headers_from_a_full_node_over_tcp`（核心：单验证人全节点 + 轻节点 over loopback TCP，轻节点同步到高度≥3、head == 全节点同高 header hash）、`light_start_rejects_require_peer_auth_without_key`。
+
+**范围 = MVP（连接 + headers-with-sets 同步）**。快照种子（`from_verified_snapshot` 经 `[snapshot]` cert+trusted_validators）与下列顺延 Phase 3：轻 RPC/metrics 读面、peer discovery、headers 持久化、弱主观性引导。
+
+## 下一验证人集随头同步上线（Milestone 147 · light fast-sync 协议前置）
+
+目标是生产级轻客户端守护进程（`node light-run`）让 M142 的 `from_verified_snapshot` 真正可用。探查发现它是**三阶段**工程，有一个硬协议前置缺口：**轻节点今天无法仅凭 wire 跨验证人集变更同步**——`GossipMsg::Headers`/`CertifiedHeader` 只带 `next_validators_root`（32B 承诺），不带集合内容，而 `follow_header` 要求调用方传完整 `ValidatorSet`；今天这份集由 `LightNetwork::run` 的**进程内 oracle** `next_set_for` 伪造。M147 关这个缺口（守护进程本身留后续 Phase）。
+
+- **head 安全**：GossipMsg 是 P2P 信封，不折入任何 cert-signed 哈希（`encode_gossip` 独立于 `encode_block`/`encode_tx`）。纯新增 wire 变体 + 新 codec → `localnet` 头仍 wire v1 `a045426e…3b87bc`，全节点 BFT 收敛不受影响。
+- **`ValidatorSet` wire codec**（`codec.rs`）：`encode_validator_set`/`decode_validator_set`——长度前缀的 `(u64 id, 32B pubkey, u64 power)` 列表，确定性（id 排序）、拒尾字节。
+- **两新 GossipMsg**（`net.rs`，tag 18/19）：`GetHeadersWithSets { from }` + `HeadersWithSets(Vec<(CertifiedHeader, ValidatorSet)>)`——条目 `i` = `(高度 from+i 的头, 认证 from+i+1 的验证人集)`（= 应用块 from+i 后状态的 validators，其 `merkle_root == header.next_validators_root`）。
+- **全节点 serve**（`net.rs`）：`headers_with_sets_from(from)` 单趟重放（从 base 种子逐块 commit，对 `[start..end]` 每块快照 `state.validators` 与头配对），`on_message` 加 `GetHeadersWithSets` serve 臂。
+- **轻节点 consume**（`net.rs`）：同步请求从 `GetHeaders` 改 `GetHeadersWithSets`；新 `on_headers_with_sets` 对每个 `(header, next_set)` 调 `apply_header`（`follow_header` 对当前 set 验 cert、对 `next_validators_root` 验 next_set、推进）——**无状态、仅凭 wire**，替代 oracle。旧 `Headers`/`on_headers`（dedup-only）保留。
+- **`LightNetwork` 改 oracle-free**：`run()` 去掉 `next_set_for` 参数，新消息经正常 `on_message` 路径推进；更新 3 个 demo + 既有 light 测的调用（断言在真实 wire 路径下更强）。
+- **测试（+4 → 607）**：`validator_set_wire_round_trips`（codec）；`headers_with_sets_serve_pairs_each_header_with_its_next_set`（每条 `set.merkle_root == header.next_validators_root`，覆盖验证人变更）；**`light_syncs_across_validator_set_change_over_wire`（核心 soundness：轻节点仅凭 wire 跨「高度 1 加验证人 25」的集合变更同步到尖端 + 权威集，学到 25）**；`gossip_wire_round_trips_headers_with_sets`；既有 light 总线测迁移到 oracle-free 后仍绿（现经真实 wire）。
+
+**light 守护进程分阶段（M147 为 Phase 1 协议前置）**：
+- **Phase 2**：light 专属 actor + `node light-run` + `[light]` config，复用全部传输层（`handle_conn`/`run_listener`/`run_connector`/`AuthContext`/TLS），snapshot-seed via `from_verified_snapshot`。
+- **Phase 3**：弱主观性 trusted-set 引导、metrics/RPC、proof 透传；`HeadersWithSets` 的「仅变更附集」压缩。
+
+## `/block/{h}` O(1) 按高度索引（Milestone 146 · 读路径 perf）
+
+`Cmd::QueryBlock` / `Cmd::QueryBlockTxs`（服务 `/block/{h}` 与 `/block/{h}/txs`）此前对 `node.blocks()` 做**线性 `find`**（O(n)）。但节点自 M139 起已偏移感知（`base_height` + `vec_idx`），高度→索引本是纯算术。M146 加 `GossipNode::block_at(height)` 复用 `vec_idx` 做 O(1) 查，两个 handler 改用它。
+
+- **行为逐字节不变**：`blocks[i]` = 高度 `base_height+1+i`（M139 不变量），故索引算术与线性 `find` 等价——创世节点、快照节点、pruned/past-tip 全部同 None/Some；410-vs-404 下游逻辑（`query_base_height`）不变。既有 602 测绿即证。
+- **`block_at`**（`net.rs`）：`self.vec_idx(height).map(|i| &self.blocks[i])`——pruned（`≤ base_height`）/ 创世（0）/ 过尖端均 None。
+- **不碰** wire/codec/共识/config；`localnet` 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+1 → 603）**：`block_at_is_offset_aware_o1_lookup`（创世节点与快照节点各验 pruned/有效/过尖端）。
+
+**已知边界（顺延）**：百分比 RBF 加价（bps）；光守护进程；keystore 口令加密 / BIP-39。
+
+## replace-by-fee 最小加价阈值（Milestone 145 · mempool RBF anti-churn）
+
+M144 的 RBF 要求替换 tx「fee 严格更高」，但哪怕只高 1 micro 也能替换——敌手可用极小加价反复替换同槽 tx 制造 churn。M145 加**最小加价阈值** `min_fee_bump`：替换须满足 `new.fee >= incumbent.fee + min_fee_bump`。
+
+- **默认 `min_fee_bump = 1`**：对整数 fee 恰为「严格更高」（`fee >= inc+1` ⟺ `fee > inc`），故与 M144 **逐字节等价**——既有 599 测 + localnet head 不变（38 个 mempool 测含全部 M144 RBF 测在默认 bump=1 下全绿即证）。
+- **语义**（`mempool.rs` `insert`）：RBF 分支的比较从 `tx.fee > inc_fee` 改为 `tx.fee >= inc_fee.saturating_add(self.min_fee_bump)`（`saturating_add` 防溢出）。`min_fee_bump > 1` 要求更大跳涨（抑制 churn）；`= 0` 允许等 fee 替换（新内容夺槽）。仅 RBF 开启时生效。
+- **新字段** `min_fee_bump: u64`（默认 1）+ `set_min_fee_bump`/getter；`MempoolConfig.min_fee_bump`（`#[serde(default)]`=1）；`GossipNode::set_mempool_min_fee_bump` 代理；`Node::start` 在 RBF 开启块内布线（RBF 关 → 不涉及）。
+- **不碰** build/apply/codec/wire；`localnet` 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+3 → 602）**：`rbf_default_min_bump_is_one_strictly_higher`（默认 1 = 严格更高，+1 替换）、`rbf_min_bump_requires_larger_increment`（bump 10：+5 拒、+10 替换）、`rbf_min_bump_zero_allows_equal_fee_replacement`（bump 0：等 fee 新内容夺槽）；config 测扩展断言 `min_fee_bump` 缺省 1。
+
+**已知边界（顺延）**：百分比加价（bps，跨 fee 量级更稳；本轮为绝对增量）；光守护进程；`Cmd::QueryBlock` 线性 find 改索引。
+
+## 显式 replace-by-fee（Milestone 144 · mempool RBF）
+
+M143 让 mempool 可按 (account, nonce) 流水线缓冲多笔 tx，但同一 (author, nonce) 的竞争 tx（同槽不同内容/fee）今天会**同时**驻留（`pending` 按 content-hash 键），出块隐式取 fee 最优、落败者滞留到 `prune_stale`——浪费池容量 + quota，替换语义隐式。M144 加**显式 replace-by-fee**：准入时若新 tx 与某在池 tx 同 (author, nonce)，仅当新 fee **严格更高**才替换旧的，否则拒绝新的，使每槽位至多一笔 pending。
+
+- **opt-in，默认关**（`replace_by_fee = false`）→ 现行为（同槽多笔共存 + 出块隐式选优 + prune）逐字节保留，既有 591 测 + localnet head 不变。**链上不涉及**（纯 mempool 准入策略）。
+- **`insert` RBF 分支**（`mempool.rs`）：在 `validate_tx_ignoring_nonce` + nonce 窗口检查后、capacity/quota 前——RBF 开启时扫描 `pending` 找同 `(author, nonce)` incumbent（不同 hash）：`tx.fee > incumbent.fee` → 先移除 incumbent（quota 递减）再走正常纳入（capacity 见释放槽不误拒、quota 净不变），否则 `ChainError::FeeTooLowToReplace { author, nonce, existing_fee, got_fee }`。同 hash 重插仍幂等（落到原路径）。扫描 O(n) 仅 RBF 开启时、池受 capacity 约束，故不引索引（避免与 `pending` 失同步的不变量）。
+- **新字段** `replace_by_fee: bool` + `set_replace_by_fee`/getter；`MempoolConfig.replace_by_fee`（`#[serde(default)]`=false）；`GossipNode::set_mempool_replace_by_fee` 代理；`Node::start` 按 `cfg.mempool.replace_by_fee` 布线（false→不调用→不变）。
+- **不碰** `build_block`（RBF 开启时每槽 ≤1 笔，M143 多趟算法天然适配）、`prune_stale`、`apply_tx`/`validate_tx`/codec/wire/`driver.rs`/`light.rs`；`localnet` 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+8 → 599）**：mempool `rbf_replaces_lower_fee_at_same_slot`、`rbf_rejects_not_higher_fee`（等/低 fee 均 `FeeTooLowToReplace`、incumbent 留存）、`rbf_idempotent_same_tx`、`rbf_different_nonces_coexist`（不同槽不替换）、`rbf_replacement_preserves_quota`（per_account_limit 1 下替换不超额）、`rbf_off_by_default_keeps_same_slot_duplicates`；lib `fee_too_low_to_replace_error_display`；config `mempool_config_replace_by_fee_defaults_false`。
+
+**已知边界（顺延）**：最小 fee 加价阈值（`new.fee >= old.fee + min_bump` 防抖动替换，本轮为「严格更高即可」）；光守护进程；`Cmd::QueryBlock` 线性 find 改索引。
+
+## nonce 流水线：每账户多笔待打包 tx（Milestone 143 · mempool pipelining）
+
+M122（wire v1）已完整实现 nonce 反重放，但 `validate_tx` 的严格 `tx.nonce == acct.nonce` 在 **mempool 准入**（`Mempool::insert`）也生效，导致**一个账户同时只能有一笔待打包 tx**——下一笔（nonce+1）须等前一笔提交才能准入。M143 加 **nonce 流水线**：允许账户缓冲一个有界窗口内的未来 nonce，出块时按**账户内 nonce 顺序 + 跨账户 fee 优先**确定性打包，使 nonce N、N+1 进同一个块。
+
+- **链上不破坏**：`apply_tx`/`validate_tx`（共识路径）仍严格相等，块按精确 nonce 顺序应用。改动纯在 mempool（准入 + 出块 + 清理）。
+- **默认 `lookahead = 0` = 现严格行为**（opt-in，照 M54/M57 capacity/quota 范式）→ localnet head + 582 既有测试逐字节不变。
+- **验证拆分**（`lib.rs`）：抽出 `validate_tx_ignoring_nonce`（除严格 nonce 外全部检查）；`validate_tx` = 它 + 末尾严格 nonce（apply 路径等价——多条件同失败时仅改返回的错误变体，不改「拒绝=跳过」与块组成）。新错误 `ChainError::NonceTooFarAhead { account, got, limit }`。
+- **准入窗口**（`mempool.rs` `insert`）：`validate_tx_ignoring_nonce` 后——`tx.nonce < acct.nonce` → `BadNonce`（重放）；`tx.nonce > acct.nonce + nonce_lookahead` → `NonceTooFarAhead`；否则准入。新字段 `nonce_lookahead` + `set_nonce_lookahead`/getter。
+- **确定性流水线出块**（`mempool.rs` `build_block`，无条件重写）：候选按 `(fee desc, hash asc)` 排序；tx 仅在其 nonce == 账户当前 trial nonce 时**合格**；多趟循环——每趟按序试应用合格者，应用推进账户 trial nonce 暴露后继，直到整趟无进展。**`lookahead=0` 时每账户 ≤1 笔合格 tx，首趟即全合格 → 与现单趟 fee-sort 逐字节等价**（账户相互独立 + 全序 tiebreak，已证）。
+- **过期清理**（`mempool.rs` `prune_stale(&chain)`）：丢弃 `tx.nonce < acct.nonce` 的 pending（重放 / 同-nonce 落败重复——此类泄漏 M122 已存在），同步 quota。在两个 commit 点 `remove_included` 后调用（`net.rs` `apply_certified`、`driver.rs`）。
+- **配置/布线**：`MempoolConfig.nonce_lookahead`（`#[serde(default)]`=0）；`GossipNode::set_mempool_nonce_lookahead` 代理；`Node::start` 按 `cfg.mempool.nonce_lookahead > 0` 布线（0→不调用→不变）。
+- **不碰**：`apply_tx`/`apply_block`/codec/wire（nonce 已在 wire v1）；`localnet` 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+9 → 591）**：mempool `lookahead_zero_rejects_future_nonce`（默认严格）、`pipeline_admits_consecutive_nonces_when_lookahead_set`、`pipeline_builds_account_txs_in_nonce_order_in_one_block`（三 nonce 一块内升序、commit 干净、守恒）、`build_fee_priority_across_accounts_respects_per_account_nonce_order`（高 fee 账户先，但账户内 nonce 保序）、`pipeline_rejects_stale_and_too_far_ahead`、`prune_stale_drops_committed_and_stale_duplicates`；lib `validate_tx_ignoring_nonce_matches_validate_tx_sans_nonce`、`nonce_too_far_ahead_error_display`；config `mempool_config_nonce_lookahead_defaults_zero`。
+
+**已知边界（顺延）**：显式 replace-by-fee（同 nonce 更高 fee 替换，现为出块时隐式取 fee 最优）；光守护进程；`Cmd::QueryBlock` 线性 find 改索引。
 
 ## 轻客户端快照 fast-sync 种子（Milestone 142 · 快速同步收官）
 

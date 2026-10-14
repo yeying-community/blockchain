@@ -302,6 +302,7 @@ fn main() {
         "bridge" => cmd_bridge(),
         "redeem" => cmd_redeem(),
         "run" => cmd_run(config_arg(&args), &args),
+        "light-run" => cmd_light_run(config_arg(&args), &args),
         "check-config" => cmd_check_config(config_arg(&args)),
         "genesis-hash" => cmd_genesis_hash(config_arg(&args)),
         "inspect-genesis" => cmd_inspect_genesis(config_arg(&args)),
@@ -400,6 +401,7 @@ fn usage() {
     eprintln!("  node redeem             consensus-level redeem: B's producer follows A on-chain and mints from a source lock inside its state machine — the mint is BFT-enforced, not off-chain");
     eprintln!("  node run    --config F  run the networked BFT daemon (tokio TCP P2P): load config/genesis/validator key, gossip votes + sync/verify over sockets");
     eprintln!("  node run    --config F --snapshot FILE --snapshot-header HEX [--snapshot-cert HEX --snapshot-validators FILE]  adopt a M131 snapshot at boot (fast-sync): verify the header's three roots against the snapshot (M135) and, when a cert + trusted set are given, additionally require the cert to reach >2/3 of that pinned set (M141); restart resumes the post-snapshot tail without re-syncing");
+    eprintln!("  node light-run --config F  run a light-client daemon (M148): connect to full-node peers over TCP, pull headers-with-sets (M147), track the validator set; headers-only — no block bodies, consensus, mempool, or on-disk state");
     eprintln!("  node check-config --config F  dry-run: load + validate config, its genesis, and validator key (if any) without starting the daemon; print a summary or the first error");
     eprintln!("  node genesis-hash --config F  print the chain identity derived from the config's genesis: genesis_hash + initial state_root + validator count (compare across operators before joining)");
     eprintln!("  node inspect-genesis --config F  dump the config's genesis contents: every account (id/balance/pubkey), reviewer, validator, plus params (the detail view to genesis-hash's identity)");
@@ -1782,10 +1784,10 @@ fn cmd_lsync() {
     );
     let mut net = LightNetwork::new(vec![full], vec![light]);
 
-    // Per-height authoritative next sets, computed once from a full replay.
-    // The light peer is told "block i+1 was certified by this set, and it
-    // commits to this next set in its `next_validators_root`" — exactly the
-    // side-information `follow_committed`/`follow_header` need.
+    // M147: the light peer syncs headers-with-sets over the wire — the full peer
+    // ships each header paired with the next validator set, so no out-of-band
+    // `next_set` oracle is needed anymore. (The `committed_sets` replay below is kept
+    // only for the membership-proof illustration further down, not for sync.)
     let mut committed_sets: Vec<ValidatorSet> = Vec::new();
     let mut replay = Chain::new(demo_genesis());
     for b in d.blocks() {
@@ -1795,16 +1797,17 @@ fn cmd_lsync() {
             .unwrap_or_else(|e| fail_msg("replay commit", &e));
         committed_sets.push(replay.state.validators.clone());
     }
-    let next_set_for = |h: u64| committed_sets.get((h - 1) as usize).cloned();
 
     net.announce_all();
     for round in 0..10 {
-        let n = net.run(1, light_id, &next_set_for);
+        let n = net.run();
         if n == 0 {
             break;
         }
         if round == 0 {
-            println!("  round 1: light Status{{height=0}} -> full replies Headers{{from=1}}");
+            println!(
+                "  round 1: light Status{{height=0}} -> full replies HeadersWithSets{{from=1}}"
+            );
         }
     }
 
@@ -1933,16 +1936,11 @@ fn cmd_account() {
     let light = LightGossipNode::new(light_id, &demo_genesis(), [1, 2]);
     let mut net = LightNetwork::new(vec![full], vec![light]);
 
-    // 3. Authoritative per-height next sets from a full replay; needed to
-    //    side-channel the headers from full -> light through
-    //    LightGossipNode::apply_header (the bus drops them otherwise).
-    let sets = committed_sets(&demo_genesis(), &blocks);
-    let next_set_for = |h: u64| sets.get((h - 1) as usize).cloned();
-
-    // 4. Run the M22 sync to header height 2.
+    // 3. M147: headers-with-sets sync — the full peer ships each header's next set
+    //    over the wire, so the light peer advances with no out-of-band oracle.
     net.announce_all();
     for _ in 0..20 {
-        let n = net.run(1, light_id, &next_set_for);
+        let n = net.run();
         if n == 0 && net.light_node(light_id).tracker().height() == 2 {
             break;
         }
@@ -3238,13 +3236,10 @@ fn cmd_graph() {
     let light = LightGossipNode::new(light_id, &demo_genesis(), [1, 2]);
     let mut net = LightNetwork::new(vec![full], vec![light]);
 
-    // Side-channel next_set_for so the M22 sync runs through apply_header.
-    let sets = committed_sets(&demo_genesis(), &blocks);
-    let next_set_for = |h: u64| sets.get((h - 1) as usize).cloned();
-
+    // M147: headers-with-sets sync — next sets ride the wire, no oracle needed.
     net.announce_all();
     for _ in 0..20 {
-        let n = net.run(1, light_id, &next_set_for);
+        let n = net.run();
         if n == 0 && net.light_node(light_id).tracker().height() == 1 {
             break;
         }
@@ -3719,28 +3714,18 @@ fn cmd_inspect_cert(args: &[String]) {
     }
 }
 
-fn cmd_run(config_path: String, args: &[String]) {
-    // M44: load the config first, then install the subscriber from its optional
-    // `[logging]` section (absent ⇒ the M37 default). Config-load errors print via
-    // `fail_msg`/eprintln — not tracing — so no log lines are lost by ordering the
-    // load before the subscriber init.
-    let mut cfg =
-        config::load_node_config(&config_path).unwrap_or_else(|e| fail_msg("load node config", &e));
-    // M140: optional snapshot-boot flags — `--snapshot FILE` + `--snapshot-header HEX`. The two
-    // flags are a coherent pair; if either is given we set `cfg.snapshot` so `Node::start`
-    // adopts the snapshot at boot (reconciling the on-disk log + verifying the cert-signed
-    // header against the snapshot's three roots).
-    // M141: optional `--snapshot-cert HEX` + `--snapshot-validators FILE` upgrade the boot to a
-    // `>2/3` quorum check against an operator-pinned trusted set. They require the base pair and
-    // are themselves a coherent pair; the final cert/trusted-set coherence is enforced in
-    // `load_snapshot_boot` (authoritative for both the CLI and the TOML keypath).
+/// M140/M141/M149: fold the `--snapshot*` CLI flags into `cfg.snapshot`, shared by
+/// `node run` (M140/M141) and `node light-run` (M149). `--snapshot` + `--snapshot-header`
+/// are a required pair; `--snapshot-cert` + `--snapshot-validators` upgrade to a quorum
+/// check and require the base pair. `who` names the subcommand in error messages.
+fn merge_snapshot_flags(cfg: &mut config::NodeConfig, args: &[String], who: &str) {
     let snap_path = opt_arg(args, "--snapshot").map(str::to_string);
     let snap_header = opt_arg(args, "--snapshot-header").map(str::to_string);
     let snap_cert = opt_arg(args, "--snapshot-cert").map(str::to_string);
     let snap_vals = opt_arg(args, "--snapshot-validators").map(str::to_string);
     match (snap_path, snap_header) {
         (Some(_), None) | (None, Some(_)) => fail_msg(
-            "node run",
+            who,
             &"--snapshot and --snapshot-header must be given together",
         ),
         (Some(path), Some(header_hex)) => {
@@ -3761,12 +3746,30 @@ fn cmd_run(config_path: String, args: &[String]) {
         (None, None) => {
             if snap_cert.is_some() || snap_vals.is_some() {
                 fail_msg(
-                    "node run",
+                    who,
                     &"--snapshot-cert/--snapshot-validators require --snapshot and --snapshot-header",
                 );
             }
         }
     }
+}
+
+fn cmd_run(config_path: String, args: &[String]) {
+    // M44: load the config first, then install the subscriber from its optional
+    // `[logging]` section (absent ⇒ the M37 default). Config-load errors print via
+    // `fail_msg`/eprintln — not tracing — so no log lines are lost by ordering the
+    // load before the subscriber init.
+    let mut cfg =
+        config::load_node_config(&config_path).unwrap_or_else(|e| fail_msg("load node config", &e));
+    // M140: optional snapshot-boot flags — `--snapshot FILE` + `--snapshot-header HEX`. The two
+    // flags are a coherent pair; if either is given we set `cfg.snapshot` so `Node::start`
+    // adopts the snapshot at boot (reconciling the on-disk log + verifying the cert-signed
+    // header against the snapshot's three roots).
+    // M141: optional `--snapshot-cert HEX` + `--snapshot-validators FILE` upgrade the boot to a
+    // `>2/3` quorum check against an operator-pinned trusted set. They require the base pair and
+    // are themselves a coherent pair; the final cert/trusted-set coherence is enforced in
+    // `load_snapshot_boot` (authoritative for both the CLI and the TOML keypath).
+    merge_snapshot_flags(&mut cfg, args, "node run");
     daemon::init_tracing_with(cfg.logging.as_ref());
     let gcfg = config::load_genesis(&cfg.genesis).unwrap_or_else(|e| fail_msg("load genesis", &e));
     let genesis = gcfg
@@ -3787,6 +3790,30 @@ fn cmd_run(config_path: String, args: &[String]) {
     rt.block_on(async move {
         if let Err(e) = daemon::run(cfg, genesis, validator_key).await {
             fail("daemon", e);
+        }
+    });
+}
+
+/// M148: run a light-client daemon — connect to the configured full-node peers over
+/// TCP, pull `GetHeadersWithSets` (M147), and track the validator set with a
+/// `LightGossipNode`. Headers-only: no block bodies, consensus, mempool, or on-disk
+/// state. Mirrors `cmd_run` but never resolves a validator key.
+fn cmd_light_run(config_path: String, args: &[String]) {
+    let mut cfg =
+        config::load_node_config(&config_path).unwrap_or_else(|e| fail_msg("load node config", &e));
+    // M149: a light node may snapshot-seed via `--snapshot*` (verified in light_start,
+    // which requires a cert + trusted set — a light node can't recompute roots locally).
+    merge_snapshot_flags(&mut cfg, args, "node light-run");
+    daemon::init_tracing_with(cfg.logging.as_ref());
+    let gcfg = config::load_genesis(&cfg.genesis).unwrap_or_else(|e| fail_msg("load genesis", &e));
+    let genesis = gcfg
+        .to_genesis()
+        .unwrap_or_else(|e| fail_msg("build genesis", &e));
+
+    let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| fail("tokio runtime", e));
+    rt.block_on(async move {
+        if let Err(e) = daemon::light_run(cfg, genesis).await {
+            fail("light daemon", e);
         }
     });
 }
@@ -4283,6 +4310,7 @@ fn cmd_localnet() {
             logging: None,
             mempool: crate::config::MempoolConfig::default(),
             snapshot: None,
+            checkpoint: None,
         }
     };
 
@@ -4939,20 +4967,6 @@ fn demo_driver_seeds() -> std::collections::BTreeMap<u64, [u8; 32]> {
             (id, s)
         })
         .collect()
-}
-
-/// Per-height committed sets from an authoritative replay: `sets[i]` is the
-/// validator set that certifies height `i + 2` (what block `i + 1` commits to
-/// in `next_validators_root`).
-fn committed_sets(g: &Genesis, blocks: &[Block]) -> Vec<ValidatorSet> {
-    let mut replay = Chain::new(g.clone());
-    let mut sets = Vec::new();
-    for b in blocks {
-        let mut b = b.clone();
-        replay.commit(&mut b).expect("commit");
-        sets.push(replay.state.validators.clone());
-    }
-    sets
 }
 
 #[cfg(test)]

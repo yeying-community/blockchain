@@ -51,6 +51,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -577,6 +578,18 @@ enum Cmd {
     BaseHeight(oneshot::Sender<u64>),
 }
 
+impl TransportCmd for Cmd {
+    fn register(id: u64, tx: mpsc::UnboundedSender<GossipMsg>) -> Self {
+        Cmd::Register { id, tx }
+    }
+    fn inbound(from: u64, msg: Box<GossipMsg>) -> Self {
+        Cmd::Inbound { from, msg }
+    }
+    fn unregister(id: u64) -> Self {
+        Cmd::Unregister { id }
+    }
+}
+
 /// M125: upper bounds (in microseconds) of the finite block-apply latency histogram buckets,
 /// ascending. Block apply is a fast in-memory state transition (typically sub-millisecond), so
 /// the buckets are dense at the low end. An observation above the last bound only increments the
@@ -658,6 +671,26 @@ pub struct Metrics {
     /// M57: cumulative admissions rejected by the per-account mempool quota
     /// (monotonic counter; `0` when the quota is disabled).
     pub txs_quota_rejected: u64,
+    /// M161: cumulative admissions rejected by the M157 min-fee floor
+    /// (monotonic counter; `0` when the floor is disabled, i.e. `min_fee == 0`).
+    pub txs_min_fee_rejected: u64,
+    /// M162: cumulative admissions rejected by the M54 global capacity bound
+    /// (monotonic counter; `0` while capacity is unbounded).
+    pub txs_full_rejected: u64,
+    /// M162: cumulative admissions rejected as a stale (replayed) nonce (monotonic counter).
+    pub txs_bad_nonce_rejected: u64,
+    /// M162: cumulative admissions rejected past the M143 nonce pipelining window
+    /// (monotonic counter; `0` under the strict default).
+    pub txs_nonce_too_far_rejected: u64,
+    /// M162: cumulative admissions rejected by an under-bid M144 replace-by-fee attempt
+    /// (monotonic counter; `0` while replace-by-fee is off).
+    pub txs_replace_fee_rejected: u64,
+    /// M163: cumulative RPC write-path requests rejected by bearer auth (M156)
+    /// (monotonic counter; `0` while `[rpc] auth_token` is empty or the RPC is off).
+    pub rpc_auth_failures: u64,
+    /// M163: cumulative `/metrics` scrapes rejected by bearer auth (M158)
+    /// (monotonic counter; `0` while `[metrics] auth_token` is empty or metrics is off).
+    pub metrics_auth_failures: u64,
     /// M125: block-apply (consensus→committed) latency histogram. `block_apply_buckets[i]`
     /// is the *non-cumulative* count of applies that fell in bucket `i` (≤ `BLOCK_APPLY_BUCKET_MICROS[i]`
     /// and above the previous bound); applies slower than the last finite bound land only in the
@@ -1051,6 +1084,13 @@ struct Actor {
     tx_burst: f64,
     /// M54: count of gossip txs dropped by the per-peer rate limiter.
     txs_rate_limited: u64,
+    /// M163: cumulative RPC write-path requests rejected by bearer auth (M156). Shared
+    /// with the per-connection `serve_rpc_conn` tasks via `Arc<AtomicU64>` — they
+    /// `fetch_add` on each 401, the actor `load`s it into the metrics snapshot.
+    rpc_auth_failures: Arc<AtomicU64>,
+    /// M163: cumulative `/metrics` scrapes rejected by bearer auth (M158). Same sharing
+    /// model as [`Actor::rpc_auth_failures`].
+    metrics_auth_failures: Arc<AtomicU64>,
 }
 
 /// M54: a minimal token bucket for per-peer gossip rate limiting. Refills
@@ -1652,34 +1692,29 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             }
             Cmd::QueryBlock { height, reply } => {
                 // M113: locate the committed block at `height` and summarize its header + body.
-                let summary = actor
-                    .node
-                    .blocks()
-                    .iter()
-                    .find(|b| b.height == height)
-                    .map(|b| BlockSummary {
-                        height: b.height,
-                        hash: b.hash(),
-                        prev_hash: b.prev_hash,
-                        timestamp_days: b.timestamp_days,
-                        proposer: b.proposer,
-                        state_root: b.state_root,
-                        accounts_root: b.accounts_root,
-                        n_txs: b.txs.len(),
-                        fees: b.txs.iter().map(|t| t.fee).sum(),
-                        n_stake_ops: b.stake_ops.len(),
-                        n_evidence: b.slashing_evidence.len(),
-                        n_validator_updates: b.validator_updates.len(),
-                    });
+                // M146: O(1) offset-aware lookup via `block_at` (was a linear scan).
+                let summary = actor.node.block_at(height).map(|b| BlockSummary {
+                    height: b.height,
+                    hash: b.hash(),
+                    prev_hash: b.prev_hash,
+                    timestamp_days: b.timestamp_days,
+                    proposer: b.proposer,
+                    state_root: b.state_root,
+                    accounts_root: b.accounts_root,
+                    n_txs: b.txs.len(),
+                    fees: b.txs.iter().map(|t| t.fee).sum(),
+                    n_stake_ops: b.stake_ops.len(),
+                    n_evidence: b.slashing_evidence.len(),
+                    n_validator_updates: b.validator_updates.len(),
+                });
                 let _ = reply.send(summary);
             }
             Cmd::QueryBlockTxs { height, reply } => {
                 // M114: the tx references (hash + author) of the committed block at `height`.
+                // M146: O(1) offset-aware lookup via `block_at` (was a linear scan).
                 let txs = actor
                     .node
-                    .blocks()
-                    .iter()
-                    .find(|b| b.height == height)
+                    .block_at(height)
                     .map(|b| b.txs.iter().map(|tx| (tx.hash(), tx.author)).collect());
                 let _ = reply.send(txs);
             }
@@ -1734,6 +1769,10 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     create_empty_blocks: actor.timing.create_empty_blocks,
                     mempool_capacity: actor.node.mempool.capacity(),
                     mempool_per_account_limit: actor.node.mempool.per_account_limit(),
+                    mempool_nonce_lookahead: actor.node.mempool.nonce_lookahead(),
+                    mempool_replace_by_fee: actor.node.mempool.replace_by_fee(),
+                    mempool_min_fee_bump: actor.node.mempool.min_fee_bump(),
+                    mempool_min_fee: actor.node.mempool.min_fee(),
                 });
             }
             Cmd::QueryNode { reply } => {
@@ -1779,6 +1818,13 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     slashing_events: actor.slashing_events,
                     txs_rate_limited: actor.txs_rate_limited,
                     txs_quota_rejected: actor.node.mempool.rejected_quota(),
+                    txs_min_fee_rejected: actor.node.mempool.rejected_min_fee(),
+                    txs_full_rejected: actor.node.mempool.rejected_full(),
+                    txs_bad_nonce_rejected: actor.node.mempool.rejected_bad_nonce(),
+                    txs_nonce_too_far_rejected: actor.node.mempool.rejected_nonce_too_far(),
+                    txs_replace_fee_rejected: actor.node.mempool.rejected_replace_fee(),
+                    rpc_auth_failures: actor.rpc_auth_failures.load(Ordering::Relaxed),
+                    metrics_auth_failures: actor.metrics_auth_failures.load(Ordering::Relaxed),
                     block_apply_buckets: actor.block_apply_buckets,
                     block_apply_sum_micros: actor.block_apply_sum_micros,
                     block_apply_count: actor.block_apply_count,
@@ -1805,11 +1851,22 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
 /// M42: `binding` carries this connection's TLS keying-material exporter (`Some`
 /// only when TLS is on and `[network] bind_channel` is set); it is folded into the
 /// authenticated handshake to defeat a MITM relay.
-async fn handle_conn(
+/// M148: the transport layer (`handle_conn`/`run_listener`/`run_connector`) is
+/// generic over the actor command type so both the full-node `Cmd` and the light
+/// daemon's `LightCmd` share one audited handshake/framing path. The transport only
+/// ever constructs three command shapes — register a peer's outbound sender, forward
+/// an inbound message, and unregister on disconnect.
+pub(crate) trait TransportCmd {
+    fn register(id: u64, tx: mpsc::UnboundedSender<GossipMsg>) -> Self;
+    fn inbound(from: u64, msg: Box<GossipMsg>) -> Self;
+    fn unregister(id: u64) -> Self;
+}
+
+async fn handle_conn<C: TransportCmd>(
     stream: Box<dyn PeerStream>,
     binding: Option<[u8; 32]>,
     ctx: Arc<AuthContext>,
-    cmd: mpsc::UnboundedSender<Cmd>,
+    cmd: mpsc::UnboundedSender<C>,
 ) {
     let my_id = ctx.my_id;
     let (mut rd, mut wr) = tokio::io::split(stream);
@@ -1834,13 +1891,7 @@ async fn handle_conn(
     info!(node = my_id, peer = peer_id, "peer connected");
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<GossipMsg>();
-    if cmd
-        .send(Cmd::Register {
-            id: peer_id,
-            tx: out_tx,
-        })
-        .is_err()
-    {
+    if cmd.send(C::register(peer_id, out_tx)).is_err() {
         return;
     }
 
@@ -1853,26 +1904,20 @@ async fn handle_conn(
     });
 
     while let Ok(msg) = read_frame(&mut rd).await {
-        if cmd
-            .send(Cmd::Inbound {
-                from: peer_id,
-                msg: Box::new(msg),
-            })
-            .is_err()
-        {
+        if cmd.send(C::inbound(peer_id, Box::new(msg))).is_err() {
             break;
         }
     }
 
-    let _ = cmd.send(Cmd::Unregister { id: peer_id });
+    let _ = cmd.send(C::unregister(peer_id));
     info!(node = my_id, peer = peer_id, "peer disconnected");
     writer.abort();
 }
 
-async fn run_listener(
+async fn run_listener<C: TransportCmd + Send + 'static>(
     listener: TcpListener,
     ctx: Arc<AuthContext>,
-    cmd: mpsc::UnboundedSender<Cmd>,
+    cmd: mpsc::UnboundedSender<C>,
 ) {
     let my_id = ctx.my_id;
     loop {
@@ -1896,7 +1941,11 @@ async fn run_listener(
 }
 
 /// Dial a higher-id peer, reconnecting with capped backoff after any drop.
-async fn run_connector(addr: SocketAddr, ctx: Arc<AuthContext>, cmd: mpsc::UnboundedSender<Cmd>) {
+async fn run_connector<C: TransportCmd + Send + 'static>(
+    addr: SocketAddr,
+    ctx: Arc<AuthContext>,
+    cmd: mpsc::UnboundedSender<C>,
+) {
     let mut backoff = Duration::from_millis(500);
     loop {
         if let Ok(stream) = TcpStream::connect(addr).await {
@@ -1936,6 +1985,21 @@ async fn server_wrap(
             Ok((Box::new(stream), binding))
         }
         None => Ok((Box::new(tcp), None)),
+    }
+}
+
+/// M164: lightweight mirror of [`server_wrap`] for the metrics/RPC ingress endpoints.
+/// They don't auth at the transport layer (bearer does that, M156/M158), they just
+/// need encryption when `[metrics] enable_tls` / `[rpc] enable_tls` is on. Returns
+/// a `PeerStream` so the existing `serve_*_conn` bodies (which only use
+/// `AsyncRead`/`AsyncWrite` trait methods) stay transport-agnostic.
+async fn wrap_optional_tls(
+    tcp: TcpStream,
+    tls: Option<TlsAcceptor>,
+) -> io::Result<Box<dyn PeerStream>> {
+    match tls {
+        Some(a) => Ok(Box::new(a.accept(tcp).await?)),
+        None => Ok(Box::new(tcp)),
     }
 }
 
@@ -2400,6 +2464,48 @@ fn render_prometheus(m: &Metrics) -> String {
         "Cumulative admissions rejected by the per-account mempool quota.",
         m.txs_quota_rejected,
     );
+    counter(
+        &mut s,
+        "zhixing_txs_min_fee_rejected_total",
+        "Cumulative admissions rejected by the min-fee floor (M157 anti-spam).",
+        m.txs_min_fee_rejected,
+    );
+    counter(
+        &mut s,
+        "zhixing_txs_full_rejected_total",
+        "Cumulative admissions rejected by the mempool capacity bound (M54).",
+        m.txs_full_rejected,
+    );
+    counter(
+        &mut s,
+        "zhixing_txs_bad_nonce_rejected_total",
+        "Cumulative admissions rejected as a stale (replayed) nonce.",
+        m.txs_bad_nonce_rejected,
+    );
+    counter(
+        &mut s,
+        "zhixing_txs_nonce_too_far_rejected_total",
+        "Cumulative admissions rejected past the nonce pipelining window (M143).",
+        m.txs_nonce_too_far_rejected,
+    );
+    counter(
+        &mut s,
+        "zhixing_txs_replace_fee_rejected_total",
+        "Cumulative admissions rejected by an under-bid replace-by-fee attempt (M144).",
+        m.txs_replace_fee_rejected,
+    );
+    counter(
+        &mut s,
+        "zhixing_rpc_auth_failures_total",
+        "Cumulative RPC write-path requests rejected by bearer auth (M156).",
+        m.rpc_auth_failures,
+    );
+    counter(
+        &mut s,
+        "zhixing_metrics_auth_failures_total",
+        "Cumulative /metrics scrapes rejected by bearer auth (M158).",
+        m.metrics_auth_failures,
+    );
     // M125: block-apply latency histogram (the `histogram` half of the Prometheus data model).
     // `_bucket{le="X"}` is the cumulative count of applies ≤ X seconds; `le="+Inf"` equals the
     // total `_count`. Bounds are stored in micros; emit them in seconds for Prometheus.
@@ -2461,39 +2567,75 @@ fn render_prometheus(m: &Metrics) -> String {
 /// Accept loop for the metrics/health endpoint. Mirrors [`run_listener`]: each
 /// connection is handled on its own task; an accept error is logged and the loop
 /// continues (a transient error must not take the endpoint down).
-async fn run_metrics(listener: TcpListener, my_id: u64, cmd: mpsc::UnboundedSender<Cmd>) {
+async fn run_metrics(
+    listener: TcpListener,
+    my_id: u64,
+    auth_token: String,
+    auth_failures: Arc<AtomicU64>,
+    tls: Option<TlsAcceptor>,
+    cmd: mpsc::UnboundedSender<Cmd>,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
-                tokio::spawn(serve_metrics_conn(stream, cmd.clone()));
+                let tls = tls.clone();
+                let auth_token = auth_token.clone();
+                let auth_failures = auth_failures.clone();
+                let cmd = cmd.clone();
+                tokio::spawn(async move {
+                    let _ = stream.set_nodelay(true);
+                    match wrap_optional_tls(stream, tls).await {
+                        Ok(s) => serve_metrics_conn(s, auth_token, auth_failures, cmd).await,
+                        Err(e) => warn!(node = my_id, error = %e, "metrics TLS accept failed"),
+                    }
+                });
             }
             Err(e) => warn!(node = my_id, error = %e, "metrics accept error"),
         }
     }
 }
 
-/// Serve one metrics request: best-effort discard the HTTP request (bounded), ask
-/// the actor for a snapshot, and write a fixed-shape `HTTP/1.1 200 OK` reply whose
-/// body is the Prometheus exposition. Any path returns metrics, so a bare `GET /`
-/// doubles as a health check (`200` ⇒ alive). Errors are swallowed — a broken
-/// client connection must never affect the node.
-async fn serve_metrics_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) {
-    // Drain the request headers so the client's write side is satisfied, but cap
-    // the read so a malformed/never-terminated request can't hang or grow the
-    // buffer without bound. We don't parse it — every request returns metrics.
+/// Serve one metrics request: read the HTTP request headers (bounded), optionally
+/// gate on a bearer token (M158), ask the actor for a snapshot, and write a
+/// fixed-shape `HTTP/1.1 200 OK` reply whose body is the Prometheus exposition. With
+/// no token configured any path returns metrics, so a bare `GET /` doubles as a health
+/// check. Errors are swallowed — a broken client connection must never affect the node.
+async fn serve_metrics_conn(
+    mut stream: Box<dyn PeerStream>,
+    auth_token: String,
+    auth_failures: Arc<AtomicU64>,
+    cmd: mpsc::UnboundedSender<Cmd>,
+) {
+    // Accumulate the request headers (bounded) so we can read an optional
+    // `Authorization` header. We still don't route on the path — every authorized
+    // request returns metrics.
+    let mut acc: Vec<u8> = Vec::new();
     let mut buf = [0u8; 1024];
-    let mut total = 0usize;
     loop {
         match stream.read(&mut buf).await {
             Ok(0) => break, // client closed
             Ok(n) => {
-                total += n;
-                // End of request headers, or the read cap — stop reading either way.
-                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") || total >= 8192 {
+                acc.extend_from_slice(&buf[..n]);
+                if acc.windows(4).any(|w| w == b"\r\n\r\n") || acc.len() >= 8192 {
                     break;
                 }
             }
             Err(_) => return,
+        }
+    }
+
+    // M158: optional bearer gate. Empty token ⇒ open (pre-M158 behavior).
+    if !auth_token.is_empty() {
+        let head = std::str::from_utf8(&acc).unwrap_or("");
+        let authorized =
+            matches!(parse_authorization_bearer(head), Ok(Some(t)) if ct_str_eq(&t, &auth_token));
+        if !authorized {
+            auth_failures.fetch_add(1, Ordering::Relaxed);
+            let _ = stream
+                .write_all(unauthorized_bearer_response().as_bytes())
+                .await;
+            let _ = stream.flush().await;
+            return;
         }
     }
 
@@ -2541,6 +2683,67 @@ fn parse_content_length(headers: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// M160: constant-time string equality for bearer tokens. The length check is the only
+/// short-circuit (lengths are not secret — an attacker already reads the token's length
+/// off the HTTP header framing) and is independent of token content; once lengths match,
+/// every byte of the secret is XOR-accumulated with no early exit. The accumulator plus
+/// the length-equality boolean is what determines the result, so two tokens of the same
+/// length always walk the whole buffer regardless of where they differ — a wrong byte at
+/// position 0 costs the same as a wrong byte at the end, closing the per-byte timing
+/// side channel that `==` (short-circuiting on the first mismatch) leaves open.
+fn ct_str_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc: u8 = 0;
+    for (x, y) in a.as_bytes().iter().zip(b.as_bytes().iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
+/// M156: pull the `Bearer` token from the request's `Authorization` header (RFC 6750
+/// §2.1). Returns `Ok(None)` when the header is absent (caller chooses 401 policy);
+/// `Err` for a malformed header (caller chooses 400 policy). The extracted token is
+/// compared against the configured secret with [`ct_str_eq`] (constant-time except for
+/// length) at the call sites, so this parse step carries no timing obligation itself.
+fn parse_authorization_bearer(headers: &str) -> Result<Option<String>, String> {
+    for line in headers.split("\r\n") {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        let value = value.trim();
+        let rest = value
+            .strip_prefix("Bearer ")
+            .or_else(|| value.strip_prefix("bearer "))
+            .ok_or_else(|| "authorization scheme must be Bearer".to_string())?;
+        if rest.is_empty() {
+            return Err("bearer token is empty".into());
+        }
+        return Ok(Some(rest.to_string()));
+    }
+    Ok(None)
+}
+
+/// M156: fixed-shape `401 Unauthorized` with `WWW-Authenticate: Bearer` (RFC 6750
+/// §3), so well-behaved clients can prompt / retry.
+fn unauthorized_bearer_response() -> String {
+    format!(
+        "HTTP/1.1 401 Unauthorized\r\n\
+         WWW-Authenticate: Bearer realm=\"zhixing-rpc\"\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        b"unauthorized".len(),
+        "unauthorized"
+    )
 }
 
 /// Build a fixed-shape `HTTP/1.1` response with a plain-text body. `status_line`
@@ -2714,11 +2917,28 @@ fn not_acceptable_encoding_json() -> String {
 /// Accept loop for the ingress RPC endpoint. Mirrors [`run_metrics`]: each
 /// connection is handled on its own task; an accept error is logged and the loop
 /// continues.
-async fn run_rpc(listener: TcpListener, my_id: u64, cmd: mpsc::UnboundedSender<Cmd>) {
+async fn run_rpc(
+    listener: TcpListener,
+    my_id: u64,
+    auth_token: String,
+    auth_failures: Arc<AtomicU64>,
+    tls: Option<TlsAcceptor>,
+    cmd: mpsc::UnboundedSender<Cmd>,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
-                tokio::spawn(serve_rpc_conn(stream, cmd.clone()));
+                let token = auth_token.clone();
+                let tls = tls.clone();
+                let auth_failures = auth_failures.clone();
+                let cmd = cmd.clone();
+                tokio::spawn(async move {
+                    let _ = stream.set_nodelay(true);
+                    match wrap_optional_tls(stream, tls).await {
+                        Ok(s) => serve_rpc_conn(s, token, auth_failures, cmd).await,
+                        Err(e) => warn!(node = my_id, error = %e, "rpc TLS accept failed"),
+                    }
+                });
             }
             Err(e) => warn!(node = my_id, error = %e, "rpc accept error"),
         }
@@ -4368,6 +4588,12 @@ struct ConfigView {
     create_empty_blocks: bool,
     mempool_capacity: usize,
     mempool_per_account_limit: usize,
+    /// M159: the opt-in mempool knobs added since M119 (M143/M144/M145/M157), so an
+    /// operator can verify them over the wire.
+    mempool_nonce_lookahead: usize,
+    mempool_replace_by_fee: bool,
+    mempool_min_fee_bump: u64,
+    mempool_min_fee: u64,
 }
 
 /// M119: render a mempool bound — a number, or `unbounded` when it is `usize::MAX` (the
@@ -4384,7 +4610,8 @@ fn bound_str(n: usize) -> String {
 fn format_config(c: &ConfigView) -> String {
     format!(
         "role={}\npropose_timeout_ms={}\nprevote_timeout_ms={}\nprecommit_timeout_ms={}\n\
-timeout_delta_ms={}\nblock_interval_ms={}\ncreate_empty_blocks={}\nmempool_capacity={}\nmempool_per_account_limit={}",
+timeout_delta_ms={}\nblock_interval_ms={}\ncreate_empty_blocks={}\nmempool_capacity={}\nmempool_per_account_limit={}\n\
+mempool_nonce_lookahead={}\nmempool_replace_by_fee={}\nmempool_min_fee_bump={}\nmempool_min_fee={}",
         c.role,
         c.propose_timeout_ms,
         c.prevote_timeout_ms,
@@ -4394,6 +4621,10 @@ timeout_delta_ms={}\nblock_interval_ms={}\ncreate_empty_blocks={}\nmempool_capac
         c.create_empty_blocks,
         bound_str(c.mempool_capacity),
         bound_str(c.mempool_per_account_limit),
+        c.mempool_nonce_lookahead,
+        c.mempool_replace_by_fee,
+        c.mempool_min_fee_bump,
+        c.mempool_min_fee,
     )
 }
 
@@ -4403,7 +4634,8 @@ timeout_delta_ms={}\nblock_interval_ms={}\ncreate_empty_blocks={}\nmempool_capac
 fn json_config(c: &ConfigView) -> String {
     format!(
         "{{\"role\":{},\"propose_timeout_ms\":{},\"prevote_timeout_ms\":{},\"precommit_timeout_ms\":{},\
-\"timeout_delta_ms\":{},\"block_interval_ms\":{},\"create_empty_blocks\":{},\"mempool_capacity\":{},\"mempool_per_account_limit\":{}}}",
+\"timeout_delta_ms\":{},\"block_interval_ms\":{},\"create_empty_blocks\":{},\"mempool_capacity\":{},\"mempool_per_account_limit\":{},\
+\"mempool_nonce_lookahead\":{},\"mempool_replace_by_fee\":{},\"mempool_min_fee_bump\":{},\"mempool_min_fee\":{}}}",
         json_str(c.role),
         json_u64(c.propose_timeout_ms),
         json_u64(c.prevote_timeout_ms),
@@ -4413,6 +4645,10 @@ fn json_config(c: &ConfigView) -> String {
         json_bool(c.create_empty_blocks),
         json_str(&bound_str(c.mempool_capacity)),
         json_str(&bound_str(c.mempool_per_account_limit)),
+        json_u64(c.mempool_nonce_lookahead as u64),
+        json_bool(c.mempool_replace_by_fee),
+        json_u64(c.mempool_min_fee_bump),
+        json_u64(c.mempool_min_fee),
     )
 }
 
@@ -5133,7 +5369,12 @@ async fn query_base_height(cmd: &mpsc::UnboundedSender<Cmd>) -> u64 {
     rx.await.unwrap_or(0)
 }
 
-async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) {
+async fn serve_rpc_conn(
+    mut stream: Box<dyn PeerStream>,
+    auth_token: String,
+    auth_failures: Arc<AtomicU64>,
+    cmd: mpsc::UnboundedSender<Cmd>,
+) {
     // Accumulate bytes until we see the end-of-headers marker, keeping any body
     // bytes that arrived in the same read.
     let mut acc: Vec<u8> = Vec::new();
@@ -6148,6 +6389,35 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
         return;
     }
 
+    // M156: the remaining POST path is tx submission. When the operator configured a
+    // bearer token on `[rpc]`, gate it with `Authorization: Bearer <token>` — reads
+    // (`/batch`, `/validate`, every `GET`) stay public. A missing/wrong token yields
+    // `401 Unauthorized` (or `WWW-Authenticate: Bearer` so well-behaved clients can
+    // re-prompt), and we close the connection — same RFC-recommended behavior for failed
+    // auth.
+    if !auth_token.is_empty() {
+        match parse_authorization_bearer(head) {
+            Ok(Some(t)) if ct_str_eq(&t, &auth_token) => {} // authorized
+            Ok(Some(_)) | Ok(None) => {
+                // M163: count the 401 (missing/wrong token). A malformed header (the
+                // `Err` arm below) is a 400 protocol error, not an auth rejection.
+                auth_failures.fetch_add(1, Ordering::Relaxed);
+                let _ = stream
+                    .write_all(unauthorized_bearer_response().as_bytes())
+                    .await;
+                let _ = stream.flush().await;
+                return;
+            }
+            Err(e) => {
+                let _ = stream
+                    .write_all(http_response("400 Bad Request", &e).as_bytes())
+                    .await;
+                let _ = stream.flush().await;
+                return;
+            }
+        }
+    }
+
     // Determine how many body bytes to expect, capped.
     let Some(len) = parse_content_length(head) else {
         let _ = stream
@@ -6400,6 +6670,23 @@ impl Node {
         if cfg.mempool.per_account_limit > 0 {
             node.set_mempool_per_account_limit(cfg.mempool.per_account_limit);
         }
+        // M143: nonce pipelining window. `nonce_lookahead == 0` ⇒ strict one-pending-tx-
+        // per-account (the default) ⇒ setter not called ⇒ behavior byte-identical.
+        if cfg.mempool.nonce_lookahead > 0 {
+            node.set_mempool_nonce_lookahead(cfg.mempool.nonce_lookahead);
+        }
+        // M144: replace-by-fee admission. `false` (the default) ⇒ setter not called ⇒
+        // behavior byte-identical. M145: the min-fee-bump threshold is only meaningful
+        // under RBF, so it is applied here alongside it.
+        if cfg.mempool.replace_by_fee {
+            node.set_mempool_replace_by_fee(true);
+            node.set_mempool_min_fee_bump(cfg.mempool.min_fee_bump);
+        }
+        // M157: minimum-fee admission floor. `0` (the default) ⇒ setter not called ⇒
+        // behavior byte-identical.
+        if cfg.mempool.min_fee > 0 {
+            node.set_mempool_min_fee(cfg.mempool.min_fee);
+        }
         // M141: a validator that snapshot-boots into a set it is not a member of will
         // follow + serve but never propose (its `start_height` membership guard never
         // opens). Surface that loudly rather than letting the node idle silently.
@@ -6484,6 +6771,22 @@ impl Node {
         } else {
             None
         };
+        // M164: per-endpoint encryption-only TLS for `[metrics]` and `[rpc]`.
+        // Independent acceptors (not the P2P `tls`) — these endpoints don't need
+        // mTLS, just channel encryption so bearer tokens and metrics bodies are
+        // not sniffable. Ephemeral self-signed cert via the same primitive the
+        // P2P "encryption-only" mode uses; `enable_tls = false` ⇒ `None` and
+        // the accept loop falls straight through to plaintext.
+        let metrics_tls = if cfg.metrics.as_ref().map(|m| m.enable_tls).unwrap_or(false) {
+            Some(build_encrypt_only_tls_setup()?.acceptor)
+        } else {
+            None
+        };
+        let rpc_tls = if cfg.rpc.as_ref().map(|r| r.enable_tls).unwrap_or(false) {
+            Some(build_encrypt_only_tls_setup()?.acceptor)
+        } else {
+            None
+        };
         let auth = Arc::new(AuthContext {
             my_id,
             kp: validator_key.clone(),
@@ -6499,6 +6802,11 @@ impl Node {
         // live height is the snapshot tip, so the two diverge. Capture it before `node`
         // moves into the actor.
         let boot_height = node.height();
+
+        // M163: bearer-auth 401 counters, shared with the per-connection RPC/metrics
+        // serve tasks (they `fetch_add`, the actor `load`s into the metrics snapshot).
+        let rpc_auth_failures = Arc::new(AtomicU64::new(0));
+        let metrics_auth_failures = Arc::new(AtomicU64::new(0));
 
         let actor = Actor {
             node,
@@ -6530,6 +6838,8 @@ impl Node {
             tx_rate: cfg.mempool.per_peer_tx_per_sec,
             tx_burst: cfg.mempool.per_peer_tx_burst,
             txs_rate_limited: 0,
+            rpc_auth_failures: rpc_auth_failures.clone(),
+            metrics_auth_failures: metrics_auth_failures.clone(),
         };
         tokio::spawn(run_actor(actor, cmd_rx));
 
@@ -6575,8 +6885,16 @@ impl Node {
         if let Some(mc) = cfg.metrics.as_ref().filter(|m| m.enabled) {
             let addr = mc.listen_addr().map_err(cfg_io)?;
             let mlistener = TcpListener::bind(addr).await?;
-            info!(node = my_id, addr = %mlistener.local_addr()?, "metrics listening");
-            tokio::spawn(run_metrics(mlistener, my_id, cmd_tx.clone()));
+            let auth = mc.auth_token.clone();
+            info!(node = my_id, addr = %mlistener.local_addr()?, auth = !auth.is_empty(), "metrics listening");
+            tokio::spawn(run_metrics(
+                mlistener,
+                my_id,
+                auth,
+                metrics_auth_failures.clone(),
+                metrics_tls.clone(),
+                cmd_tx.clone(),
+            ));
         }
 
         // M53: optionally bind the external transaction-ingress RPC. Opt-in like
@@ -6585,8 +6903,16 @@ impl Node {
         if let Some(rc) = cfg.rpc.as_ref().filter(|r| r.enabled) {
             let addr = rc.listen_addr().map_err(cfg_io)?;
             let rlistener = TcpListener::bind(addr).await?;
-            info!(node = my_id, addr = %rlistener.local_addr()?, "rpc listening");
-            tokio::spawn(run_rpc(rlistener, my_id, cmd_tx.clone()));
+            let auth = rc.auth_token.clone();
+            info!(node = my_id, addr = %rlistener.local_addr()?, auth = !auth.is_empty(), "rpc listening");
+            tokio::spawn(run_rpc(
+                rlistener,
+                my_id,
+                auth,
+                rpc_auth_failures.clone(),
+                rpc_tls.clone(),
+                cmd_tx.clone(),
+            ));
         }
 
         // M33: kick off consensus for the first height after the mesh has had a
@@ -6616,6 +6942,578 @@ pub async fn run(
     tokio::signal::ctrl_c().await?;
     info!("shutdown requested — exiting (logs are fsync'd per append)");
     Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// M148: light-client daemon (`node light-run`) — a long-running light node.
+// ----------------------------------------------------------------------------
+
+/// M148: the light daemon actor's command set — the light analogue of [`Cmd`], with
+/// only the four transport shapes plus a status query for the [`LightNode`] handle.
+/// No consensus, mempool, persistence, or read-RPC variants (a light node has none).
+enum LightCmd {
+    Inbound {
+        from: u64,
+        msg: Box<GossipMsg>,
+    },
+    Register {
+        id: u64,
+        tx: mpsc::UnboundedSender<GossipMsg>,
+    },
+    Unregister {
+        id: u64,
+    },
+    /// Periodic anti-entropy heartbeat (`net.announce_interval_ms`).
+    Announce,
+    /// Handle query: current `(tracker height, head)`.
+    Status(oneshot::Sender<(u64, Hash)>),
+    /// M155: handle query for a Prometheus metrics snapshot.
+    Metrics(oneshot::Sender<LightMetrics>),
+}
+
+impl TransportCmd for LightCmd {
+    fn register(id: u64, tx: mpsc::UnboundedSender<GossipMsg>) -> Self {
+        LightCmd::Register { id, tx }
+    }
+    fn inbound(from: u64, msg: Box<GossipMsg>) -> Self {
+        LightCmd::Inbound { from, msg }
+    }
+    fn unregister(id: u64) -> Self {
+        LightCmd::Unregister { id }
+    }
+}
+
+/// M148: the light daemon's actor — owns the [`crate::net::LightGossipNode`] and the
+/// per-peer outbound queues. No logs, no chain, no consensus.
+struct LightActor {
+    node: crate::net::LightGossipNode,
+    outbound: HashMap<u64, mpsc::UnboundedSender<GossipMsg>>,
+    /// M151: optional header persistence — `Some` when the light node has a data_dir.
+    hlog: Option<crate::store::HeaderLog>,
+    /// M151: number of retained headers already written to `hlog`.
+    appended: usize,
+    /// M153: peer discovery state (mirrors the full-node actor's M39 fields).
+    my_id: u64,
+    peer_exchange: bool,
+    addrs: HashMap<u64, String>,
+    dialing: HashSet<u64>,
+    auth: Arc<AuthContext>,
+    self_tx: mpsc::UnboundedSender<LightCmd>,
+}
+
+impl LightActor {
+    fn route(&self, out: Vec<(u64, GossipMsg)>) {
+        for (dst, msg) in out {
+            if let Some(tx) = self.outbound.get(&dst) {
+                let _ = tx.send(msg);
+            }
+        }
+    }
+
+    /// M153: the address book as a `Peers` gossip message.
+    fn peers_msg(&self) -> GossipMsg {
+        GossipMsg::Peers(self.addrs.iter().map(|(id, a)| (*id, a.clone())).collect())
+    }
+
+    /// M153: propagate the address book to every connected peer (periodic). No-op when
+    /// peer exchange is disabled.
+    fn gossip_peers(&self) {
+        if !self.peer_exchange {
+            return;
+        }
+        let msg = self.peers_msg();
+        for tx in self.outbound.values() {
+            let _ = tx.send(msg.clone());
+        }
+    }
+
+    /// M153: ingest a peer's address book — first-wins merge, and auto-dial any
+    /// newly-learned higher-id peer (the lower-id side learns our addr from the same
+    /// gossip and dials us). Mirrors the full node's `on_peers` (M39). No-op when peer
+    /// exchange is disabled.
+    fn on_peers(&mut self, book: Vec<(u64, String)>) {
+        if !self.peer_exchange {
+            return;
+        }
+        for (id, addr) in book {
+            if id == self.my_id {
+                continue;
+            }
+            self.addrs.entry(id).or_insert_with(|| addr.clone());
+            if id > self.my_id && !self.dialing.contains(&id) {
+                if let Ok(sa) = addr.parse::<SocketAddr>() {
+                    self.dialing.insert(id);
+                    let tx = self.self_tx.clone();
+                    tokio::spawn(run_connector(sa, self.auth.clone(), tx));
+                    info!(node = self.my_id, peer = id, %addr, "light: discovered peer, dialing");
+                }
+            }
+        }
+    }
+
+    /// M151: append any newly-applied `(header, next_set)` pairs to the header log so a
+    /// restart can resume. No-op when persistence is off or nothing new was applied.
+    fn persist(&mut self) {
+        let Some(hlog) = self.hlog.as_ref() else {
+            return;
+        };
+        let headers = self.node.headers();
+        let next_sets = self.node.next_sets();
+        while self.appended < headers.len() {
+            if hlog
+                .append(&headers[self.appended], &next_sets[self.appended])
+                .is_err()
+            {
+                // A write failure must not crash the actor; stop persisting (the node
+                // keeps serving from memory, and re-sync on restart still recovers).
+                break;
+            }
+            self.appended += 1;
+        }
+    }
+}
+
+async fn run_light_actor(mut actor: LightActor, mut rx: mpsc::UnboundedReceiver<LightCmd>) {
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            LightCmd::Register { id, tx } => {
+                // Announce our height so the peer starts pushing; the peer's reply
+                // `Status` triggers our `GetHeadersWithSets` (see LightGossipNode).
+                let _ = tx.send(GossipMsg::Status {
+                    height: actor.node.tracker().height(),
+                });
+                // M153: hand the new peer our address book so it can learn + dial the rest.
+                if actor.peer_exchange {
+                    let _ = tx.send(actor.peers_msg());
+                }
+                actor.outbound.insert(id, tx);
+            }
+            LightCmd::Unregister { id } => {
+                actor.outbound.remove(&id);
+            }
+            LightCmd::Inbound { from, msg } => {
+                let msg = *msg;
+                // M153: address-book gossip drives peer discovery + auto-dial (the pure
+                // light core drops it).
+                if let GossipMsg::Peers(book) = msg {
+                    actor.on_peers(book);
+                    continue;
+                }
+                let out = actor.node.on_message(from, msg);
+                actor.route(out);
+                actor.persist(); // M151: durably record any headers just applied
+            }
+            LightCmd::Announce => {
+                let out = actor.node.announce();
+                actor.route(out);
+                actor.gossip_peers(); // M153: periodic address-book propagation
+            }
+            LightCmd::Status(reply) => {
+                let _ = reply.send((actor.node.tracker().height(), actor.node.tracker().head()));
+            }
+            LightCmd::Metrics(reply) => {
+                let _ = reply.send(LightMetrics {
+                    height: actor.node.tracker().height(),
+                    head: actor.node.tracker().head(),
+                    peers_connected: actor.outbound.len() as u64,
+                    addrs_known: actor.addrs.len() as u64,
+                });
+            }
+        }
+    }
+}
+
+/// M149: build a snapshot-seeded [`crate::net::LightGossipNode`] from a snapshot-boot
+/// config. A light node can't recompute state roots locally, so it requires a cert +
+/// trusted validator set and verifies via `from_verified_snapshot` (M134/M142): the
+/// cert must reach `>2/3` of the pinned trusted set and bind the header, and the
+/// snapshot must recompute the header's three roots. A `[snapshot]` without a cert is
+/// rejected (unlike a full node, a light node has no fallback commitment check).
+fn load_light_snapshot_seed(
+    s: &crate::config::SnapshotBootConfig,
+    my_id: u64,
+    peer_ids: &[u64],
+) -> io::Result<crate::net::LightGossipNode> {
+    s.validate()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let cert_hex = s.cert_hex.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "light snapshot-seed requires a cert + trusted_validators (cert_hex missing)",
+        )
+    })?;
+    let bytes = std::fs::read(&s.path)?;
+    let state = crate::codec::decode_snapshot(&bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("decode snapshot {}: {e:?}", s.path),
+        )
+    })?;
+    let header =
+        crate::codec::decode_header(&hex_to_bytes(&s.header_hex).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "header_hex not valid hex")
+        })?)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode header: {e:?}")))?;
+    let cert = crate::codec::decode_commit(
+        &hex_to_bytes(cert_hex)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "cert_hex not valid hex"))?,
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode cert: {e:?}")))?;
+    let trusted = snapshot_trusted_set(s)?;
+    crate::net::LightGossipNode::from_verified_snapshot(
+        my_id,
+        &state,
+        &header,
+        &cert,
+        &trusted,
+        peer_ids.iter().copied(),
+    )
+    .map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("light snapshot verification failed: {e}"),
+        )
+    })
+}
+
+/// M155: snapshot of the light node's observable state for the `/metrics` endpoint.
+#[derive(Clone, Debug)]
+pub struct LightMetrics {
+    pub height: u64,
+    pub head: Hash,
+    /// Number of peers currently connected (live outbound queues).
+    pub peers_connected: u64,
+    /// Number of addresses in the discovery book.
+    pub addrs_known: u64,
+}
+
+/// M148: a handle to a running light daemon.
+pub struct LightNode {
+    cmd: mpsc::UnboundedSender<LightCmd>,
+}
+
+impl LightNode {
+    /// M148: boot a light-client daemon from `cfg` + `genesis`: build a
+    /// [`crate::net::LightGossipNode`], reuse the full-node transport layer
+    /// ([`handle_conn`]/[`run_listener`]/[`run_connector`] over [`LightCmd`]) to connect
+    /// to the configured peers, and sync headers-with-sets (M147). Headers-only — no
+    /// block bodies, consensus, mempool, persistence, or chain execution.
+    ///
+    /// A light node has no validator key, so `require_peer_auth`/`require_peer_certs`
+    /// (which need one) must be off; `enable_tls` alone (encryption-only) is fine.
+    pub async fn start(cfg: NodeConfig, genesis: Genesis) -> io::Result<LightNode> {
+        let my_id = cfg.node.id;
+        let listen = cfg.listen_addr().map_err(cfg_io)?;
+
+        if cfg.network.require_peer_auth || cfg.network.require_peer_certs {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "light node {my_id} cannot set require_peer_auth/require_peer_certs \
+                     (a light node has no validator signing key)"
+                ),
+            ));
+        }
+
+        let peer_ids: Vec<u64> = cfg.peers.iter().map(|p| p.id).collect();
+        // M149/M154: seed from a verified snapshot or a weak-subjectivity checkpoint if
+        // configured; otherwise track from genesis. Snapshot and checkpoint are mutually
+        // exclusive (one carries a cert-verified ChainState, the other a pure-trust anchor).
+        if cfg.snapshot.is_some() && cfg.checkpoint.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("light node {my_id} sets both [snapshot] and [checkpoint] (choose one)"),
+            ));
+        }
+        let mut node = match (cfg.snapshot.as_ref(), cfg.checkpoint.as_ref()) {
+            (Some(s), _) => load_light_snapshot_seed(s, my_id, &peer_ids)?,
+            (_, Some(cp)) => {
+                let (head, set) = cp.decode().map_err(cfg_io)?;
+                crate::net::LightGossipNode::from_checkpoint(
+                    my_id,
+                    set,
+                    head,
+                    cp.height,
+                    peer_ids.iter().copied(),
+                )
+            }
+            (None, None) => {
+                crate::net::LightGossipNode::new(my_id, &genesis, peer_ids.iter().copied())
+            }
+        };
+
+        // M151: header persistence. When a data_dir is configured, open (and replay) a
+        // `headers.log` so a restart resumes at the last verified height instead of
+        // re-syncing. The persisted `(header, next_set)` pairs replay via `apply_header`
+        // onto the just-built base node (genesis or snapshot seed); a replay failure
+        // means the log is inconsistent with the base — surfaced as an error.
+        let (hlog, appended) = if cfg.node.data_dir.is_empty() {
+            (None, 0)
+        } else {
+            let path = format!("{}/headers.log", cfg.node.data_dir);
+            let log = crate::store::HeaderLog::open(&path)?;
+            let persisted = log.read_all()?;
+            let appended = persisted.len();
+            for (ch, set) in persisted {
+                node.apply_header(ch, &set).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("persisted header log inconsistent with the base: {e}"),
+                    )
+                })?;
+            }
+            (Some(log), appended)
+        };
+
+        // Reuse the full-node AuthContext build with no key. Encryption-only TLS
+        // (`enable_tls` without `require_peer_certs`) needs no credential.
+        let validators: HashMap<u64, PubKey> = genesis
+            .validators
+            .iter()
+            .map(|(id, pk, _)| (*id, *pk))
+            .collect();
+        let tls = if cfg.network.enable_tls {
+            Some(build_tls_setup(None)?)
+        } else {
+            None
+        };
+        let auth = Arc::new(AuthContext {
+            my_id,
+            kp: None,
+            validators,
+            require: cfg.network.require_peer_auth, // false (guarded above)
+            tls,
+            bind_channel: cfg.network.bind_channel,
+        });
+
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<LightCmd>();
+
+        // M153: seed the discovery address book with our own listen addr + every
+        // configured peer; mark higher-id configured peers as already-dialing (the boot
+        // connectors below cover them). Discovery grows both as `Peers` gossip arrives.
+        let mut addrs: HashMap<u64, String> = HashMap::new();
+        addrs.insert(
+            my_id,
+            self_advertise_addr(&cfg.node.listen, &cfg.network.advertise_addr),
+        );
+        let mut dialing: HashSet<u64> = HashSet::new();
+        for p in &cfg.peers {
+            addrs.entry(p.id).or_insert_with(|| p.addr.clone());
+            if p.id > my_id {
+                dialing.insert(p.id);
+            }
+        }
+
+        let actor = LightActor {
+            node,
+            outbound: HashMap::new(),
+            hlog,
+            appended,
+            my_id,
+            peer_exchange: cfg.network.enable_peer_exchange,
+            addrs,
+            dialing,
+            auth: auth.clone(),
+            self_tx: cmd_tx.clone(),
+        };
+        tokio::spawn(run_light_actor(actor, cmd_rx));
+
+        let listener = TcpListener::bind(listen).await?;
+        info!(node = my_id, addr = %listener.local_addr()?, peers = peer_ids.len(), role = "light", "listening");
+        tokio::spawn(run_listener(listener, auth.clone(), cmd_tx.clone()));
+
+        // dial higher ids only → one link per pair (same rule as the full node)
+        for p in &cfg.peers {
+            if p.id > my_id {
+                let addr = p.socket_addr().map_err(cfg_io)?;
+                tokio::spawn(run_connector(addr, auth.clone(), cmd_tx.clone()));
+            }
+        }
+
+        // periodic anti-entropy heartbeat
+        {
+            let cmd = cmd_tx.clone();
+            let announce_ms = cfg.network.announce_interval_ms;
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_millis(announce_ms));
+                loop {
+                    tick.tick().await;
+                    if cmd.send(LightCmd::Announce).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        // M152: opt-in read-only RPC (`[rpc] enabled = true`) — exposes the light node's
+        // sync status (/status, /info), /version, and a health probe. No write path.
+        if let Some(rc) = cfg.rpc.as_ref().filter(|r| r.enabled) {
+            let addr = rc.listen_addr().map_err(cfg_io)?;
+            let rlistener = TcpListener::bind(addr).await?;
+            info!(node = my_id, addr = %rlistener.local_addr()?, "light rpc listening");
+            tokio::spawn(run_light_rpc(rlistener, my_id, cmd_tx.clone()));
+        }
+
+        Ok(LightNode { cmd: cmd_tx })
+    }
+
+    /// Current `(tracker height, head)` of the light node, or `None` if the actor
+    /// has stopped.
+    pub async fn status(&self) -> Option<(u64, Hash)> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd.send(LightCmd::Status(tx)).ok()?;
+        rx.await.ok()
+    }
+
+    /// M155: a metrics snapshot (height, head, peer counts), or `None` if stopped.
+    pub async fn metrics(&self) -> Option<LightMetrics> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd.send(LightCmd::Metrics(tx)).ok()?;
+        rx.await.ok()
+    }
+}
+
+/// CLI entry point for `node light-run`: start the light daemon and block until Ctrl-C.
+pub async fn light_run(cfg: NodeConfig, genesis: Genesis) -> io::Result<()> {
+    let _node = LightNode::start(cfg, genesis).await?;
+    tokio::signal::ctrl_c().await?;
+    info!("shutdown requested — exiting (light node holds no on-disk state)");
+    Ok(())
+}
+
+/// M152: accept loop for the light node's read-only RPC.
+async fn run_light_rpc(listener: TcpListener, my_id: u64, cmd: mpsc::UnboundedSender<LightCmd>) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                tokio::spawn(serve_light_rpc_conn(stream, cmd.clone()));
+            }
+            Err(e) => warn!(node = my_id, error = %e, "light rpc accept error"),
+        }
+    }
+}
+
+/// M152: serve one read-only HTTP request to a light node. `GET /status` (alias
+/// `/info`) returns the tracked `height` + `head`; `GET /version` the software version;
+/// `GET /` (or any unknown path) is a `200 OK` health probe. A light node exposes no
+/// write path, so any non-`GET` method is `405 Method Not Allowed`. `?format=json`
+/// selects the JSON twin. Client-side errors are swallowed — a broken client never
+/// affects the node.
+async fn serve_light_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<LightCmd>) {
+    let mut acc: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) => return,
+            Ok(n) => {
+                acc.extend_from_slice(&buf[..n]);
+                if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                if acc.len() >= MAX_RPC_HEADER {
+                    let _ = stream
+                        .write_all(
+                            http_response(
+                                "431 Request Header Fields Too Large",
+                                "header too large",
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+    let Ok(head) = std::str::from_utf8(&acc) else {
+        let _ = stream
+            .write_all(http_response("400 Bad Request", "malformed headers").as_bytes())
+            .await;
+        return;
+    };
+    let method = head.split_whitespace().next().unwrap_or("");
+    let target = head.split_whitespace().nth(1).unwrap_or("");
+    let (path, query) = split_query(target);
+    if !method.eq_ignore_ascii_case("GET") {
+        // RFC 9110 §15.5.6: 405 carries an `Allow` header. A light node serves GET only.
+        let body = "light node is read-only — use GET";
+        let resp = format!(
+            "HTTP/1.1 405 Method Not Allowed\r\n\
+             Allow: GET\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(resp.as_bytes()).await;
+        return;
+    }
+    let fmt = response_format(query).unwrap_or(RespFormat::Text);
+    let resp = match path {
+        "/metrics" => {
+            // M155: Prometheus plaintext (Content-Type comes from the inner render, so
+            // `?format=json` is intentionally ignored — Prometheus expects text/plain).
+            let (tx, rx) = oneshot::channel();
+            if cmd.send(LightCmd::Metrics(tx)).is_err() {
+                http_response("503 Service Unavailable", "node stopped")
+            } else {
+                match rx.await {
+                    Ok(m) => {
+                        let head_hex = crate::hash::hex(&m.head);
+                        let body = format!(
+                            "# HELP zhixing_height Certified chain height.\n\
+                             # TYPE zhixing_height gauge\n\
+                             zhixing_height {h}\n\
+                             # HELP zhixing_head_info Block hash the next header must chain to (info-gauge).\n\
+                             # TYPE zhixing_head_info gauge\n\
+                             zhixing_head_info {h} {head}\n\
+                             # HELP zhixing_peers_connected Number of peers currently connected.\n\
+                             # TYPE zhixing_peers_connected gauge\n\
+                             zhixing_peers_connected {p}\n\
+                             # HELP zhixing_addrs_known Number of addresses in the discovery book.\n\
+                             # TYPE zhixing_addrs_known gauge\n\
+                             zhixing_addrs_known {a}\n",
+                            h = m.height,
+                            head = head_hex,
+                            p = m.peers_connected,
+                            a = m.addrs_known,
+                        );
+                        http_response_ct("200 OK", "text/plain; version=0.0.4", &body)
+                    }
+                    Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                }
+            }
+        }
+        "/status" | "/info" => {
+            let (tx, rx) = oneshot::channel();
+            if cmd.send(LightCmd::Status(tx)).is_err() {
+                http_response("503 Service Unavailable", "node stopped")
+            } else {
+                match rx.await {
+                    Ok((h, hd)) => {
+                        let hex = crate::hash::hex(&hd);
+                        ok_body(
+                            fmt,
+                            &format!("height={h}\nhead={hex}"),
+                            &format!("{{\"height\":{},\"head\":{}}}", json_u64(h), json_str(&hex)),
+                        )
+                    }
+                    Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                }
+            }
+        }
+        "/version" => ok_body(
+            fmt,
+            &format!("version={NODE_VERSION}"),
+            &format!("{{\"version\":{}}}", json_str(NODE_VERSION)),
+        ),
+        _ => http_response("200 OK", "ok"),
+    };
+    let _ = stream.write_all(resp.as_bytes()).await;
 }
 
 /// M37: install a process-global `tracing` subscriber (stderr, `RUST_LOG`-filtered,
@@ -7351,6 +8249,7 @@ mod tests {
             logging: None,
             mempool: crate::config::MempoolConfig::default(),
             snapshot: None,
+            checkpoint: None,
         }
     }
 
@@ -7821,6 +8720,13 @@ mod tests {
             slashing_events: 19,
             txs_rate_limited: 23,
             txs_quota_rejected: 29,
+            txs_min_fee_rejected: 31,
+            txs_full_rejected: 41,
+            txs_bad_nonce_rejected: 43,
+            txs_nonce_too_far_rejected: 47,
+            txs_replace_fee_rejected: 53,
+            rpc_auth_failures: 59,
+            metrics_auth_failures: 61,
             // M125: a sample latency histogram — buckets sum to 6, with two applies above the
             // last finite bound (count 8 > finite total 6).
             block_apply_buckets: [1, 2, 0, 3, 0, 0, 0, 0, 0, 0, 0],
@@ -7889,6 +8795,13 @@ mod tests {
             ("zhixing_slashing_events_total", 19),
             ("zhixing_txs_rate_limited_total", 23),
             ("zhixing_txs_quota_rejected_total", 29),
+            ("zhixing_txs_min_fee_rejected_total", 31),
+            ("zhixing_txs_full_rejected_total", 41),
+            ("zhixing_txs_bad_nonce_rejected_total", 43),
+            ("zhixing_txs_nonce_too_far_rejected_total", 47),
+            ("zhixing_txs_replace_fee_rejected_total", 53),
+            ("zhixing_rpc_auth_failures_total", 59),
+            ("zhixing_metrics_auth_failures_total", 61),
         ] {
             assert!(
                 out.contains(&format!("# TYPE {name} counter")),
@@ -8020,6 +8933,8 @@ mod tests {
         cfg.metrics = Some(crate::config::MetricsConfig {
             enabled: true,
             listen: metrics_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let _node = Node::start(cfg, test_genesis(), Some(kp(21)))
             .await
@@ -8049,6 +8964,214 @@ mod tests {
             "missing height gauge: {text}"
         );
         assert!(text.contains("# TYPE zhixing_height gauge"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_bearer_auth_gates_scrapes() {
+        // M158: with `[metrics] auth_token` set, a scrape needs
+        // `Authorization: Bearer <token>`; no/wrong token → 401, correct → 200.
+        let dir = tmp_dir("metrics-auth");
+        let mut cfg = node_config(21, 20780, &[21], dir.clone());
+        let metrics_addr = "127.0.0.1:20791";
+        cfg.metrics = Some(crate::config::MetricsConfig {
+            enabled: true,
+            listen: metrics_addr.into(),
+            auth_token: "scrape-key".into(),
+            enable_tls: false,
+        });
+        let _node = Node::start(cfg, test_genesis(), Some(kp(21)))
+            .await
+            .expect("start node");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        async fn scrape(addr: &str, auth: Option<&str>) -> String {
+            let mut req = String::from("GET /metrics HTTP/1.1\r\nHost: localhost\r\n");
+            if let Some(a) = auth {
+                req.push_str(&format!("Authorization: Bearer {a}\r\n"));
+            }
+            req.push_str("Connection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect");
+            s.write_all(req.as_bytes()).await.expect("send");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+
+        let no = scrape(metrics_addr, None).await;
+        assert!(
+            no.starts_with("HTTP/1.1 401 Unauthorized"),
+            "no token: {no}"
+        );
+        let wrong = scrape(metrics_addr, Some("nope")).await;
+        assert!(wrong.starts_with("HTTP/1.1 401"), "wrong token: {wrong}");
+        let ok = scrape(metrics_addr, Some("scrape-key")).await;
+        assert!(ok.starts_with("HTTP/1.1 200 OK"), "correct token: {ok}");
+        assert!(ok.contains("zhixing_height"), "metrics body: {ok}");
+        // M163: the two prior 401s (no token + wrong token) are counted and surfaced.
+        assert!(
+            ok.contains("zhixing_metrics_auth_failures_total 2"),
+            "auth-failure counter: {ok}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_tls_encrypts_scrape() {
+        // M164: with `[metrics] enable_tls = true`, the listener wraps every
+        // accepted connection in TLS. A plaintext probe of the port can't get past
+        // the handshake; a TLS client (trust-on-first-use) sees the metrics body.
+        let dir = tmp_dir("metrics-tls");
+        let mut cfg = node_config(21, 19701, &[21], dir.clone());
+        let metrics_addr = "127.0.0.1:20771";
+        cfg.metrics = Some(crate::config::MetricsConfig {
+            enabled: true,
+            listen: metrics_addr.into(),
+            auth_token: String::new(),
+            enable_tls: true,
+        });
+        let _node = Node::start(cfg, test_genesis(), Some(kp(21)))
+            .await
+            .expect("start node");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // 1. A plaintext probe must not see the body — the server-side TLS handshake
+        //    rejects bytes that don't parse as a ClientHello. We don't strictly
+        //    require a particular read error type (rustls may either fail or hang
+        //    up); we just assert the body never arrives.
+        let mut plain = TcpStream::connect(metrics_addr).await.expect("connect");
+        let _ = plain
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await;
+        let _ = plain.flush().await;
+        let mut buf = vec![0u8; 1024];
+        let _ = tokio::time::timeout(Duration::from_millis(500), plain.read(&mut buf)).await;
+        let body = String::from_utf8_lossy(&buf);
+        assert!(
+            !body.contains("zhixing_height"),
+            "plaintext probe should not see metrics body: {body}"
+        );
+
+        // 2. A TLS client with `AcceptAnyServerCert` (encryption-only trust) scrapes
+        //    the endpoint and gets a 200 with the Prometheus body.
+        let client_cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_cfg));
+        let tcp = TcpStream::connect(metrics_addr).await.expect("tls connect");
+        let server_name =
+            rustls::pki_types::ServerName::try_from("zhixing-node").expect("static SNI is valid");
+        let mut tls = connector
+            .connect(server_name, tcp)
+            .await
+            .expect("tls handshake");
+        tls.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("send over tls");
+        // Bounded read — the server closes after writing the response (because we
+        // asked for `Connection: close`); `read_to_end` would surface the clean
+        // half-close as `UnexpectedEof`. 16 KiB is far more than a Prometheus
+        // exposition for a single node.
+        let mut resp = Vec::new();
+        let mut buf = [0u8; 16384];
+        loop {
+            match tls.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    resp.extend_from_slice(&buf[..n]);
+                    if resp.len() >= 16384 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 200 OK"),
+            "expected 200, got: {text}"
+        );
+        assert!(
+            text.contains("zhixing_height 0"),
+            "missing height gauge: {text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_endpoint_tls_encrypts_write() {
+        // M164: with `[rpc] enable_tls = true`, the write path is reachable over
+        // TLS only — a plaintext probe fails. The TLS body round-trips a valid
+        // `POST /submit_tx` to admission (single-validator genesis ⇒ quorum 1).
+        let dir = tmp_dir("rpc-tls");
+        let mut cfg = node_config(21, 19721, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:20871";
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: true,
+        });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let _node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let client_cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_cfg));
+        let tcp = TcpStream::connect(rpc_addr).await.expect("tls connect");
+        let server_name =
+            rustls::pki_types::ServerName::try_from("zhixing-node").expect("static SNI is valid");
+        let mut tls = connector
+            .connect(server_name, tcp)
+            .await
+            .expect("tls handshake");
+
+        // Use the same `test_tx(21, 0, 1)` shape as the other RPC tests: tx from
+        // account 21 with nonce 0 to a self-bond of 1. Body is the raw
+        // `codec::encode_tx` bytes; for a smoke test we just need a 200/422-class
+        // response, not full tx body construction. Use the minimal body that the
+        // RPC server will parse and either admit (200 + hash) or reject (422 +
+        // reason) — both are sufficient to prove the TLS path is end-to-end.
+        let body = b"not-a-valid-tx-body-just-proves-tls";
+        let req = format!(
+            "POST /submit_tx HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        tls.write_all(req.as_bytes()).await.expect("send headers");
+        tls.write_all(body).await.expect("send body");
+        // Bounded read (see the metrics test for the half-close reasoning).
+        let mut resp = Vec::new();
+        let mut buf = [0u8; 16384];
+        loop {
+            match tls.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    resp.extend_from_slice(&buf[..n]);
+                    if resp.len() >= 16384 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&resp);
+        // A 422 (validation failure) is fine — what matters is that the response
+        // is an HTTP status line, proving the TLS layer end-to-end and the RPC
+        // handler reached the body. A plaintext probe would never produce this.
+        assert!(
+            text.starts_with("HTTP/1.1 4") || text.starts_with("HTTP/1.1 2"),
+            "expected 2xx or 4xx, got: {text}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8110,6 +9233,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -8173,6 +9298,108 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn rpc_bearer_auth_gates_the_write_path() {
+        // M156: with `[rpc] auth_token` set, a tx-submission POST needs
+        // `Authorization: Bearer <token>`. No/wrong token → 401; correct token → 200.
+        // Reads (GET) stay public regardless of the token.
+        let dir = tmp_dir("rpc-auth");
+        let mut cfg = node_config(21, 20760, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:20771";
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+            auth_token: "s3cret".into(),
+            enable_tls: false,
+        });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let body = crate::codec::encode_tx(&test_tx(1, 0, 1));
+        let post = |auth: Option<&str>| {
+            let mut headers = format!(
+                "POST /submit_tx HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n",
+                body.len()
+            );
+            if let Some(a) = auth {
+                headers.push_str(&format!("Authorization: Bearer {a}\r\n"));
+            }
+            headers.push_str("\r\n");
+            let mut r = headers.into_bytes();
+            r.extend_from_slice(&body);
+            r
+        };
+        async fn send(addr: &str, req: &[u8]) -> String {
+            let mut s = TcpStream::connect(addr).await.expect("connect");
+            s.write_all(req).await.expect("send");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+
+        // No token → 401.
+        let no = send(rpc_addr, &post(None)).await;
+        assert!(
+            no.starts_with("HTTP/1.1 401 Unauthorized"),
+            "no-token: {no}"
+        );
+        assert!(
+            no.contains("WWW-Authenticate: Bearer"),
+            "401 challenge: {no}"
+        );
+        // Wrong token → 401.
+        let wrong = send(rpc_addr, &post(Some("nope"))).await;
+        assert!(wrong.starts_with("HTTP/1.1 401"), "wrong-token: {wrong}");
+        // Correct token → 200, tx admitted.
+        let ok = send(rpc_addr, &post(Some("s3cret"))).await;
+        assert!(ok.starts_with("HTTP/1.1 200 OK"), "correct-token: {ok}");
+
+        // Reads stay public (no token required).
+        let get = {
+            let req = "GET /height HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            send(rpc_addr, req.as_bytes()).await
+        };
+        assert!(get.starts_with("HTTP/1.1 200 OK"), "public read: {get}");
+
+        let _ = node;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_authorization_bearer_cases() {
+        assert_eq!(
+            parse_authorization_bearer("Authorization: Bearer abc\r\n").unwrap(),
+            Some("abc".to_string())
+        );
+        // header-name case-insensitive, lowercase scheme accepted.
+        assert_eq!(
+            parse_authorization_bearer("authorization: bearer xyz\r\n").unwrap(),
+            Some("xyz".to_string())
+        );
+        assert_eq!(parse_authorization_bearer("Host: x\r\n").unwrap(), None);
+        assert!(parse_authorization_bearer("Authorization: Basic zzz\r\n").is_err());
+        assert!(parse_authorization_bearer("Authorization: Bearer \r\n").is_err());
+    }
+
+    #[test]
+    fn ct_str_eq_basic_properties() {
+        // M160: constant-time bearer compare agrees with `==` on the result (the timing
+        // property itself isn't observable in a unit test, but correctness must hold).
+        assert!(ct_str_eq("", ""));
+        assert!(ct_str_eq("abc", "abc"));
+        // equal length, differing byte (near the end) — still rejected.
+        assert!(!ct_str_eq("abc", "abd"));
+        // length mismatch, both directions.
+        assert!(!ct_str_eq("abc", "ab"));
+        assert!(!ct_str_eq("abc", "abcd"));
+        // case-sensitive (tokens are secrets, not identifiers).
+        assert!(!ct_str_eq("abc", "ABC"));
+    }
+
     #[test]
     fn route_get_parses_paths() {
         // M58: the read-class router. Unknown non-/account paths stay Health (200) so
@@ -8219,6 +9446,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -8362,6 +9591,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -8425,6 +9656,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -8507,6 +9740,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -8582,6 +9817,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -8739,6 +9976,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -8792,6 +10031,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -8882,6 +10123,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(24, kp(24).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -8983,6 +10226,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(25, kp(25).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -9095,6 +10340,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(26, kp(26).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -9209,6 +10456,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(27, kp(27).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -9302,6 +10551,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(28, kp(28).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -9377,6 +10628,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(29, kp(29).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -9455,6 +10708,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(30, kp(30).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -9531,6 +10786,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(31, kp(31).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -9609,6 +10866,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(32, kp(32).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -9676,6 +10935,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(36, kp(36).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -9745,6 +11006,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(44, kp(44).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -9816,6 +11079,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(45, kp(45).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -9900,6 +11165,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(46, kp(46).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -9983,6 +11250,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(47, kp(47).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10067,6 +11336,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(48, kp(48).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10137,6 +11408,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(49, kp(49).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10179,6 +11452,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(50, kp(50).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10218,6 +11493,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(37, kp(37).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10295,6 +11572,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(38, kp(38).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10388,6 +11667,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(51, kp(51).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10447,6 +11728,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(52, kp(52).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10497,6 +11780,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(39, kp(39).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10569,6 +11854,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(40, kp(40).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10648,6 +11935,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(43, kp(43).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10701,6 +11990,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(41, kp(41).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10786,6 +12077,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(33, kp(33).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10861,6 +12154,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(34, kp(34).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10941,6 +12236,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(35, kp(35).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10995,6 +12292,8 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -12576,13 +13875,23 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             create_empty_blocks: true,
             mempool_capacity: usize::MAX,
             mempool_per_account_limit: 32,
+            mempool_nonce_lookahead: 4,
+            mempool_replace_by_fee: true,
+            mempool_min_fee_bump: 1,
+            mempool_min_fee: 7,
         };
         let text = format_config(&c);
         assert!(text.starts_with("role=validator\n"), "{text}");
         assert!(text.contains("block_interval_ms=1000\n"), "{text}");
         assert!(text.contains("create_empty_blocks=true\n"), "{text}");
         assert!(text.contains("mempool_capacity=unbounded\n"), "{text}");
-        assert!(text.ends_with("mempool_per_account_limit=32"), "{text}");
+        assert!(text.contains("mempool_per_account_limit=32\n"), "{text}");
+        // M159: the opt-in mempool knobs added since M119 are surfaced so operators can
+        // verify them over the wire; min_fee is the last line.
+        assert!(text.contains("mempool_nonce_lookahead=4\n"), "{text}");
+        assert!(text.contains("mempool_replace_by_fee=true\n"), "{text}");
+        assert!(text.contains("mempool_min_fee_bump=1\n"), "{text}");
+        assert!(text.ends_with("mempool_min_fee=7"), "{text}");
 
         let json = json_config(&c);
         assert!(json.contains("\"role\":\"validator\""), "{json}");
@@ -12596,6 +13905,10 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             json.contains("\"mempool_per_account_limit\":\"32\""),
             "{json}"
         );
+        assert!(json.contains("\"mempool_nonce_lookahead\":\"4\""), "{json}");
+        assert!(json.contains("\"mempool_replace_by_fee\":true"), "{json}");
+        assert!(json.contains("\"mempool_min_fee_bump\":\"1\""), "{json}");
+        assert!(json.contains("\"mempool_min_fee\":\"7\""), "{json}");
         // bound_str maps a real bound to its number, the sentinel to `unbounded`.
         assert_eq!(bound_str(0), "0");
         assert_eq!(bound_str(usize::MAX), "unbounded");
@@ -13108,6 +14421,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -13180,6 +14495,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -13303,6 +14620,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -13406,6 +14725,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -13535,6 +14856,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(23, kp(23).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -13634,6 +14957,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(42, kp(42).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -13720,6 +15045,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -13976,6 +15303,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -14061,6 +15390,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -14223,6 +15554,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             logging: None,
             mempool: crate::config::MempoolConfig::default(),
             snapshot: None,
+            checkpoint: None,
         }
     }
 
@@ -15353,6 +16685,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -15378,7 +16712,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         std::fs::create_dir_all(&dir).expect("mkdir data dir");
         let snap_path = std::path::Path::new(&dir).join("snapshot.bin");
         std::fs::write(&snap_path, &snap_bytes).expect("write snapshot");
-        cfg.snapshot = Some(SnapshotBootConfig {
+        cfg.snapshot = Some(crate::config::SnapshotBootConfig {
             path: snap_path.to_string_lossy().into_owned(),
             header_hex,
             cert_hex: None,
@@ -15846,5 +17180,315 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- M148: light-client daemon (node light-run) ------------------------------
+
+    #[tokio::test]
+    async fn light_run_syncs_headers_from_a_full_node_over_tcp() {
+        // M148: a long-running light daemon connects to a full node over TCP, pulls
+        // headers-with-sets (M147), and tracks the chain to the full node's height —
+        // headers-only, no block bodies or chain execution.
+        let dir = tmp_dir("light-full");
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)]; // single validator self-produces
+
+        // Full validator node (id 21) — binds port_base+0, dials peer 22 (the light node).
+        let full_cfg = node_config(21, 20620, &[21, 22], format!("{dir}/full"));
+        let full = Node::start(full_cfg, genesis.clone(), Some(kp(21)))
+            .await
+            .expect("start full node");
+
+        // Light node (id 22) — dials nobody (>22 none); the full node dials it. It syncs
+        // via the Status→GetHeadersWithSets exchange regardless of dial direction.
+        let light_cfg = node_config(22, 20620, &[21, 22], format!("{dir}/light"));
+        let light = LightNode::start(light_cfg, genesis.clone())
+            .await
+            .expect("start light node");
+
+        // Wait for the light node to reach height >= 3.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if light.status().await.map(|(h, _)| h >= 3).unwrap_or(false) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "light node never synced to height 3"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // The light node's head matches the full node's at the same height.
+        let (lh, lhead) = light.status().await.expect("light status");
+        let (fh, fhead) = full.status().await.expect("full status");
+        assert!(fh >= lh, "full node is at least as tall as the light node");
+        // Compare at the light node's height: pull the full node's header there.
+        let (reply, rx) = oneshot::channel();
+        full.cmd
+            .send(Cmd::QueryHeader { height: lh, reply })
+            .unwrap();
+        let ch = rx.await.unwrap().expect("full node has the header");
+        assert_eq!(
+            ch.header.hash(),
+            lhead,
+            "light-tracked head equals the full node's header hash at height {lh}"
+        );
+        let _ = (fhead,);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn light_start_rejects_require_peer_auth_without_key() {
+        // M148: a light node has no validator key, so an auth/cert-pinned network policy
+        // is refused at boot rather than failing every dial silently.
+        let dir = tmp_dir("light-auth");
+        let mut cfg = node_config(22, 20640, &[21, 22], dir.clone());
+        cfg.network.require_peer_auth = true;
+        let genesis = test_genesis();
+        match LightNode::start(cfg, genesis).await {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
+            Ok(_) => panic!("require_peer_auth without a key must be rejected"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- M149: light daemon snapshot-seed ----------------------------------------
+
+    #[tokio::test]
+    async fn light_snapshot_seed_starts_at_tip() {
+        // M149: a light daemon configured with a verified snapshot (cert + trusted set)
+        // boots directly at the snapshot tip instead of tracking from genesis.
+        let (snap_bytes, header, cert, tv, state) = quorum_snapshot_fixture();
+        let dir = tmp_dir("light-seed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = std::path::Path::new(&dir).join("snap.bin");
+        std::fs::write(&path, &snap_bytes).unwrap();
+
+        let mut cfg = node_config(21, 20660, &[21], dir.clone());
+        cfg.snapshot = Some(crate::config::SnapshotBootConfig {
+            path: path.to_string_lossy().into_owned(),
+            header_hex: crate::hash::hex(&crate::codec::encode_header(&header)),
+            cert_hex: Some(crate::hash::hex(&crate::codec::encode_commit(&cert))),
+            trusted_validators: tv,
+        });
+        let light = LightNode::start(cfg, test_genesis())
+            .await
+            .expect("light snapshot-seed boot");
+        let (h, _) = light.status().await.expect("light status");
+        assert_eq!(h, state.height, "seeded at the snapshot tip");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn light_snapshot_seed_requires_cert() {
+        // M149: a light node can't recompute roots locally, so a `[snapshot]` without a
+        // cert + trusted set is rejected (no fallback commitment check like a full node).
+        let (snap_bytes, header, _cert, _tv, _state) = quorum_snapshot_fixture();
+        let dir = tmp_dir("light-seed-nocert");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = std::path::Path::new(&dir).join("snap.bin");
+        std::fs::write(&path, &snap_bytes).unwrap();
+
+        let mut cfg = node_config(21, 20680, &[21], dir.clone());
+        cfg.snapshot = Some(crate::config::SnapshotBootConfig {
+            path: path.to_string_lossy().into_owned(),
+            header_hex: crate::hash::hex(&crate::codec::encode_header(&header)),
+            cert_hex: None,
+            trusted_validators: vec![],
+        });
+        match LightNode::start(cfg, test_genesis()).await {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            Ok(_) => panic!("light snapshot-seed without a cert must be rejected"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- M151: light-node header persistence --------------------------------------
+
+    #[tokio::test]
+    async fn light_resumes_from_persisted_headers() {
+        // M151: a light daemon with a pre-seeded headers.log resumes at its last height
+        // on boot — no peer, no re-sync. (Deterministic: pre-seed the log directly, like
+        // the M141 full-node restart test, to avoid two live actors.)
+        use crate::driver::ChainDriver;
+        let dir = tmp_dir("light-resume");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Build a 3-block certified chain and its per-height validator sets.
+        let seeds: BTreeMap<u64, [u8; 32]> = [21u64, 22, 23, 24]
+            .iter()
+            .map(|&id| (id, seed(id)))
+            .collect();
+        let mut d = ChainDriver::new(test_genesis(), seeds, 1);
+        d.submit(test_tx(1, 1, 1)).unwrap();
+        d.submit(test_tx(2, 2, 2)).unwrap();
+        d.submit(test_tx(3, 3, 3)).unwrap();
+        assert_eq!(d.produce_until_drained(1.0, 8).unwrap(), 3);
+        let blocks = d.blocks().to_vec();
+        let certs = d.certificates().to_vec();
+        let mut replay = crate::Chain::new(test_genesis());
+        let mut sets = Vec::new();
+        for b in &blocks {
+            let mut b = b.clone();
+            replay.commit(&mut b).unwrap();
+            sets.push(replay.state.validators.clone());
+        }
+
+        // Pre-seed the header log as a prior run's persist() would have.
+        {
+            let hlog = crate::store::HeaderLog::open(format!("{dir}/headers.log")).unwrap();
+            for (i, b) in blocks.iter().enumerate() {
+                let ch = crate::codec::CertifiedHeader::from_certified(b, &certs[i]);
+                hlog.append(&ch, &sets[i]).unwrap();
+            }
+        }
+
+        // Boot a light node (no peers) against the same data_dir — it replays the log.
+        let cfg = node_config(21, 20700, &[21], dir.clone());
+        let light = LightNode::start(cfg, test_genesis())
+            .await
+            .expect("light node resumes from persisted headers");
+        let (h, _) = light.status().await.expect("light status");
+        assert_eq!(h, 3, "resumed at the persisted height without a peer");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- M152: light-node read-only RPC -------------------------------------------
+
+    #[tokio::test]
+    async fn light_rpc_status_over_tcp() {
+        // M152: a light node with `[rpc]` enabled serves its sync status over HTTP.
+        // Seed from a verified snapshot at height 3 (no peer), then GET /status.
+        let (snap_bytes, header, cert, tv, _state) = quorum_snapshot_fixture();
+        let dir = tmp_dir("light-rpc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = std::path::Path::new(&dir).join("snap.bin");
+        std::fs::write(&path, &snap_bytes).unwrap();
+
+        let mut cfg = node_config(21, 20720, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:20731";
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
+        });
+        cfg.snapshot = Some(crate::config::SnapshotBootConfig {
+            path: path.to_string_lossy().into_owned(),
+            header_hex: crate::hash::hex(&crate::codec::encode_header(&header)),
+            cert_hex: Some(crate::hash::hex(&crate::codec::encode_commit(&cert))),
+            trusted_validators: tv,
+        });
+        let _light = LightNode::start(cfg, test_genesis())
+            .await
+            .expect("light rpc boot");
+
+        async fn get(addr: &str, pathq: &str) -> String {
+            let req =
+                format!("GET {pathq} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect light rpc");
+            s.write_all(req.as_bytes()).await.expect("send");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // /status (text) reports the seeded height.
+        let s = get(rpc_addr, "/status").await;
+        assert!(s.starts_with("HTTP/1.1 200 OK"), "status: {s}");
+        assert!(body_of(&s).starts_with("height=3\n"), "status body: {s}");
+        assert!(body_of(&s).contains("\nhead="), "status has a head: {s}");
+
+        // JSON twin.
+        let j = get(rpc_addr, "/status?format=json").await;
+        assert!(
+            body_of(&j).starts_with("{\"height\":\"3\","),
+            "status json: {j}"
+        );
+
+        // A write method is rejected (read-only node).
+        async fn post(addr: &str) -> String {
+            let req = "POST /tx HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let mut s = TcpStream::connect(addr).await.expect("connect");
+            s.write_all(req.as_bytes()).await.expect("send");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        let p = post(rpc_addr).await;
+        assert!(
+            p.starts_with("HTTP/1.1 405 Method Not Allowed"),
+            "write rejected: {p}"
+        );
+        assert!(p.contains("Allow: GET\r\n"), "405 carries Allow: {p}");
+
+        // M155: /metrics serves Prometheus text with the height gauge.
+        let m = get(rpc_addr, "/metrics").await;
+        assert!(m.starts_with("HTTP/1.1 200 OK"), "metrics status: {m}");
+        assert!(
+            m.contains("# TYPE zhixing_height gauge\n")
+                && body_of(&m).contains("zhixing_height 3\n"),
+            "metrics body: {m}"
+        );
+        assert!(
+            body_of(&m).contains("zhixing_peers_connected "),
+            "metrics has peer gauge: {m}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- M153: light-node peer discovery ------------------------------------------
+
+    #[tokio::test]
+    async fn light_on_peers_learns_and_dials_higher_ids() {
+        // M153: a light actor ingesting a `Peers` book learns every peer's address
+        // (first-wins), skips itself, and auto-dials only higher-id peers (the
+        // dial-higher-id invariant); with peer exchange off it is a no-op. (TCP
+        // end-to-end discovery is covered by the full node's M39 tests + M148's sync.)
+        let auth = Arc::new(AuthContext {
+            my_id: 5,
+            kp: None,
+            validators: HashMap::new(),
+            require: false,
+            tls: None,
+            bind_channel: false,
+        });
+        let (tx, _rx) = mpsc::unbounded_channel::<LightCmd>();
+        let mut actor = LightActor {
+            node: crate::net::LightGossipNode::new(5, &test_genesis(), []),
+            outbound: HashMap::new(),
+            hlog: None,
+            appended: 0,
+            my_id: 5,
+            peer_exchange: true,
+            addrs: HashMap::new(),
+            dialing: HashSet::new(),
+            auth,
+            self_tx: tx,
+        };
+        actor.on_peers(vec![
+            (3, "127.0.0.1:1".into()),     // lower id: learn, don't dial
+            (9, "127.0.0.1:65000".into()), // higher id: learn + dial
+            (5, "127.0.0.1:2".into()),     // self: skipped
+        ]);
+        assert!(actor.addrs.contains_key(&3), "learned lower-id peer");
+        assert!(actor.addrs.contains_key(&9), "learned higher-id peer");
+        assert!(!actor.addrs.contains_key(&5), "self is not added");
+        assert!(actor.dialing.contains(&9), "dials the higher-id peer");
+        assert!(!actor.dialing.contains(&3), "does not dial a lower-id peer");
+
+        // peer_exchange off → on_peers is a no-op.
+        actor.peer_exchange = false;
+        actor.on_peers(vec![(10, "127.0.0.1:3".into())]);
+        assert!(
+            !actor.addrs.contains_key(&10),
+            "discovery off: nothing learned"
+        );
     }
 }

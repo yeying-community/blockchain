@@ -707,6 +707,30 @@ pub enum ChainError {
         expected: u64,
         got: u64,
     },
+    /// M143: the tx's `nonce` is further ahead than the mempool's pipelining window
+    /// allows (`got > acct.nonce + nonce_lookahead`). A mempool-admission bound, not
+    /// a consensus rule — it keeps per-account buffering finite.
+    NonceTooFarAhead {
+        account: u64,
+        got: u64,
+        limit: u64,
+    },
+    /// M144: a replace-by-fee admission was rejected because the incoming tx did not
+    /// bid a strictly higher fee than the pending tx at the same `(author, nonce)`.
+    /// A mempool-admission policy, not a consensus rule.
+    FeeTooLowToReplace {
+        author: u64,
+        nonce: u64,
+        existing_fee: u64,
+        got_fee: u64,
+    },
+    /// M157: a tx was rejected at mempool admission because its `fee` is below the
+    /// operator-configured minimum-fee floor. A local anti-spam policy, not a consensus
+    /// rule — a block carrying a below-floor tx still applies.
+    FeeBelowMinimum {
+        got: u64,
+        min: u64,
+    },
     BadScore {
         reviewer: u64,
         score: f32,
@@ -862,6 +886,17 @@ impl std::fmt::Display for ChainError {
                 f,
                 "account {account} nonce mismatch: expected {expected}, got {got}"
             ),
+            ChainError::NonceTooFarAhead { account, got, limit } => write!(
+                f,
+                "account {account} nonce {got} exceeds the mempool pipelining window (max {limit})"
+            ),
+            ChainError::FeeTooLowToReplace { author, nonce, existing_fee, got_fee } => write!(
+                f,
+                "account {author} nonce {nonce}: replacement fee {got_fee} not higher than pending {existing_fee}"
+            ),
+            ChainError::FeeBelowMinimum { got, min } => {
+                write!(f, "tx fee {got} below the mempool minimum {min}")
+            }
             ChainError::BadScore { reviewer, score } => {
                 write!(f, "reviewer {reviewer} score {score} out of [0,1]")
             }
@@ -1716,6 +1751,31 @@ impl ChainState {
     /// The mempool uses this for admission; `apply_tx` runs it first, so a tx
     /// that passes here never partially mutates state when applied.
     pub(crate) fn validate_tx(&self, tx: &SubmissionTx) -> Result<(), ChainError> {
+        // M143: all checks except the strict-nonce gate live in `validate_tx_ignoring_nonce`
+        // so the mempool can reuse them under a relaxed (pipelining) nonce window. The
+        // consensus/apply path keeps the strict `tx.nonce == acct.nonce` rule here.
+        self.validate_tx_ignoring_nonce(tx)?;
+        let acct = self.accounts.get(&tx.author).unwrap(); // existence proven above
+                                                           // M122: sequence-based replay protection — the tx must carry the account's current
+                                                           // nonce. (M143: now checked after the other gates; when several checks fail at once
+                                                           // this only changes which error variant surfaces, never whether the tx is rejected —
+                                                           // so block building, which skips any rejected tx, is unaffected.)
+        if tx.nonce != acct.nonce {
+            return Err(ChainError::BadNonce {
+                account: tx.author,
+                expected: acct.nonce,
+                got: tx.nonce,
+            });
+        }
+        Ok(())
+    }
+
+    /// M143: every static admission check EXCEPT the sequence-number gate — the shared core
+    /// of [`Self::validate_tx`] (which adds the strict `tx.nonce == acct.nonce` rule) and the
+    /// mempool's pipelining admission (which applies a bounded forward-nonce window instead).
+    /// Validates: non-empty + well-scored reviews, known reviewers, known account, authentic
+    /// signature, and balance covering `stake` then `stake + fee`.
+    pub(crate) fn validate_tx_ignoring_nonce(&self, tx: &SubmissionTx) -> Result<(), ChainError> {
         if tx.reviews.is_empty() {
             return Err(ChainError::EmptyReviews(tx.author));
         }
@@ -1743,16 +1803,6 @@ impl ChainState {
                 account: tx.author,
                 need: tx.stake,
                 have: acct.balance,
-            });
-        }
-        // M122: sequence-based replay protection — the tx must carry the account's current
-        // nonce (checked before the balance gate so a replay is rejected as such, not as a
-        // balance error).
-        if tx.nonce != acct.nonce {
-            return Err(ChainError::BadNonce {
-                account: tx.author,
-                expected: acct.nonce,
-                got: tx.nonce,
             });
         }
         // M122: the author must cover both the escrowed stake and the (spent) fee. u128 add
@@ -4379,6 +4429,53 @@ mod tests {
         let r = chain.commit(&mut b1).unwrap();
         assert_eq!(r.accepted, 1);
         assert_eq!(chain.state.accounts.get(&1).unwrap().nonce, 2);
+    }
+
+    #[test]
+    fn validate_tx_ignoring_nonce_matches_validate_tx_sans_nonce() {
+        // M143: `validate_tx_ignoring_nonce` is `validate_tx` without the strict nonce gate.
+        let chain = Chain::new(base_genesis());
+        // Correct nonce (0): both accept.
+        let ok = novel_tx_full(1, 1, 1, 1.0, 0, 0);
+        assert!(chain.state.validate_tx(&ok).is_ok());
+        assert!(chain.state.validate_tx_ignoring_nonce(&ok).is_ok());
+        // Future nonce (5): strict `validate_tx` rejects as BadNonce; the nonce-ignoring
+        // variant (what the mempool uses under a pipelining window) still accepts.
+        let future = novel_tx_full(1, 2, 2, 1.0, 0, 5);
+        assert!(matches!(
+            chain.state.validate_tx(&future),
+            Err(ChainError::BadNonce { .. })
+        ));
+        assert!(chain.state.validate_tx_ignoring_nonce(&future).is_ok());
+    }
+
+    #[test]
+    fn nonce_too_far_ahead_error_display() {
+        let e = ChainError::NonceTooFarAhead {
+            account: 7,
+            got: 10,
+            limit: 3,
+        };
+        let s = e.to_string();
+        assert!(
+            s.contains("account 7") && s.contains("10") && s.contains("3"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn fee_too_low_to_replace_error_display() {
+        let e = ChainError::FeeTooLowToReplace {
+            author: 4,
+            nonce: 2,
+            existing_fee: 9,
+            got_fee: 5,
+        };
+        let s = e.to_string();
+        assert!(
+            s.contains("account 4") && s.contains("nonce 2") && s.contains('9') && s.contains('5'),
+            "{s}"
+        );
     }
 
     #[test]
