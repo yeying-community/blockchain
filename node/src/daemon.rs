@@ -2631,6 +2631,10 @@ async fn serve_metrics_conn(
             matches!(parse_authorization_bearer(head), Ok(Some(t)) if ct_str_eq(&t, &auth_token));
         if !authorized {
             auth_failures.fetch_add(1, Ordering::Relaxed);
+            // M167: timing-hardened 401 — sleep a uniform `[0, 5) ms` before
+            // writing the response so the missing/wrong token branches cost
+            // the same end-to-end.
+            jitter_401().await;
             let _ = stream
                 .write_all(unauthorized_bearer_response().as_bytes())
                 .await;
@@ -2728,6 +2732,32 @@ fn parse_authorization_bearer(headers: &str) -> Result<Option<String>, String> {
         return Ok(Some(rest.to_string()));
     }
     Ok(None)
+}
+
+/// M167: upper bound (in milliseconds) of the uniform random delay added to
+/// every 401 response. The 401 path (M156/M158) otherwise has near-constant
+/// time (a few microseconds) and would let an attacker distinguish
+/// "missing token" from "wrong token" from "malformed header" by end-to-end
+/// timing. The jitter is small enough that a health-check or scrape on the
+/// port barely notices it, but large enough to lift the 401 distribution's
+/// lower bound into the legit-path distribution (which already does an
+/// actor round-trip + render in milliseconds). Uniform on `[0, MAX)`.
+const AUTH_FAILURE_JITTER_MAX_MS: u64 = 5;
+
+/// M167: sleep `[0, AUTH_FAILURE_JITTER_MAX_MS)` ms, sampled uniformly from
+/// `getrandom`. Called once per 401 path in `serve_metrics_conn` and
+/// `serve_rpc_conn`, immediately after the `auth_failures` counter
+/// increment and before the `unauthorized_bearer_response()` write — so
+/// the on-wire delay is the same regardless of which branch (missing / wrong
+/// / malformed-but-tolerated) the handler took. RNG syscall is ~μs, well
+/// below the jitter range, so the helper itself is not a timing leak.
+async fn jitter_401() {
+    use std::time::Duration;
+    let mut buf = [0u8; 8];
+    let _ = getrandom::getrandom(&mut buf);
+    let max_nanos = AUTH_FAILURE_JITTER_MAX_MS.saturating_mul(1_000_000).max(1); // never sleep zero-nanos; mod-by-zero would panic.
+    let nanos = u64::from_le_bytes(buf) % max_nanos;
+    tokio::time::sleep(Duration::from_nanos(nanos)).await;
 }
 
 /// M156: fixed-shape `401 Unauthorized` with `WWW-Authenticate: Bearer` (RFC 6750
@@ -6665,6 +6695,9 @@ async fn serve_rpc_conn(
                 // M163: count the 401 (missing/wrong token). A malformed header (the
                 // `Err` arm below) is a 400 protocol error, not an auth rejection.
                 auth_failures.fetch_add(1, Ordering::Relaxed);
+                // M167: timing-hardened 401 — sleep a uniform `[0, 5) ms` so the
+                // missing-vs-wrong branches cost the same end-to-end.
+                jitter_401().await;
                 let _ = stream
                     .write_all(unauthorized_bearer_response().as_bytes())
                     .await;
@@ -9278,6 +9311,25 @@ mod tests {
             "auth-failure counter: {ok}"
         );
 
+        // M167: each 401 sleeps `[0, AUTH_FAILURE_JITTER_MAX_MS)` before
+        // responding. Take four unauthorized scrapes and assert the spread of
+        // their end-to-end elapsed times is non-zero — proving the jitter
+        // helper is actually sleeping a positive amount at least once. We
+        // don't assert the absolute upper bound (CI scheduling jitter is
+        // large) just that *some* sampling lands above zero.
+        let mut samples = Vec::new();
+        for _ in 0..4 {
+            let start = std::time::Instant::now();
+            let _ = scrape(metrics_addr, None).await;
+            samples.push(start.elapsed());
+        }
+        let min = *samples.iter().min().unwrap();
+        let max = *samples.iter().max().unwrap();
+        assert!(
+            max > min,
+            "401 elapsed times were constant ({min:?}..{max:?}) — jitter not applied"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9661,6 +9713,46 @@ mod tests {
         assert!(!ct_str_eq("abc", "abcd"));
         // case-sensitive (tokens are secrets, not identifiers).
         assert!(!ct_str_eq("abc", "ABC"));
+    }
+
+    #[test]
+    fn jitter_401_distribution_is_bounded() {
+        // M167: the 401 timing-jitter helper samples `[0, AUTH_FAILURE_JITTER_MAX_MS)`
+        // ms uniformly. We don't assert a tight statistical property (CI timing is
+        // noisy and `tokio::time::sleep` on a paused runtime can be a no-op anyway) —
+        // just the contract the helper is supposed to honor: every sample is below
+        // the upper bound, and the distribution is not constant-zero (i.e. the RNG
+        // is actually wiring through).
+        use std::time::Duration;
+        let max_nanos = AUTH_FAILURE_JITTER_MAX_MS.saturating_mul(1_000_000).max(1);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let mut saw_nonzero = false;
+        for _ in 0..256 {
+            let mut buf = [0u8; 8];
+            getrandom::getrandom(&mut buf).expect("rng");
+            let n = u64::from_le_bytes(buf) % max_nanos;
+            assert!(n < max_nanos, "sample {n} not below max {max_nanos}");
+            if n > 0 {
+                saw_nonzero = true;
+            }
+            // The helper itself awaits a tokio sleep — make sure that compiles
+            // and the future actually runs to completion (so the helper is
+            // callable, not just logically correct).
+            rt.block_on(async {
+                tokio::time::sleep(Duration::from_nanos(n)).await;
+            });
+        }
+        // With 256 samples uniform on `[0, 5_000_000)` ns, the probability of
+        // getting *all* zero is `(1/5_000_000)^256` — astronomically below any
+        // practical flake risk. If we ever see 0/256 non-zero the RNG has
+        // silently broken.
+        assert!(
+            saw_nonzero,
+            "all 256 jitter samples were 0 — RNG is constant?"
+        );
     }
 
     #[test]

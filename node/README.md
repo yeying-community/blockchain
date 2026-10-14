@@ -1418,6 +1418,17 @@ M157 的最低费用门槛（`[mempool] min_fee`）在 `insert` 最前置拒掉�
 - **测试（+0 → 624）**：扩展 M157 `min_fee_floor_rejects_below_and_admits_at_or_above`（拒后 `rejected_min_fee()==1`、准入不递增）+ `render_prometheus_emits_counters`（新 counter 在期望表）。
 - **已知边界**：boot 起单调累加（Prometheus counter，重启归零，运维用 `rate()`）；仅 `insert` 路径计数，块级无费用门槛（M157 设计）故不含块内低费 tx，与门槛「本地准入策略非共识规则」定位一致。同理给 nonce-too-far/replace-by-fee/mempool-full 各补计数器、401 鉴权失败计数属后续篮子。
 
+## bearer 鉴权失败响应延迟 jitter（Milestone 167 · 鉴权时序硬化）
+
+M156/M158/M160/M163 把 bearer 鉴权做齐：缺/错 token 返 401 + 常时比较 + 401 计数。但**失败响应的端到端延迟**未加随机化——handler 内部各分支（缺 token / 错 token / malformed header 走 400）执行时间不同，攻击者可经延迟反推走哪条分支 + 配合字典探测 token 长度/前缀。M167 在 401 路径**写响应前** sleep 一个 `[0, 5)` ms 的 uniform 随机抖动。
+
+- **新辅助**（`daemon.rs`）：`AUTH_FAILURE_JITTER_MAX_MS: u64 = 5` 常量 + `jitter_401()` async 函数（用现成 `getrandom::getrandom` 抽 8 字节 LE u64、`%` 限到 `[0, 5_000_000)` 纳秒、`tokio::time::sleep`）。**无新 dep**——`getrandom` 已在 `Cargo.toml`（M121 引入 hash 后）。
+- **两个 401 现场**插入 `jitter_401().await`：M158 `serve_metrics_conn`（`daemon.rs:2635`）+ M156 `serve_rpc_conn`（`daemon.rs:6700`）——紧跟 `auth_failures.fetch_add(1, Ordering::Relaxed)` 之后、写 `unauthorized_bearer_response()` 之前。
+- **不**给合法路径（200）、其他 4xx（400 malformed header、403、405）、其他错误加 jitter——合法用户无时序攻击面；malformed header 已 M163 不计 401 counter，不属本攻击面。
+- **不碰** 共识/codec/wire/合法路径字节；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+1 → 632）**：新纯 `jitter_401_distribution_is_bounded`（256 样本全部 `< max_nanos` + 至少一个 > 0 + 顺便验证 `tokio::time::sleep` 实际跑过）；扩展 M163 `metrics_endpoint_bearer_auth_gates_scrapes` 4 次未授权 scrape 断言**至少有一次延迟 > 最小延迟**（证明 jitter 真在 sleep）——**不**断言绝对上限（CI 调度抖动大）。
+- **已知边界**：5 ms uniform 是**最简有用版本**——下界 0 仍快于合法路径 ~ms，攻击者要可靠区分 0 vs ~ms 仍要做大量采样平均 + 多次测量。**完美防御**需常时 handler（每个分支字节相同 + 无 syscall 边界），M167 不达此。5 ms 是工程量（与典型 LAN RTT 同数量级），过大影响合法 scrape/健康检查延迟。RNG syscall ~μs 开销对 ms 量级端到端延迟无影响。counter `_created` 时间戳、mTLS/持久 cert、助记词 keystore、真正 `encode_unbonding` codec 入口属后续篮子。
+
 ## bearer 鉴权常时比较（Milestone 160 · 鉴权加固）
 
 M156/M158 在 `[rpc] auth_token` 与 `[metrics] auth_token` 处用 `t == auth_token` 逐字节短路比较——第一个不等字节即返 `false`，对公网监听/共享 token 部署构成**逐字节时序侧信道**（攻击者经端到端延迟推 prefix）。M160 改用**常时字符串相等**比较。
