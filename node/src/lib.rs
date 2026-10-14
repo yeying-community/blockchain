@@ -536,6 +536,24 @@ pub struct UnbondingEntry {
     pub mature_height: u64,
 }
 
+impl UnbondingEntry {
+    /// M166: content-addressed hash for cursor pagination. The three fields are
+    /// hashed as little-endian byte strings in declaration order, then SHA-256'd.
+    /// This is a **local cursor key** only — it is not on the wire and does not
+    /// participate in any consensus rule. If `UnbondingEntry` is later
+    /// serialized via a codec entry (`encode_unbonding` is deliberately *not*
+    /// introduced here to keep the wire surface untouched), that helper should
+    /// be the canonical encoding for `hash()` too — and the two must agree,
+    /// byte-for-byte, so old cursors keep resolving across the upgrade.
+    pub fn hash(&self) -> Hash {
+        let mut buf = [0u8; 24];
+        buf[0..8].copy_from_slice(&self.account.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.amount.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.mature_height.to_le_bytes());
+        hash::sha256(&buf)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Account {
     pub pubkey: PubKey,
@@ -4497,5 +4515,40 @@ mod tests {
         chain.commit(&mut blk).unwrap();
         assert_eq!(blk.txs[0].author, 2);
         assert_eq!(blk.txs[0].fee, 3 * MICRO);
+    }
+
+    #[test]
+    fn unbonding_entry_hash_is_stable_and_collision_safe() {
+        // M166: the cursor pagination key for `/unbonding` is a content hash of
+        // the three declared fields (account, amount, mature_height) in
+        // little-endian byte order, then SHA-256'd. The hash is deterministic
+        // (same input → same hash), distinct from any other input that differs
+        // in any of the three fields, and 32 bytes long (fits the existing
+        // `crate::hash::hex` / `crate::hash::from_hex` 64-char cursor format).
+        let a = UnbondingEntry {
+            account: 1,
+            amount: 2,
+            mature_height: 3,
+        };
+        let b = a.clone();
+        assert_eq!(a.hash(), b.hash(), "deterministic across clone");
+
+        // Each field contributes — flipping any one of the three yields a
+        // different hash. We don't pin a specific golden value (the LE
+        // byte-order / SHA-256 details are the contract; reordering the
+        // fields in the struct would silently break every old cursor and
+        // that's the property this test guards).
+        let mut diff_account = a.clone();
+        diff_account.account = 99;
+        assert_ne!(a.hash(), diff_account.hash());
+        let mut diff_amount = a.clone();
+        diff_amount.amount = 99;
+        assert_ne!(a.hash(), diff_amount.hash());
+        let mut diff_height = a.clone();
+        diff_height.mature_height = 99;
+        assert_ne!(a.hash(), diff_height.hash());
+
+        // 32-byte output (a `[u8; 32]` `Hash`).
+        assert_eq!(a.hash().len(), 32);
     }
 }

@@ -3144,7 +3144,10 @@ const MAX_PAGE_LIMIT: usize = 500;
 /// M72: apply an `offset`/`limit` window to a slice, clamped to bounds with
 /// saturating arithmetic (huge params can't overflow). `offset` past the end ⇒
 /// empty; `limit == None` ⇒ through the end; `limit == Some(0)` ⇒ empty. Pure and
-/// generic so future list endpoints reuse it. Unit-tested directly.
+/// generic so future list endpoints reuse it. M166: retained for the
+/// `paginate_windows` unit test; all live call sites have moved to M165 cursor
+/// pagination (`key_after` + manual slice bounds).
+#[allow(dead_code)]
 fn paginate<T>(items: &[T], offset: usize, limit: Option<usize>) -> &[T] {
     let start = offset.min(items.len());
     let end = match limit {
@@ -4795,6 +4798,10 @@ fn json_bond_page_cursor(
 }
 
 /// M137: `/unbonding` page with the whole-queue amount Σ (`total_amount`, lossless quoted-u64).
+/// M166: retained for callers that still want the offset-based envelope (e.g. tests
+/// that pin the M137 shape); `/unbonding` itself now emits the cursor variant
+/// ([`json_unbonding_page_cursor`]).
+#[allow(dead_code)]
 fn json_unbonding_page(
     items: &str,
     total: usize,
@@ -4809,6 +4816,29 @@ fn json_unbonding_page(
         "{{\"total\":{},\"next\":{},\"total_amount\":{},\"items\":{}}}",
         json_u64(total as u64),
         next,
+        json_u64(total_amount),
+        items
+    )
+}
+
+/// M166: cursor-pagination variant of [`json_unbonding_page`] for `/unbonding`.
+/// `cursor` is a JSON string (the content-addressed `UnbondingEntry::hash()` of
+/// the last returned row, hex-encoded) instead of an offset `next`. The
+/// `total_amount` Σ over the whole queue is unchanged.
+fn json_unbonding_page_cursor(
+    items: &str,
+    total: usize,
+    cursor: Option<&str>,
+    total_amount: u64,
+) -> String {
+    let cur = match cursor {
+        Some(c) => json_str(c),
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"total\":{},\"cursor\":{},\"total_amount\":{},\"items\":{}}}",
+        json_u64(total as u64),
+        cur,
         json_u64(total_amount),
         items
     )
@@ -6044,7 +6074,9 @@ async fn serve_rpc_conn(
                 // `format_unbonding`/`json_unbonding` per item. M137: also reports the
                 // micro-$COG Σ of the *whole* queue (the value folded into `state.unbonding`
                 // and visible at `/supply`) so the operator can verify the queue's total in
-                // one place.
+                // one place. M166: stable `?cursor=<UnbondingEntry::hash() hex>` cursor
+                // (the new `UnbondingEntry::hash()` is the content-addressed key, see
+                // `src/lib.rs`).
                 let (reply, rx) = oneshot::channel();
                 if cmd.send(Cmd::QueryUnbonding { reply }).is_err() {
                     http_response("503 Service Unavailable", "node stopped")
@@ -6052,25 +6084,30 @@ async fn serve_rpc_conn(
                     match rx.await {
                         Ok(listing) => {
                             let total_amount: u64 = listing.iter().map(|u| u.amount).sum();
-                            let offset = usize_param(query, "offset").unwrap_or(0);
-                            let limit = Some(effective_limit(usize_param(query, "limit")));
-                            let total = listing.len();
-                            let page = paginate(&listing, offset, limit);
-                            let start = offset.min(total);
-                            let next = if start + page.len() < total {
-                                Some(start + page.len())
+                            let keys: Vec<crate::Hash> = listing.iter().map(|u| u.hash()).collect();
+                            let cursor = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("cursor="))
+                                .and_then(crate::hash::from_hex);
+                            let start = if cursor.is_some() {
+                                key_after(&keys, cursor.as_ref())
                             } else {
-                                None
+                                usize_param(query, "offset").unwrap_or(0)
                             };
+                            let limit = effective_limit(usize_param(query, "limit"));
+                            let total = listing.len();
+                            let page = &listing[start..(start + limit).min(total)];
+                            let cur = last_key(&keys[start..(start + page.len())])
+                                .map(|h| crate::hash::hex(h));
                             let summary = format!("total_amount={total_amount}");
                             let items = format!("{summary}\n{}", format_unbonding_listing(page));
                             ok_body(
                                 fmt,
-                                &format_page(&items, total, next),
-                                &json_unbonding_page(
+                                &format_page_cursor(&items, total, cur.as_deref()),
+                                &json_unbonding_page_cursor(
                                     &json_unbonding_listing(page),
                                     total,
-                                    next,
+                                    cur.as_deref(),
                                     total_amount,
                                 ),
                             )
@@ -6084,26 +6121,42 @@ async fn serve_rpc_conn(
                 // consumer of the pagination stack and the first pending-pool read (after the
                 // committed-state lists `/validators`, `/accounts`, `/reviewers`, `/graph`,
                 // `/bonds`, `/unbonding`), reusing `format_stake_op`/`json_stake_op` per item.
+                // M166: stable `?cursor=<StakeOp::hash() hex>` cursor — every pending
+                // StakeOp already has a content-addressed `hash()` (lib.rs:228).
                 let (reply, rx) = oneshot::channel();
                 if cmd.send(Cmd::QueryStakeOps { reply }).is_err() {
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
                         Ok(listing) => {
-                            let offset = usize_param(query, "offset").unwrap_or(0);
-                            let limit = Some(effective_limit(usize_param(query, "limit")));
-                            let total = listing.len();
-                            let page = paginate(&listing, offset, limit);
-                            let start = offset.min(total);
-                            let next = if start + page.len() < total {
-                                Some(start + page.len())
+                            let keys: Vec<crate::Hash> =
+                                listing.iter().map(|op| op.hash()).collect();
+                            let cursor = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("cursor="))
+                                .and_then(crate::hash::from_hex);
+                            let start = if cursor.is_some() {
+                                key_after(&keys, cursor.as_ref())
                             } else {
-                                None
+                                usize_param(query, "offset").unwrap_or(0)
                             };
+                            let limit = effective_limit(usize_param(query, "limit"));
+                            let total = listing.len();
+                            let page = &listing[start..(start + limit).min(total)];
+                            let cur = last_key(&keys[start..(start + page.len())])
+                                .map(|h| crate::hash::hex(h));
                             ok_body(
                                 fmt,
-                                &format_page(&format_stakeop_listing(page), total, next),
-                                &json_page(&json_stakeop_listing(page), total, next),
+                                &format_page_cursor(
+                                    &format_stakeop_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
+                                &json_page_cursor(
+                                    &json_stakeop_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -6114,26 +6167,40 @@ async fn serve_rpc_conn(
                 // M90: pending slashing-evidence pool — always a (possibly empty) `200`. Ninth
                 // consumer of the pagination stack and the second pending-pool read (after
                 // `/stake-ops`), reusing `format_slash_evidence`/`json_slash_evidence` per item.
+                // M166: stable `?cursor=<SlashEvidence::hash() hex>` cursor (lib.rs:266).
                 let (reply, rx) = oneshot::channel();
                 if cmd.send(Cmd::QueryEvidence { reply }).is_err() {
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
                         Ok(listing) => {
-                            let offset = usize_param(query, "offset").unwrap_or(0);
-                            let limit = Some(effective_limit(usize_param(query, "limit")));
-                            let total = listing.len();
-                            let page = paginate(&listing, offset, limit);
-                            let start = offset.min(total);
-                            let next = if start + page.len() < total {
-                                Some(start + page.len())
+                            let keys: Vec<crate::Hash> = listing.iter().map(|e| e.hash()).collect();
+                            let cursor = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("cursor="))
+                                .and_then(crate::hash::from_hex);
+                            let start = if cursor.is_some() {
+                                key_after(&keys, cursor.as_ref())
                             } else {
-                                None
+                                usize_param(query, "offset").unwrap_or(0)
                             };
+                            let limit = effective_limit(usize_param(query, "limit"));
+                            let total = listing.len();
+                            let page = &listing[start..(start + limit).min(total)];
+                            let cur = last_key(&keys[start..(start + page.len())])
+                                .map(|h| crate::hash::hex(h));
                             ok_body(
                                 fmt,
-                                &format_page(&format_evidence_listing(page), total, next),
-                                &json_page(&json_evidence_listing(page), total, next),
+                                &format_page_cursor(
+                                    &format_evidence_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
+                                &json_page_cursor(
+                                    &json_evidence_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -10893,7 +10960,9 @@ mod tests {
             "unbonding text envelope (empty queue, with M137 Σ)"
         );
 
-        // JSON representation → the `total`/`next`/`total_amount`/`items` envelope (empty array).
+        // JSON representation → the `total`/`cursor`/`total_amount`/`items` envelope
+        // (empty array). M166: `cursor=` replaces M79's `next=`; cursor is `null` for
+        // empty listings; `total_amount` Σ unchanged.
         let as_json = get(rpc_addr, "/unbonding?format=json").await;
         assert!(
             as_json.starts_with("HTTP/1.1 200 OK"),
@@ -10905,8 +10974,8 @@ mod tests {
         );
         assert_eq!(
             body_of(&as_json),
-            "{\"total\":\"0\",\"next\":null,\"total_amount\":\"0\",\"items\":[]}",
-            "unbonding JSON envelope (empty queue, with M137 Σ)"
+            "{\"total\":\"0\",\"cursor\":null,\"total_amount\":\"0\",\"items\":[]}",
+            "unbonding JSON envelope (empty queue, with M137 Σ + M166 cursor)"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -10971,7 +11040,11 @@ mod tests {
             "stake-ops text envelope (empty pool)"
         );
 
-        // JSON representation → the `total`/`next`/`items` envelope with an empty array.
+        // JSON representation → the `total`/`cursor`/`items` envelope with an empty
+        // array. M166: `cursor=` replaces M79's `next=`; cursor is `null` for empty
+        // listings. (Each pending `StakeOp` already has a content-addressed
+        // `StakeOp::hash()` (lib.rs:228); once the pool is non-empty, the cursor
+        // value is that hash hex.)
         let as_json = get(rpc_addr, "/stake-ops?format=json").await;
         assert!(
             as_json.starts_with("HTTP/1.1 200 OK"),
@@ -10983,8 +11056,8 @@ mod tests {
         );
         assert_eq!(
             body_of(&as_json),
-            "{\"total\":\"0\",\"next\":null,\"items\":[]}",
-            "stake-ops JSON envelope (empty pool)"
+            "{\"total\":\"0\",\"cursor\":null,\"items\":[]}",
+            "stake-ops JSON envelope (empty pool, M166 cursor)"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -11049,7 +11122,10 @@ mod tests {
             "evidence text envelope (empty pool)"
         );
 
-        // JSON representation → the `total`/`next`/`items` envelope with an empty array.
+        // JSON representation → the `total`/`cursor`/`items` envelope with an empty
+        // array. M166: `cursor=` replaces M79's `next=`; cursor is `null` for empty
+        // listings. (`SlashEvidence::hash()` (lib.rs:266) is the natural cursor key
+        // for non-empty pools.)
         let as_json = get(rpc_addr, "/evidence?format=json").await;
         assert!(
             as_json.starts_with("HTTP/1.1 200 OK"),
@@ -11061,8 +11137,8 @@ mod tests {
         );
         assert_eq!(
             body_of(&as_json),
-            "{\"total\":\"0\",\"next\":null,\"items\":[]}",
-            "evidence JSON envelope (empty pool)"
+            "{\"total\":\"0\",\"cursor\":null,\"items\":[]}",
+            "evidence JSON envelope (empty pool, M166 cursor)"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

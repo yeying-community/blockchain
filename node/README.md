@@ -1380,6 +1380,18 @@ M72/M79/M81 的 `?offset=` / `?limit=` + `next=` 信封用**列表内字节偏�
 - **测试（+2 → 630）**：新纯 `cursor_pagination_helpers`（`key_after`/`last_key` 各种 cursor 场景含 hash）+ `cursor_page_envelopes`（`format_page_cursor`/`json_page_cursor` 5 断言）；扩展 6 个端点既有 in-process 测（`rpc_*_list_over_tcp`）更新为 `cursor=` 信封。
 - **已知边界**：8 端点**端点契约小破坏**——响应字段名 `next`→`cursor`，值语义从位置变内容键。运营脚本要更新；3 端点仍 `next=`。`/unbonding`/`/stake-ops`/`/evidence` 内容键（tx hash 或复合键）属后续篮子。`?cursor=garbage` 静默忽略（不返 400）以保持 `?offset=` 风格的宽容度。
 
+## 游标补全：unbonding / stake-ops / evidence 也上 `cursor=`（Milestone 166 · 收尾）
+
+M165 保留 3 端点（`/unbonding`/`/stake-ops`/`/evidence`）为 `next=` 是因为它们**当时无自然内容键**——入池顺序 + 每块 drain。M166 给这 3 端各加内容地址键（content hash），让**全部 12 个 list 端点统一 `cursor=` 信封**，端点契约分裂期结束。
+
+- **`UnbondingEntry::hash()`**（`src/lib.rs`，M166 新加）：3 字段（account/amount/mature_height）按声明顺序 LE 字节拼接（24 字节）+ SHA-256 → 32 字节 `Hash`。**刻意不引 `encode_unbonding` codec 入口**——避免新 wire 表面 = 破 head 不变量风险（cursor 键只是**本地**计算，不参与任何共识/wire/encode）。若未来真要把 `UnbondingEntry` 序列化入 wire，单独里程碑加 codec 入口并同步 `hash()` 用 codec。
+- **`StakeOp::hash()`**（`lib.rs:228` 已存在）/**`SlashEvidence::hash()`**（`lib.rs:266` 已存在）现成复用，content-addressed over the full signed encoding。
+- **三个 handler 采纳 `cursor=`**（`daemon.rs`）：`/unbonding` 用 `UnbondingEntry::hash()`、 `/stake-ops` 用 `StakeOp::hash()`、 `/evidence` 用 `SlashEvidence::hash()`。新 `json_unbonding_page_cursor`（照 M165 `json_bond_page_cursor` 套路）保留 `total_amount` Σ + 改 `next`→`cursor`。旧 `format_page`/`json_page`/`json_unbonding_page`/`json_bond_page` 标 `#[allow(dead_code)]` 保留给其他可能调用方；M165 顺延"`/unbonding`/`/stake-ops`/`/evidence` 内容键"项收尾。
+- **`paginate` 函数**（M72）现在所有活路径都用 `key_after` + 手摇切片了，标 `#[allow(dead_code)]` 保留给 `paginate_windows` 单元测。
+- **不碰** 共识/codec/wire（`UnbondingEntry::hash` 纯本地）/分页基础原语；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+1 → 631）**：新 `unbonding_entry_hash_is_stable_and_collision_safe`（4 断言：clone 等、改任一字段 hash 不同、32 字节长）；扩展 `rpc_unbonding_list_over_tcp`/`rpc_stake_ops_list_over_tcp`/`rpc_evidence_list_over_tcp` in-process 测改 `next`→`cursor`。
+- **已知边界**：`UnbondingEntry` 字段顺序（account/amount/mature_height）+ LE 字节序 = hash 格式的隐性契约；改字段顺序或加字段 = 改 hash 格式 = 旧 cursor 解析失败（文档说明）。`encode_unbonding` 真正的 codec 入口（若未来要把 UnbondingEntry 入 wire/快照/跨链）属后续篮子。
+
 ## mempool 剩余拒绝路径计数指标（Milestone 162 · 反垃圾可观测收尾）
 
 M161 补了 min-fee floor 的 counter，但 mempool 另外四条 opt-in 拒路径仍无计数——运维无从判断 `[mempool] capacity / nonce_lookahead / replace_by_fee` 及反重放实际拦了多少。M162 一次性补齐，全部照 M161 范式（mempool 内部 `rejected_*: u64` + getter → `Metrics` 字段 → `render_prometheus` counter，**仅 `insert` 路径计数**）。
