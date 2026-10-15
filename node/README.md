@@ -1392,6 +1392,20 @@ M165 保留 3 端点（`/unbonding`/`/stake-ops`/`/evidence`）为 `next=` 是�
 - **测试（+1 → 631）**：新 `unbonding_entry_hash_is_stable_and_collision_safe`（4 断言：clone 等、改任一字段 hash 不同、32 字节长）；扩展 `rpc_unbonding_list_over_tcp`/`rpc_stake_ops_list_over_tcp`/`rpc_evidence_list_over_tcp` in-process 测改 `next`→`cursor`。
 - **已知边界**：`UnbondingEntry` 字段顺序（account/amount/mature_height）+ LE 字节序 = hash 格式的隐性契约；改字段顺序或加字段 = 改 hash 格式 = 旧 cursor 解析失败（文档说明）。`encode_unbonding` 真正的 codec 入口（若未来要把 UnbondingEntry 入 wire/快照/跨链）属后续篮子。
 
+## `encode_unbonding` codec 入口 + 字段布局对齐（Milestone 170 · 一字一源）
+
+M166 给 `UnbondingEntry::hash` 写"24 字节 LE + SHA-256"作本地 cursor 键时**刻意不引 codec**（避免新 wire 表面 = 破 head 不变量），并文档化若未来真要 wire 化需字节级一致。M170 就是这个未来：加 `encode_unbonding` / `decode_unbonding` codec 入口，让 `hash()` 共享同一字节序 + 字段布局，消除"隐性契约"警告。
+
+- **`encode_unbonding` / `decode_unbonding`**（`codec.rs`，照 `encode_reviewer` 范式 — 单 record 24 字节，无 leading tag / length prefix）：`u64 BE account ‖ u64 BE amount ‖ u64 BE mature_height`。`TrailingBytes` 校验边界。
+- **`UnbondingEntry::hash` 重定义**（`lib.rs`）：从手摇 24 字节 LE 累加器 → `sha256(&crate::codec::encode_unbonding(self))`（BE 24 字节）——wire / state-root / cursor 键三处收敛**同一 writer**。
+- **3 处 inline 重复消除**：`codec.rs:1150-1156`（snapshot 帧）+ `lib.rs:1980-1985`（`state_root` digest 折叠）+ `UnbondingEntry::hash` 全部调 `encode_unbonding`；**字节布局不变**（都是 3 个 u64 BE）— M141 既有 snapshot 仍可解码，`state_root` 哈希值不变。
+- **不引新 dep**；不动共识 apply 路径（`state.unbonding` 仍按顺序 drain 每块）；不动 wire v1；localnet 头仍 `a045426e…3b87bc`。
+- **测试（+3 → 645）**：
+  - `codec.rs` +2：`unbonding_round_trip`（24 字节长度 + 双向往返 + `hash()` 等于 SHA256(encode) + `TrailingBytes` + 截断返 `UnexpectedEof`）+ `unbonding_be_layout_uses_big_endian`（**钉字节布局** — 防止未来字段顺序 / 字节序无意翻转旋转所有现 cursor 哈希）。
+  - `lib.rs` +1：`state_root_uses_codec_unbonding`（state_root 真在用 `encode_unbonding` 字节 — 改 entry 改 root + 字节位置 pin）。
+  - M166 既有 `unbonding_entry_hash_is_stable_and_collision_safe` 保留 + 扩注（稳定性 + collision-safety 性质 BE 24 字节下依然成立）。
+- **已知边界**：M166 起所有**在飞 cursor** 在 daemon 重启后第一次翻页指向错行（`key_after` 大小关系随机，cursor 一旦被解析为"全部 ≤" → 空页 → 客户端回到首页重启分页）——daemon 重启 = pagination 完整重置，业务影响可忽略；新部署 daemon 之间无 cross-version 问题（双方都用 BE 24 字节）。`UnbondingEntry` 字段顺序 + BE 字节序 = hash 格式隐性契约（与 M166 同，**未变**）。`UnbondingEntry::hash` 改 LE → BE **破坏旧 cursor 一次**。**不**做真 `UnbondingEntry` 入 wire 跨链 / 快照跨链（属后续篮子 — M170 提供 codec 入口）；严格 BIP-39 NFKD、密钥轮换、轻节点 RPC TLS / bearer、OTel push exporter、bearer 失败延迟 jitter、ingress 持久 cert 属其他篮子。
+
 ## mempool 剩余拒绝路径计数指标（Milestone 162 · 反垃圾可观测收尾）
 
 M161 补了 min-fee floor 的 counter，但 mempool 另外四条 opt-in 拒路径仍无计数——运维无从判断 `[mempool] capacity / nonce_lookahead / replace_by_fee` 及反重放实际拦了多少。M162 一次性补齐，全部照 M161 范式（mempool 内部 `rejected_*: u64` + getter → `Metrics` 字段 → `render_prometheus` counter，**仅 `insert` 路径计数**）。

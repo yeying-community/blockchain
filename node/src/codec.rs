@@ -943,6 +943,42 @@ fn dec_evidence(d: &mut Dec) -> Result<SlashEvidence, CodecError> {
     Ok(SlashEvidence { vote_a, vote_b })
 }
 
+// --- unbonding queue (M170) -----------------------------------------------
+
+/// M170: canonical bytes of a single [`UnbondingEntry`] — `u64 BE account ‖ u64
+/// BE amount ‖ u64 BE mature_height` (24 bytes, no leading tag / length
+/// prefix). This is the same byte layout the snapshot frame and the
+/// `state_root` digest fold (see `ChainState::state_root` in `lib.rs`), and
+/// `UnbondingEntry::hash` hashes these exact bytes — keeping the wire, the
+/// state-root, and the content-hash key on a single canonical writer (the
+/// M166 "implicit contract" warning is resolved by this consolidation).
+pub fn encode_unbonding(u: &UnbondingEntry) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    e.u64(u.account);
+    e.u64(u.amount);
+    e.u64(u.mature_height);
+    e.0
+}
+
+/// Decode exactly one [`UnbondingEntry`] (inverse of [`encode_unbonding`]).
+/// Returns [`CodecError::TrailingBytes`] if extra bytes follow the 24-byte
+/// triple (same boundary contract as the other single-record codecs in this
+/// file, e.g. [`decode_account`]).
+pub fn decode_unbonding(buf: &[u8]) -> Result<UnbondingEntry, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let account = d.u64()?;
+    let amount = d.u64()?;
+    let mature_height = d.u64()?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(UnbondingEntry {
+        account,
+        amount,
+        mature_height,
+    })
+}
+
 // --- commit certificates -----------------------------------------------------
 
 /// Canonical bytes of a finality certificate ([`Commit`]) — used to persist
@@ -1147,12 +1183,12 @@ pub fn encode_snapshot(s: &ChainState) -> Vec<u8> {
         e.u64(*id);
         e.u64(*amt);
     }
-    // unbonding queue
+    // unbonding queue — M170: use the shared codec entry so the snapshot
+    // frame, the state-root digest, and the content-hash key are all
+    // derived from the same canonical 24 BE bytes.
     e.u64(s.unbonding.len() as u64);
     for u in &s.unbonding {
-        e.u64(u.account);
-        e.u64(u.amount);
-        e.u64(u.mature_height);
+        e.raw(&encode_unbonding(u));
     }
     // active validator set
     enc_validator_set(&mut e, &s.validators);
@@ -2211,6 +2247,62 @@ mod tests {
             decode_block(&bytes),
             Err(CodecError::TrailingBytes)
         ));
+    }
+
+    #[test]
+    fn unbonding_round_trip() {
+        // M170: 24 BE bytes per entry (u64 account ‖ u64 amount ‖ u64
+        // mature_height). Round-trip is stable, hash matches the wire
+        // bytes (single-source-of-truth with `state_root` and the
+        // cursor content-hash key), trailing bytes are rejected.
+        let u = UnbondingEntry {
+            account: 21,
+            amount: 4 * crate::MICRO,
+            mature_height: 12345,
+        };
+        let bytes = encode_unbonding(&u);
+        assert_eq!(bytes.len(), 24);
+        let back = decode_unbonding(&bytes).unwrap();
+        assert_eq!(encode_unbonding(&back), bytes);
+        assert_eq!(back, u);
+        // Single source of truth: hashing the canonical bytes equals
+        // `UnbondingEntry::hash`, which the cursor pagination feeds into
+        // `key_after` / `last_key`.
+        assert_eq!(u.hash(), crate::hash::sha256(&bytes));
+
+        // Trailing bytes are rejected.
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(matches!(
+            decode_unbonding(&extra),
+            Err(CodecError::TrailingBytes)
+        ));
+
+        // Truncated input is rejected.
+        assert!(matches!(
+            decode_unbonding(&bytes[..23]),
+            Err(CodecError::UnexpectedEof)
+        ));
+    }
+
+    #[test]
+    fn unbonding_be_layout_uses_big_endian() {
+        // M170: pin the byte layout (the comment above `encode_unbonding`
+        // documents BE; this test guards against an accidental switch to
+        // LE that would silently change every existing cursor's hash
+        // without changing the field values).
+        let u = UnbondingEntry {
+            account: 0x0102_0304_0506_0708,
+            amount: 0x1112_1324_2526_3738,
+            mature_height: 0x4142_4344_4546_4748,
+        };
+        let bytes = encode_unbonding(&u);
+        assert_eq!(bytes.len(), 24);
+        let mut expected = Vec::with_capacity(24);
+        expected.extend_from_slice(&u.account.to_be_bytes());
+        expected.extend_from_slice(&u.amount.to_be_bytes());
+        expected.extend_from_slice(&u.mature_height.to_be_bytes());
+        assert_eq!(bytes, expected);
     }
 
     #[test]

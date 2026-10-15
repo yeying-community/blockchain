@@ -529,7 +529,7 @@ impl Block {
 /// to its balance once the chain reaches `mature_height`. Until then the funds
 /// are neither in a balance nor in the validator's power — they sit here, still
 /// part of `supply` (and, in a later milestone, still slashable).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnbondingEntry {
     pub account: u64,
     pub amount: u64,
@@ -537,20 +537,18 @@ pub struct UnbondingEntry {
 }
 
 impl UnbondingEntry {
-    /// M166: content-addressed hash for cursor pagination. The three fields are
-    /// hashed as little-endian byte strings in declaration order, then SHA-256'd.
-    /// This is a **local cursor key** only — it is not on the wire and does not
-    /// participate in any consensus rule. If `UnbondingEntry` is later
-    /// serialized via a codec entry (`encode_unbonding` is deliberately *not*
-    /// introduced here to keep the wire surface untouched), that helper should
-    /// be the canonical encoding for `hash()` too — and the two must agree,
-    /// byte-for-byte, so old cursors keep resolving across the upgrade.
+    /// M170: content-addressed hash for cursor pagination. Hashes the **exact
+    /// 24 BE bytes** produced by [`crate::codec::encode_unbonding`] — the
+    /// snapshot frame, the `state_root` digest fold, and this content-hash
+    /// key are all derived from the same canonical writer, so a future
+    /// codec field-add / reorder only needs to land in one place. M166's
+    /// local LE-24-bytes layout was intentionally replaced at M170 to
+    /// converge on the codec's BE convention; in-flight cursors minted
+    /// before this commit become stale on first page after a daemon
+    /// restart (daemon restart = pagination full reset; clients get an
+    /// empty page and re-page from 0).
     pub fn hash(&self) -> Hash {
-        let mut buf = [0u8; 24];
-        buf[0..8].copy_from_slice(&self.account.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.amount.to_le_bytes());
-        buf[16..24].copy_from_slice(&self.mature_height.to_le_bytes());
-        hash::sha256(&buf)
+        hash::sha256(&crate::codec::encode_unbonding(self))
     }
 }
 
@@ -1978,10 +1976,12 @@ impl ChainState {
             e.u64(*amt);
         }
         e.u64(self.unbonding.len() as u64);
+        // M170: fold the same canonical 24 BE bytes that
+        // `encode_unbonding` writes — single source of truth between
+        // the state-root digest, the snapshot frame, and the cursor
+        // content-hash key (`UnbondingEntry::hash`).
         for u in &self.unbonding {
-            e.u64(u.account);
-            e.u64(u.amount);
-            e.u64(u.mature_height);
+            e.raw(&crate::codec::encode_unbonding(u));
         }
         // M30: bridge state. A lock is a redistribution within `supply`
         // (balance → bridge_locked), so folding both sides + the cumulative
@@ -4550,5 +4550,43 @@ mod tests {
 
         // 32-byte output (a `[u8; 32]` `Hash`).
         assert_eq!(a.hash().len(), 32);
+    }
+
+    #[test]
+    fn state_root_uses_codec_unbonding() {
+        // M170: `state_root` folds the same 24 BE bytes that
+        // `encode_unbonding` writes, so the wire frame, the cursor
+        // content-hash key (`UnbondingEntry::hash`), and the state digest
+        // all agree byte-for-byte. We assert (a) the root moves when an
+        // entry moves (proving the state_root actually picks up the
+        // unbonding section) and (b) the canonical byte layout matches
+        // `encode_unbonding` (the single-source-of-truth invariant).
+        let (mut a, _a_root) = ChainState::genesis(base_genesis());
+        a.unbonding.push(UnbondingEntry {
+            account: 42,
+            amount: 0,
+            mature_height: 100,
+        });
+        let (mut b, _b_root) = ChainState::genesis(base_genesis());
+        b.unbonding.push(UnbondingEntry {
+            account: 42,
+            amount: 1, // one micro-$COG different
+            mature_height: 100,
+        });
+
+        // The two roots must differ (state_root folds unbonding).
+        assert_ne!(a.state_root(), b.state_root());
+
+        // Canonical byte layout — pinned here so a future endianness /
+        // field-order change in `encode_unbonding` is caught before it
+        // silently rotates every existing cursor's hash.
+        let bytes_a = crate::codec::encode_unbonding(&a.unbonding[0]);
+        let bytes_b = crate::codec::encode_unbonding(&b.unbonding[0]);
+        assert_eq!(bytes_a.len(), 24);
+        assert_eq!(bytes_b.len(), 24);
+        assert_ne!(bytes_a, bytes_b);
+        // Field positions: account, amount, mature_height in BE.
+        assert_eq!(&bytes_a[0..8], &42u64.to_be_bytes());
+        assert_eq!(&bytes_b[8..16], &1u64.to_be_bytes());
     }
 }
