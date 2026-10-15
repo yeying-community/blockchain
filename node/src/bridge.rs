@@ -354,6 +354,7 @@ mod tests {
             bridge_locks: locks,
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
+            bridge_unbondings: Vec::new(),
             proposer: 0,
         };
         chain.seal(&mut b).expect("seal");

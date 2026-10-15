@@ -249,6 +249,7 @@ mod tests {
             bridge_locks: Vec::new(),
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
+            bridge_unbondings: Vec::new(),
             proposer: 0,
         }
     }

@@ -230,6 +230,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         bridge_locks: Vec::new(),
         bridge_headers: Vec::new(),
         bridge_redeems: Vec::new(),
+        bridge_unbondings: Vec::new(),
     };
     trial.seal(&mut b1).expect("seal b1");
     trial.commit(&mut b1).expect("commit b1 on trial");
@@ -271,6 +272,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         bridge_locks: Vec::new(),
         bridge_headers: Vec::new(),
         bridge_redeems: Vec::new(),
+        bridge_unbondings: Vec::new(),
     };
     trial.seal(&mut b2).expect("seal b2");
     vec![b1, b2]
@@ -3211,6 +3213,7 @@ fn empty_next_block(chain: &Chain, timestamp_days: f32) -> Block {
         bridge_locks: Vec::new(),
         bridge_headers: Vec::new(),
         bridge_redeems: Vec::new(),
+        bridge_unbondings: Vec::new(),
     }
 }
 
@@ -5972,6 +5975,7 @@ mod tests {
             bridge_locks: vec![],
             bridge_headers: vec![],
             bridge_redeems: vec![],
+            bridge_unbondings: vec![],
             proposer: 0,
         }
     }

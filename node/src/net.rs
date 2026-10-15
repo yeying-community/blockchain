@@ -1226,6 +1226,7 @@ impl GossipNode {
                 bridge_locks: Vec::new(),
                 bridge_headers: Vec::new(),
                 bridge_redeems: Vec::new(),
+                bridge_unbondings: Vec::new(),
             });
         candidate.stake_ops = self.pending_stake_ops.clone();
         candidate.slashing_evidence = self.pending_evidence.clone();

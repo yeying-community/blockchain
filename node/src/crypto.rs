@@ -92,6 +92,10 @@ fn sha256_one(data: &[u8]) -> [u8; 32] {
 
 /// Lowercase hex encoding. Local mirror of `crate::hash::hex` so the BIP-39
 /// tests don't have to thread an extra import through `mod tests`.
+/// `#[allow(dead_code)]` (M168) — the function is only referenced from
+/// unit tests in this file, but the compiler doesn't see those references
+/// during lib builds.
+#[allow(dead_code)]
 fn hex(data: &[u8]) -> String {
     let mut s = String::with_capacity(data.len() * 2);
     for b in data {

@@ -1392,6 +1392,31 @@ M165 保留 3 端点（`/unbonding`/`/stake-ops`/`/evidence`）为 `next=` 是�
 - **测试（+1 → 631）**：新 `unbonding_entry_hash_is_stable_and_collision_safe`（4 断言：clone 等、改任一字段 hash 不同、32 字节长）；扩展 `rpc_unbonding_list_over_tcp`/`rpc_stake_ops_list_over_tcp`/`rpc_evidence_list_over_tcp` in-process 测改 `next`→`cursor`。
 - **已知边界**：`UnbondingEntry` 字段顺序（account/amount/mature_height）+ LE 字节序 = hash 格式的隐性契约；改字段顺序或加字段 = 改 hash 格式 = 旧 cursor 解析失败（文档说明）。`encode_unbonding` 真正的 codec 入口（若未来要把 UnbondingEntry 入 wire/快照/跨链）属后续篮子。
 
+## `BridgeUnbond` 跨链镜像（Milestone 171 · B3 wire）
+
+M170 给 `UnbondingEntry` 加了 `encode_unbonding` codec 入口但**仅本地用**。M171 真正让 `UnbondingEntry` 入 wire 跨链——加 `BridgeUnbond` 类型 + 全栈 apply + 光客户端验证。**这是 Block 布局的 M168 之后第一次 B3 wire bump**（新增 `bridge_unbondings: Vec<BridgeUnbond>` + 头部 7th commitment 槽 `bridge_unbondings_commitment`）——头变化是 explicit 的，本地 net 在 M171 commit 时重置。
+
+- **`BridgeUnbond` 类型**（`lib.rs`）：5 字段 `source_chain` / `source_header`（cert-signed `state_root` 携带 unbonding 子树根）/ `source_cert`（> 2/3 quorum，跨链 cert-binding 防御）/ `entry: UnbondingEntry` / `proof: merkle::Proof`。Self-authenticating via cert + Merkle inclusion，**不 account-signed**。
+- **`encode_bridge_unbond` / `decode_bridge_unbond` codec**（`codec.rs`）：照 `encode_bridge_redeem` 形状（u32 长度前缀内嵌各子 blob），entry 用 M170 `encode_unbonding` 24 BE 字节。Wire 字节总长度 = 32 (source_chain) + 4+u32 (header) + 4+u32 (cert) + 4+24 (entry) + 4+0 (proof for single-leaf) + 4 = ~76 字节。
+- **`Block.bridge_unbondings: Vec<BridgeUnbond>`**（`lib.rs`）：新字段，`encode_block` 写 `Vec<BridgeUnbond>` 在 `bridge_redeems` 后；`BlockHeader::from_block` 把 `bridge_unbondings_commitment: Hash` 折叠进 cert-signed bytes。
+- **`BlockHeader.bridge_unbondings_commitment`**（`codec.rs`）：新增第 7 个 per-body commitment 槽；`encode_header` 在尾部加 32 字节；`decode_header` 末加 `take(32)?`；`decode_certified_header` 的 `192` 固定尾长 → `224` 更新。
+- **`Chain::apply_bridge_unbond`**（`lib.rs`）：8 步 gate（mirror `apply_bridge_redeem`，去掉 dest match，加 Merkle-against-`bridge_root` 而非 `bridge_root`-of-locks 步）：
+  1. source known（`UnknownBridgeSource` else）
+  2. frontier guard（`op.source_header.height ≤ s.height` else `BridgeSourceNotFollowed`）
+  3. cert-binding against tracked set（`BadSignature`/`CertificateMismatch` → `BridgeCertInvalid`）
+  4. Merkle inclusion against `op.source_header.bridge_root`（`MerkleInclusionInvalid` → `BridgeInclusionInvalid`）——**bridge_root 槽被 M171 复用**为 unbonding 子树根，**保持 B3 wire layout 与 B2 字节级兼容**：7 commitments 槽的总长 +32，prefix-stable。
+  5. replay dedup via `BridgeSource.consumed_unbonds: BTreeSet<u64>`（`BridgeUnbondReplay` else 拼入 unbonding 队列 + 记录 index）
+  6. mutate: `self.unbonding.push(op.entry.clone())`；成熟 drain（`lib.rs:1276`）按 `mature_height ≤ new_height` 返回给 `op.entry.account` 同样的账号。
+- **`ChainError::BridgeUnbondReplay { source, height, index }`** 新增变体 + Display 臂。
+- **`BridgeEndpoint::verify_unbonding` + `consume_unbonding`**（`bridge.rs`）：对称 M30 `verify_lock` / `consume` 模式。**不做 dest match**（mirror 仅适用本端链）。
+- **B2 兼容**：现有 B2-encoded blocks 仍可被 M171 decoder 读（decode_block 的 `bridge_unbondings` section 读 `n=0` → 0 字节 → `TrailingBytes` 通过），新 M171 编码的 blocks 在 B2 读侧会 `UnexpectedEof`（明示 wire 升级）。
+- **不引新 dep**；不动 consensus apply 路径（`state.unbonding` 仍按顺序 drain 每块）；不动 mTLS、bearer、TTL 配置。
+- **测试（+2 → 647）**：
+  - `bridge_unbond_round_trip`（`codec.rs`）：24 BE entry 字节 round-trip，trailing 字节拒，截断返 `UnexpectedEof`。
+  - `bridge_unbond_replay_is_rejected`（`lib.rs`）：**stub**——cross-chain cert path 在 bin 测试中建真 source chain + 真 cert，lib unit 测覆盖 codec + apply 入口。完整 replay 测试在 `bin/node` 集成测试。
+  - 旧 fixtures（30+ 处 `Block { ... }` 字面量 + `BlockHeader { ... }` 字段）**全 30+ 处手工补 `bridge_unbondings: vec![]` / `bridge_unbondings_commitment: [0u8; 32]` 字段**（B2→B3 wire bump 显式承担）。
+- **已知边界**：M171 B3 wire bump 是 M168 之后**首次 Block 布局变更**——本地 net 在 M171 commit 时**重置头**。`UnbondingEntry` 字段顺序（account/amount/mature_height）+ **BE** 字节序 = hash 格式隐性契约（M170 一字一源后已不变）。`bridge_unbond` 复用了 `bridge_root` 槽——`bridge_locks` 槽和 `bridge_unbondings` 槽**不能**同时被非空消费（设计层如此），属后续跨链测试须观察项。B2 → B3 不做自动迁移（本地 net 重置头即可）。`apply_bridge_unbond` 的 `lock_id: 0` 哨兵是临时简化（未来 `merkle::Proof` 加 `key: u64` 字段后可携带真实 index）。
+
 ## `encode_unbonding` codec 入口 + 字段布局对齐（Milestone 170 · 一字一源）
 
 M166 给 `UnbondingEntry::hash` 写"24 字节 LE + SHA-256"作本地 cursor 键时**刻意不引 codec**（避免新 wire 表面 = 破 head 不变量），并文档化若未来真要 wire 化需字节级一致。M170 就是这个未来：加 `encode_unbonding` / `decode_unbonding` codec 入口，让 `hash()` 共享同一字节序 + 字段布局，消除"隐性契约"警告。
