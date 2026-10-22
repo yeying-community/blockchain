@@ -346,11 +346,14 @@ pub struct BridgeSource {
     /// been redeemed. Doubly-keyed by the source chain's identity at the
     /// apply layer (the BTreeMap is keyed by `source_chain`).
     pub consumed: BTreeSet<u64>,
-    /// M171: replay dedup for cross-chain unbonding mirrors. Tracks which
-    /// indices in the source's `state.unbonding: Vec<UnbondingEntry>` at
-    /// the followed height have already been spliced into this chain's
-    /// own `state.unbonding`. The M170 `unbonding_merkle_leaf` makes the
-    /// key/position unique at any given source height.
+    /// M171/M172: replay dedup for cross-chain unbonding mirrors. Each
+    /// key is `u64::from_be_bytes(sha256(source_height_be ‖
+    /// unbonding_merkle_leaf(entry))[..8])` — a stable content+height
+    /// digest of a `BridgeUnbond` already spliced into this chain's own
+    /// `state.unbonding`. Re-submitting the same `(source_height, entry)`
+    /// pair collides on this key and is rejected; a distinct entry (or the
+    /// same entry re-committed at a later followed height) does not. See
+    /// `apply_bridge_unbond` step 5.
     pub consumed_unbonds: BTreeSet<u64>,
 }
 
@@ -458,30 +461,6 @@ pub struct BridgeUnbond {
 /// the *literal* bytes the M170 redesign unified.
 pub fn unbonding_merkle_leaf(u: &UnbondingEntry) -> Hash {
     hash::sha256(&codec::encode_unbonding(u))
-}
-
-/// M171: pick the smallest non-negative integer not already in `used` (a
-/// `BTreeSet<u64>`). This is the "index" in the source's
-/// `state.unbonding: Vec<UnbondingEntry>` that the next
-/// `apply_bridge_unbond` should consume. A full Merkle-proof-with-key
-/// implementation would let the proof itself carry the index (and the
-/// consumed set would be keyed by (height, index) tuples); M171 keeps the
-/// simpler "smallest available index" semantics, which is correct for a
-/// single-entry-at-a-time ingestion per source height and degenerate to
-/// O(1) on the common case.
-#[allow(dead_code)] // M171: reserved for the merkle-proof-with-key follow-up
-                    // (currently the wire-side test stubs this with a no-siblings
-                    // proof + replay-dedup via the consumed_unbonds set).
-fn first_unused_index(used: &std::collections::BTreeSet<u64>) -> u64 {
-    let mut i: u64 = 0;
-    for &k in used {
-        if k == i {
-            i += 1;
-        } else {
-            break;
-        }
-    }
-    i
 }
 
 /// A block: an ordered batch of submissions applied atomically.
@@ -1489,6 +1468,15 @@ impl ChainState {
         for op in &block.bridge_redeems {
             self.apply_bridge_redeem(op)?;
         }
+        // M172: cross-chain unbonding mirrors. Each splices a source-chain
+        // `UnbondingEntry` into this chain's own `state.unbonding` after the
+        // same cert-binding + Merkle-inclusion checks as a redeem. Ordered
+        // after `bridge_headers` so a mirror may reference a header followed
+        // in the same block. Validation fully precedes mutation (inside
+        // `apply_bridge_unbond`), so a bad mirror rolls the whole block back.
+        for op in &block.bridge_unbondings {
+            self.apply_bridge_unbond(op)?;
+        }
 
         // on-chain validator-set transition: explicit updates PLUS the changes
         // implied by this block's staking ops (power == bonded stake). Both take
@@ -1890,17 +1878,13 @@ impl ChainState {
     /// (the entry's `account` field is the source-side account id; both
     /// chains share the same keypair at the operator level).
     ///
-    /// Replay dedup is **per source-height-and-index** via
-    /// `bridge_sources[op.source_chain].consumed_unbonds: BTreeSet<u64>`
-    /// — the index is the position of `op.entry` in the source's
-    /// `state.unbonding: Vec<UnbondingEntry>` at `op.source_header.height`.
-    /// Different source heights can carry entries with the same
-    /// `(account, mature_height)`; their indices differ, so both can
-    /// coexist on the same destination.
-    #[allow(dead_code)] // M171: consumed only by the B3 wire integration
-                        // suite (a separate `bin/node` test) — see the
-                        // matching `#[allow(dead_code)]` on
-                        // `first_unused_index` for the same reasoning.
+    /// Replay dedup is **per (source-height, entry)** via
+    /// `bridge_sources[op.source_chain].consumed_unbonds: BTreeSet<u64>` —
+    /// the key is a SHA-256 digest of `source_header.height` concatenated
+    /// with the entry's merkle leaf (see step 5). The same entry committed
+    /// at two different followed source heights yields two distinct keys,
+    /// so both can coexist on the same destination; a literal re-submission
+    /// of one `(height, entry)` pair collides and is rejected.
     fn apply_bridge_unbond(&mut self, op: &BridgeUnbond) -> Result<(), ChainError> {
         // 1. source known
         let s = self
@@ -1936,28 +1920,37 @@ impl ChainState {
         if !crate::merkle::verify(&op.source_header.bridge_root, &leaf_hash, &op.proof) {
             return Err(ChainError::BridgeInclusionInvalid {
                 source: op.source_chain,
-                lock_id: 0, // M171: unbonding proof has no `lock_id` analogue;
-                            // the replay-dedup index carries the wire-uniqueness
-                            // signal instead.
+                lock_id: 0, // M171: an unbonding proof has no `lock_id`
+                            // analogue; the content+height dedup key (step 5)
+                            // carries the wire-uniqueness signal instead.
             });
         }
-        // 5. replay dedup: the index of `op.entry` in the source's
-        //    `state.unbonding` is recovered from the merkle proof key
-        //    (the proof's `key` is the position; for the no-siblings
-        //    case it's 0). The M170 `unbonding_merkle_leaf` keeps the
-        //    index layout stable; consumers of the source chain can
-        //    reconstruct it from `op.proof.key` once that field is
-        //    added. For now we use the simple "first index not already
-        //    consumed" fallback — a tighter implementation would carry
-        //    `key: u64` in `merkle::Proof` (M170's `Step` doesn't track
-        //    a key, only siblings). See the doc comment on
-        //    `consumed_unbonds`.
-        let entry_index = first_unused_index(&s.consumed_unbonds);
-        if s.consumed_unbonds.contains(&entry_index) {
+        // 5. replay dedup. The wire-uniqueness signal for an unbonding
+        //    mirror is "this entry, committed at this source height":
+        //    a relayer that re-submits the same `(source_header.height,
+        //    entry)` pair must be rejected, while a genuinely distinct
+        //    entry (different account/amount/mature_height, or the same
+        //    entry re-committed at a later followed height) is allowed.
+        //    We derive a stable `u64` dedup key from
+        //    `sha256(source_height_be ‖ unbonding_merkle_leaf(entry))`
+        //    (first 8 bytes, BE) and track it in `consumed_unbonds`. This
+        //    is collision-resistant for honest and adversarial inputs
+        //    alike (it inherits SHA-256's preimage resistance) and does
+        //    not depend on a merkle-proof `key` field M170's `Step` does
+        //    not yet carry — see the `consumed_unbonds` doc comment and
+        //    the M173 follow-up.
+        let entry_key = {
+            let mut pre = Vec::with_capacity(8 + 32);
+            pre.extend_from_slice(&op.source_header.height.to_be_bytes());
+            pre.extend_from_slice(&leaf_hash);
+            let digest = crate::hash::sha256(&pre);
+            u64::from_be_bytes(digest[..8].try_into().unwrap())
+        };
+        if s.consumed_unbonds.contains(&entry_key) {
             return Err(ChainError::BridgeUnbondReplay {
                 source: op.source_chain,
                 height: op.source_header.height,
-                index: entry_index,
+                index: entry_key,
             });
         }
         // 6. mutate: splice the entry into the destination's own
@@ -1967,7 +1960,7 @@ impl ChainState {
         //    is present; if not, the funds go to treasury — same fallback
         //    as the local drain).
         self.unbonding.push(op.entry.clone());
-        s.consumed_unbonds.insert(entry_index);
+        s.consumed_unbonds.insert(entry_key);
         Ok(())
     }
 
@@ -4802,14 +4795,134 @@ mod tests {
         assert_eq!(&bytes_b[8..16], &1u64.to_be_bytes());
     }
 
+    /// M172 helper: build a single-block source chain A whose block 1
+    /// bonds then fully unbonds `amount` for account `acct` — netting zero
+    /// bonded power (so A's validator set is unchanged and one genesis-set
+    /// cert certifies both height 1 and the next height). The block's
+    /// `bridge_root` slot is patched to the unbonding sub-tree root (M171
+    /// reuse convention) and the block is re-certified over the patched
+    /// header. Returns everything a relayer needs to assemble a
+    /// `BridgeUnbond` on chain B: the patched header, its cert, the
+    /// (no-siblings) merkle proof, and the queued `UnbondingEntry`.
+    fn build_source_unbond_envelope(
+        acct: u64,
+        amount: u64,
+    ) -> (codec::BlockHeader, Commit, merkle::Proof, UnbondingEntry) {
+        let mut chain_a = Chain::new(base_genesis());
+        let a_genesis_set = chain_a.state.validators.clone();
+        let mut ab1 = block(&chain_a, 1, Vec::new());
+        ab1.stake_ops = vec![
+            StakeOp {
+                account: acct,
+                kind: BondKind::Bond,
+                amount,
+                signature: [0u8; 64],
+            }
+            .signed(&kp(acct)),
+            StakeOp {
+                account: acct,
+                kind: BondKind::Unbond,
+                amount,
+                signature: [0u8; 64],
+            }
+            .signed(&kp(acct)),
+        ];
+        // Seal + certify + commit the honest block first (this applies the
+        // stake ops into `chain_a.state.unbonding`).
+        let _cert0 = seal_certify_commit(&mut chain_a, &mut ab1);
+        // Compute the unbonding sub-tree root from the now-populated queue.
+        let leaves: Vec<_> = chain_a
+            .state
+            .unbonding
+            .iter()
+            .map(unbonding_merkle_leaf)
+            .collect();
+        let unbonding_root = merkle::MerkleTree::from_leaf_hashes(leaves).root();
+        // Patch the block's `bridge_root` slot to the unbonding sub-tree
+        // root and re-certify over the patched header (the genesis set is
+        // unchanged — bond+full-unbond nets to zero bonded power).
+        ab1.bridge_root = unbonding_root;
+        let kps: BTreeMap<u64, Keypair> = a_genesis_set
+            .validators()
+            .iter()
+            .map(|v| (v.id, kp(v.id)))
+            .collect();
+        let voters: Vec<u64> = a_genesis_set.validators().iter().map(|v| v.id).collect();
+        let cert =
+            consensus::commit_block(&a_genesis_set, &kps, &ab1, 0, &voters).expect("re-certify");
+        let entry = chain_a.state.unbonding[0].clone();
+        (ab1.header(), cert, merkle::Proof { steps: vec![] }, entry)
+    }
+
+    /// End-to-end: chain A produces a real `Unbond` → chain B follows A's
+    /// header, ingests a `BridgeUnbond` mirroring the entry into B's own
+    /// `state.unbonding`, and the maturation drain returns the funds to the
+    /// entry's account on B. A second ingest of the same mirror is rejected
+    /// with `BridgeUnbondReplay`.
     #[test]
-    fn bridge_unbond_replay_is_rejected() {
-        // M171: same BridgeUnbond ingested twice on the same destination
-        // at the same source-height ⇒ second apply returns
-        // `ChainError::BridgeUnbondReplay`. The cert + merkle path is
-        // covered by the codec round-trip test; here we just exercise
-        // the replay dedup gate by crafting a synthetic valid-apply
-        // first. Skipped pending a deeper test-helper for the cross-
-        // chain cert path; the unit is the `apply_bridge_unbond` body.
+    fn bridge_unbond_mirrors_to_dest_and_matures() {
+        let ga = base_genesis();
+        let (a_genesis_hash, a_genesis_set) = source_identity(&ga);
+        let (mut chain_b, _b_genesis_hash) = dest_chain_b(a_genesis_hash, a_genesis_set.clone());
+
+        let (a_header, a_cert, proof, entry) = build_source_unbond_envelope(1, 30 * MICRO);
+        // The bond+full-unbond nets to zero bonded power, so A's set is
+        // unchanged — `next_set` is the genesis set.
+        assert_eq!(a_header.next_validators_root, a_genesis_set.merkle_root());
+
+        // Block on B at height 1: follow A's height 1.
+        let follow = BridgeHeader {
+            source_chain: a_genesis_hash,
+            header: a_header.clone(),
+            cert: a_cert.clone(),
+            next_set: a_genesis_set.clone(),
+        };
+        let mut b_b1 = block(&chain_b, 1, Vec::new());
+        b_b1.bridge_headers.push(follow);
+        chain_b.seal(&mut b_b1).unwrap();
+        chain_b.commit(&mut b_b1).expect("B follows A");
+
+        // Block on B at height 2: ingest the BridgeUnbond.
+        let mirror = BridgeUnbond {
+            source_chain: a_genesis_hash,
+            source_header: a_header.clone(),
+            source_cert: a_cert.clone(),
+            entry: entry.clone(),
+            proof: proof.clone(),
+        };
+        let mut b_b2 = block(&chain_b, 2, Vec::new());
+        b_b2.bridge_unbondings.push(mirror.clone());
+        chain_b.seal(&mut b_b2).unwrap();
+        chain_b.commit(&mut b_b2).expect("B mirrors the unbond");
+        assert_eq!(chain_b.state.unbonding.len(), 1);
+        assert_eq!(chain_b.state.unbonding[0], entry);
+
+        // Replay: a second ingest of the same mirror at the same source
+        // height is rejected (the whole block rolls back).
+        let mut b_replay = block(&chain_b, 3, Vec::new());
+        b_replay.bridge_unbondings.push(mirror);
+        let err = chain_b
+            .commit(&mut b_replay)
+            .expect_err("replay must be rejected");
+        assert!(matches!(err, ChainError::BridgeUnbondReplay { .. }));
+
+        // Maturation: advance empty blocks past the source mature_height.
+        let acct1_before = chain_b.state.accounts.get(&1).unwrap().balance;
+        let mature = entry.mature_height;
+        while chain_b.state.height < mature {
+            let mut mb = block(&chain_b, chain_b.state.height + 1, Vec::new());
+            chain_b.seal(&mut mb).unwrap();
+            chain_b.commit(&mut mb).expect("maturation block");
+        }
+        assert_eq!(
+            chain_b.state.accounts.get(&1).unwrap().balance,
+            acct1_before + 30 * MICRO,
+            "destination account 1 received the mirrored unbond at maturity"
+        );
+        assert_eq!(
+            chain_b.state.unbonding.len(),
+            0,
+            "destination queue drained"
+        );
     }
 }

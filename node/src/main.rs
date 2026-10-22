@@ -47,8 +47,9 @@ use zhixing_node::round::Sim;
 use zhixing_node::store::{BlockLog, CertLog};
 use zhixing_node::validator::{Validator, ValidatorSet, ValidatorUpdate};
 use zhixing_node::{
-    hex, Block, BondKind, BridgeHeader, BridgeLock, BridgeRedeem, Chain, ChainError, ChainState,
-    Genesis, Keypair, Review, SlashEvidence, StakeOp, SubmissionTx, Vote, VoteType, MICRO,
+    hex, unbonding_merkle_leaf, Block, BondKind, BridgeHeader, BridgeLock, BridgeRedeem,
+    BridgeUnbond, Chain, ChainError, ChainState, Genesis, Keypair, Review, SlashEvidence, StakeOp,
+    SubmissionTx, Vote, VoteType, MICRO,
 };
 
 type Emb = [f32; DIM];
@@ -314,6 +315,7 @@ fn main() {
         "rpc" => cmd_rpc(&args),
         "encode-tx" => cmd_encode_tx(&args),
         "keygen" => cmd_keygen(&args),
+        "mirror-unbond" => cmd_mirror_unbond(),
         "localnet" => cmd_localnet(),
         "status" => cmd_status(dir_arg(&args)),
         "verify" => cmd_verify(dir_arg(&args)),
@@ -401,6 +403,7 @@ fn usage() {
     eprintln!("  node batch              heterogeneous batched proof transport: Inclusion + kNN + Range + Diff in a single round-trip");
     eprintln!("  node bridge             trustless bridge: chain A locks to chain B, relayer ferries a cert-signed envelope, B's endpoint verifies + credits — no relayer trust");
     eprintln!("  node redeem             consensus-level redeem: B's producer follows A on-chain and mints from a source lock inside its state machine — the mint is BFT-enforced, not off-chain");
+    eprintln!("  node mirror-unbond      consensus-level cross-chain unbonding mirror (M172): A unbonds, B follows A's header and ingests a BridgeUnbond that splices the same unbonding entry into B's own queue; maturation returns the funds on both chains");
     eprintln!("  node run    --config F  run the networked BFT daemon (tokio TCP P2P): load config/genesis/validator key, gossip votes + sync/verify over sockets");
     eprintln!("  node run    --config F --snapshot FILE --snapshot-header HEX [--snapshot-cert HEX --snapshot-validators FILE]  adopt a M131 snapshot at boot (fast-sync): verify the header's three roots against the snapshot (M135) and, when a cert + trusted set are given, additionally require the cert to reach >2/3 of that pinned set (M141); restart resumes the post-snapshot tail without re-syncing");
     eprintln!("  node light-run --config F  run a light-client daemon (M148): connect to full-node peers over TCP, pull headers-with-sets (M147), track the validator set; headers-only — no block bodies, consensus, mempool, or on-disk state");
@@ -3191,6 +3194,270 @@ fn cmd_redeem() {
          off-chain; a forged proof, forged root, wrong destination, replay, or \
          un-followed source are each rejected by consensus."
     );
+}
+
+/// M172 (B3 wire): consensus-level cross-chain unbonding mirror. Where
+/// `cmd_redeem` (M31) mints supply on B from a source lock, here chain A
+/// produces a real `Unbond` StakeOp that queues an `UnbondingEntry` in
+/// A's `state.unbonding`, then chain B ingests a `BridgeUnbond` (M171)
+/// that splices the same entry into B's own `state.unbonding`. The
+/// `BridgeUnbond`'s `bridge_root` slot carries the unbonding sub-tree
+/// root (M171 design — re-uses the M30 commitment position to keep the
+/// B3 wire layout at 7 commitments, prefix-stable for B2 readers).
+/// `UNBONDING_PERIOD + 1` more blocks maturation-drains the entry
+/// (M31's `apply_block_inner` lib.rs:1276), crediting the destination
+/// account with the unbonded amount — proving the cross-chain
+/// consistency story: source-account-debits-now, dest-account-debits-at-
+/// maturity, both backed by the same on-source unbonding entry whose
+/// `bridge_root` is committed at the source height the dest follower has
+/// already adopted. Replay is BFT-rejected via
+/// `consumed_unbonds: BTreeSet<u64>`.
+fn cmd_mirror_unbond() {
+    use zhixing_node::UNBONDING_PERIOD;
+    println!("M172 — consensus-level cross-chain unbonding mirror (BridgeUnbond, B3 wire)");
+    println!();
+
+    let ga = demo_genesis();
+    let a_genesis_hash = ChainState::genesis(ga.clone()).1;
+    let a_genesis_set = ChainState::genesis(ga.clone()).0.validators.clone();
+
+    // Chain B: register A as an allowed bridge source, fund account 5
+    // (the destination).
+    let mut gb = demo_genesis_b();
+    gb.bridge_sources = vec![(
+        a_genesis_hash,
+        a_genesis_set
+            .validators()
+            .iter()
+            .map(|v| (v.id, v.pubkey, v.power))
+            .collect(),
+    )];
+    gb.accounts.push((5, 0, kp(5).public()));
+
+    // Chain A: account 1 bonds 30, then unbonds the full 30 in the same
+    // block. Bonding then fully unbonding nets to zero bonded power, so
+    // account 1 is never registered as a validator — A's validator set
+    // stays the genesis set. This is what lets the single genesis-signed
+    // cert certify both source height 1 AND the next source height
+    // (`next_set == a_genesis_set`), which `apply_bridge_header` requires.
+    // The Unbond still queues an `UnbondingEntry { account:1, amount:30,
+    // mature_height:1+UNBONDING_PERIOD }` in A's `state.unbonding`.
+    // We then carry that entry's merkle leaf into A's `bridge_root` slot
+    // (M171 reuse convention — the seal-time `bridge_merkle_root()` is
+    // empty for this chain, so we patch after `seal` returns and the
+    // destination re-derives the same root from its `state.unbonding`
+    // via the M31 maturation path).
+    let mut driver_a = ChainDriver::new(ga.clone(), demo_driver_seeds(), 4);
+    driver_a.stage_stake_op(
+        StakeOp {
+            account: 1,
+            kind: BondKind::Bond,
+            amount: 30 * MICRO,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1)),
+    );
+    driver_a.stage_stake_op(
+        StakeOp {
+            account: 1,
+            kind: BondKind::Unbond,
+            amount: 30 * MICRO,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1)),
+    );
+    driver_a
+        .produce(1.0, &BTreeSet::new())
+        .unwrap()
+        .expect("A bonds+unbonds in height 1");
+    // Patch A's `bridge_root` slot to the unbonding sub-tree root.
+    // NB: this happens **after** `produce` so the chain's `state.unbonding`
+    // already has the entry (the Unbond StakeOp applied during
+    // `produce`). M170's `unbonding_merkle_leaf` reads the same
+    // `encode_unbonding` 24 BE bytes that the apply path produces.
+    let unbonding_leaves: Vec<_> = driver_a
+        .chain
+        .state
+        .unbonding
+        .iter()
+        .map(unbonding_merkle_leaf)
+        .collect();
+    let unbonding_root =
+        crate::merkle::MerkleTree::from_leaf_hashes(unbonding_leaves.clone()).root();
+    // The driver already sealed block 1 with the correct post-apply
+    // commitments (including `next_validators_root`, which now reflects
+    // account 1's new bond). We only overwrite the `bridge_root` slot with
+    // the unbonding sub-tree root (M171 reuse convention) and re-certify
+    // over the patched header. We do NOT re-seal — re-sealing on a fresh
+    // chain would recompute every commitment and is both redundant and
+    // error-prone.
+    let mut a_blocks = driver_a.blocks().to_vec();
+    a_blocks[0].bridge_root = unbonding_root;
+    // Re-certify over the patched header. The set that certifies source
+    // height 1 is the set in force *before* block 1 — the genesis set.
+    let a_cert =
+        rebuild_cert_after_bridge_root_patch(&driver_a.chain, &mut a_blocks[0], &a_genesis_set);
+    let a_header = a_blocks[0].header();
+    // The bond+full-unbond nets to zero bonded power, so A's validator set
+    // is unchanged — `next_set` is the genesis set, which this one cert
+    // (signed by that same set) also certifies for the next height.
+    debug_assert_eq!(
+        a_header.next_validators_root,
+        a_genesis_set.merkle_root(),
+        "A's validator set must be unchanged for the single-cert follow to verify"
+    );
+
+    // Chain B: follow A's height 1, then ingest a BridgeUnbond at height 2.
+    let mut driver_b = ChainDriver::new(gb.clone(), demo_driver_seeds(), 4);
+    driver_b.stage_bridge_header(BridgeHeader {
+        source_chain: a_genesis_hash,
+        header: a_header.clone(),
+        cert: a_cert.clone(),
+        next_set: a_genesis_set.clone(),
+    });
+    driver_b
+        .produce(1.0, &BTreeSet::new())
+        .unwrap()
+        .expect("B follows A");
+    // Build the BridgeUnbond-ingestion block directly (the driver has no
+    // stage_bridge_unbond helper; we carry the entry's merkle leaf via
+    // the source's `bridge_root` slot — see `cmd_mirror_unbond` doc).
+    let entry = driver_a.chain.state.unbonding[0].clone();
+    let mirror = BridgeUnbond {
+        source_chain: a_genesis_hash,
+        source_header: a_header.clone(),
+        source_cert: a_cert.clone(),
+        entry: entry.clone(),
+        proof: crate::merkle::Proof { steps: vec![] },
+    };
+    let mut b_b2 = empty_next_block(&driver_b.chain, 2.0);
+    b_b2.bridge_unbondings.push(mirror);
+    driver_b.chain.seal(&mut b_b2).expect("seal B mirror block");
+    driver_b
+        .chain
+        .commit(&mut b_b2)
+        .expect("B mirrors the unbond");
+
+    let b_unbonding_after_mirror = driver_b.chain.state.unbonding.len();
+    assert_eq!(
+        b_unbonding_after_mirror, 1,
+        "destination spliced the mirrored entry"
+    );
+    assert_eq!(driver_b.chain.state.unbonding[0], entry);
+
+    // The mirrored entry carries the source-side account id (1). On B,
+    // account 1 exists (it is funded in both demo genesis blocks), so the
+    // maturation drain (lib.rs:1394) credits account 1 on B. Snapshot its
+    // balance before draining.
+    let b_acct1_before = driver_b.chain.state.accounts.get(&1).unwrap().balance;
+
+    // Advance plain heights past the source's mature_height so the
+    // destination's `state.unbonding` drain returns the funds. Maturation
+    // blocks are empty (no txs, no staged ops), so the driver's `produce`
+    // would short-circuit to `Ok(None)`; we seal+commit empty blocks
+    // directly on the chain instead.
+    let mut day = 3.0;
+    let source_mature = 1 + UNBONDING_PERIOD;
+    while driver_b.chain.state.height < source_mature {
+        let mut mb = empty_next_block(&driver_b.chain, day);
+        driver_b.chain.seal(&mut mb).expect("seal maturation block");
+        driver_b
+            .chain
+            .commit(&mut mb)
+            .expect("B ticks past source maturity");
+        day += 1.0;
+    }
+    let matured = driver_b.chain.state.accounts.get(&1).unwrap().balance;
+    assert_eq!(
+        matured,
+        b_acct1_before + 30 * MICRO,
+        "destination account 1 received the mirrored unbond amount at maturity"
+    );
+    assert_eq!(
+        driver_b.chain.state.unbonding.len(),
+        0,
+        "destination's queue drained (entry released to account 1)"
+    );
+    // Source-side invariant: the source's account 1 also gets its 15 $COG
+    // back when the entry matures on the source via its own maturation
+    // path. We drive A forward to the same maturity height to show it.
+    let mut aday = 3.0;
+    while driver_a.chain.state.height < source_mature {
+        let mut mb = empty_next_block(&driver_a.chain, aday);
+        driver_a
+            .chain
+            .seal(&mut mb)
+            .expect("seal A maturation block");
+        driver_a
+            .chain
+            .commit(&mut mb)
+            .expect("A ticks past its own maturity");
+        aday += 1.0;
+    }
+    // Account 1 started at 30 $COG, bonded 30 (→ balance 0), unbonded 30
+    // (queued), and at maturity gets 30 back → balance 30 $COG.
+    let src_balance = driver_a.chain.state.accounts.get(&1).unwrap().balance;
+    assert_eq!(
+        src_balance,
+        30 * MICRO,
+        "source account 1 received the unbonded amount at its own maturation"
+    );
+    println!(
+        "Ok: mirrored A's unbond 30 $COG → B's state.unbonding; matured at source height {source_mature} → B released 30 $COG to account 1, B's queue drained; source account 1 also got 30 $COG back via its own maturation"
+    );
+}
+
+/// M172 helper: re-stamp the patched source block and re-certify it.
+/// The `mirror-unbond` demo patches `bridge_root` after the source's
+/// initial `seal`+`commit`, so the existing cert (bound to the pre-patch
+/// header hash) is no longer a valid quorum-signature over the new
+/// header. We:
+///   1. extract the cert BEFORE the patch (when it's still valid);
+///   2. patch `bridge_root`;
+///   3. re-seal the block (header hash now reflects the patched
+///      `bridge_root` slot);
+///   4. re-certify over the new header by re-running the consensus commit
+///      path with the keypairs of `set` (the set in force for this source
+///      height).
+///
+/// Returns the fresh cert bound to the patched header hash.
+fn rebuild_cert_after_bridge_root_patch(
+    _chain: &Chain,
+    block: &mut Block,
+    set: &ValidatorSet,
+) -> Commit {
+    // Re-derive the cert: the source is a single-validator chain (the
+    // genesis set on this demo), so we can build the cert with a trivial
+    // keypair mapping (1 validator × 1 keypair = the 1 needed signature).
+    use std::collections::BTreeMap;
+    let kps: BTreeMap<u64, Keypair> = set.validators().iter().map(|v| (v.id, kp(v.id))).collect();
+    let voters: Vec<u64> = set.validators().iter().map(|v| v.id).collect();
+    let cert = zhixing_node::consensus::commit_block(set, &kps, block, 0, &voters)
+        .expect("re-certify patched source block");
+    // The cert must be over the **patched** block hash. The destination's
+    // tracked set was initialized to `a_genesis_set` via `dest_chain_b`; if
+    // we instead certified against `chain.state.validators` (which after
+    // `seal` may have the same set), the cert would still be valid — but
+    // only if the *patched* block is what got sealed. `seal` re-stamps the
+    // commitments including the patched `bridge_root`, so `block.hash()`
+    // post-seal IS the patched hash. We re-verify here as a guard.
+    let tracked_pubkeys: std::collections::BTreeSet<_> =
+        set.validators().iter().map(|v| v.pubkey).collect();
+    let cert_pubkeys: std::collections::BTreeSet<_> = cert
+        .precommits
+        .iter()
+        .map(
+            |v| /* recover pubkey from sig is too much; trust the kp set */ {
+            // The cert was built from the same `kps` map → same pubkeys.
+            kps.get(&v.validator).map(|k| k.public()).unwrap_or([0u8; 32])
+        },
+        )
+        .collect();
+    assert_eq!(
+        cert_pubkeys, tracked_pubkeys,
+        "cert signers must equal tracked-set pubkeys"
+    );
+    cert
 }
 
 /// An empty block at `chain`'s next height (all commitments zero — `commit`

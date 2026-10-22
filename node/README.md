@@ -23,6 +23,7 @@ cargo run --release --bin node -- vprove           # 验证人 Merkle 证明：�
 cargo run --release --bin node -- staking          # 质押：绑定 $COG 获得验证人权重；解绑经时间锁提款到期返还
 cargo run --release --bin node -- slashing         # 罚没：验证人双签 → 提交证据 → 绑定质押罚没入 treasury、移出验证人集
 cargo run --release --bin node -- certs  --dir DIR # 证书落盘：产出认证链→落盘 blocks/certs→重放复验最终性
+cargo run --release --bin node -- mirror-unbond    # M172：共识级跨链解绑镜像——A 解绑 → B 跟随 A 的头并 ingest BridgeUnbond 把同一解绑条目拼入 B 自己的队列，两链成熟各自返还
 cargo run --release --bin node -- localnet         # M33：进程内 tokio 测试网（4 验证人，无定序器）经真实 socket BFT 收敛
 cargo run --release --bin node -- run  --config F  # M33：联网 tokio 守护进程（TCP P2P gossip + 分布式 BFT 投票）
 cargo run --release --bin node -- submit-tx --config F --tx F  # M53：向运行中守护进程的 [rpc] 入口提交 codec 编码交易
@@ -1391,6 +1392,39 @@ M165 保留 3 端点（`/unbonding`/`/stake-ops`/`/evidence`）为 `next=` 是�
 - **不碰** 共识/codec/wire（`UnbondingEntry::hash` 纯本地）/分页基础原语；localnet 头仍 wire v1 `a045426e…3b87bc`。
 - **测试（+1 → 631）**：新 `unbonding_entry_hash_is_stable_and_collision_safe`（4 断言：clone 等、改任一字段 hash 不同、32 字节长）；扩展 `rpc_unbonding_list_over_tcp`/`rpc_stake_ops_list_over_tcp`/`rpc_evidence_list_over_tcp` in-process 测改 `next`→`cursor`。
 - **已知边界**：`UnbondingEntry` 字段顺序（account/amount/mature_height）+ LE 字节序 = hash 格式的隐性契约；改字段顺序或加字段 = 改 hash 格式 = 旧 cursor 解析失败（文档说明）。`encode_unbonding` 真正的 codec 入口（若未来要把 UnbondingEntry 入 wire/快照/跨链）属后续篮子。
+
+## `BridgeUnbond` 端到端演示 + apply 布线修复（Milestone 172）
+
+M171 加了 `BridgeUnbond` 类型 + codec + `apply_bridge_unbond` 函数体，但**从未把它接进 `apply_block_inner`**——`Block.bridge_unbondings` 向量从不被消费（函数标 `#[allow(dead_code)]`）。M172 真正把跨链镜像跑通：补齐 apply 布线、修复一个 replay-dedup 逻辑漏洞、加 `node mirror-unbond` 端到端演示 + 真跨链 e2e 测试。
+
+- **apply 布线**（`lib.rs`）：`apply_block_inner` 在 `bridge_redeems` 循环后加
+  ```rust
+  for op in &block.bridge_unbondings {
+      self.apply_bridge_unbond(op)?;
+  }
+  ```
+  排在 `bridge_headers` 之后，故同块内镜像可引用同块 follow 的 header；验证全先于变更，坏镜像整块回滚。移除 `apply_bridge_unbond` / `first_unused_index` 的 `#[allow(dead_code)]`。
+- **replay dedup 漏洞修复**（`lib.rs`）：M171 的 `first_unused_index(&consumed)` 返回**不在**集合里的最小索引，故紧随的 `consumed.contains(&idx)` **恒 false**——replay 永不触发。改用内容派生键：
+  ```rust
+  let entry_key = {
+      let mut pre = Vec::with_capacity(8 + 32);
+      pre.extend_from_slice(&op.source_header.height.to_be_bytes());
+      pre.extend_from_slice(&leaf_hash); // unbonding_merkle_leaf(&op.entry)
+      u64::from_be_bytes(sha256(&pre)[..8].try_into().unwrap())
+  };
+  ```
+  同 `(source_height, entry)` 重放撞键被拒；不同 entry（或同 entry 在更晚 followed 高度再提交）各得异键可共存。继承 SHA-256 抗碰撞，不依赖 M170 `merkle::Proof` 尚无的 `key` 字段。`first_unused_index` 整个删除，`consumed_unbonds` 文档订正为「内容+高度 digest」。
+- **`node mirror-unbond` 演示**（`main.rs` `cmd_mirror_unbond` + dispatch + help）：
+  - 链 A 账户 1 **同块 bond 30 + 全额 unbond 30**：净零 bonded power → A 验证人集**不变** → 单张 genesis-set cert 可同时认证源高 1 及下一高度，满足 `apply_bridge_header` 的 `next_set.merkle_root() == header.next_validators_root` 检查（否则 bond 让账户 1 成为下一高度验证人、root 发散 → `BridgeNextSetMismatch`）。Unbond 仍队列入 `UnbondingEntry{account:1, amount:30, mature_height:1+UNBONDING_PERIOD}`。
+  - 驱动已 seal 块的 `bridge_root` 槽**打补丁**为 unbonding 子树根后**重签 cert**（`rebuild_cert_after_bridge_root_patch`）——不重 seal（重 seal 会重算全部承诺且冗余易错，已 seal 块的 `next_validators_root` 已正确）。
+  - 链 B 注册 A 为 bridge source、follow 源高 1、ingest `BridgeUnbond`（单叶树无兄弟 → 空 Merkle proof，根 == 叶 hash）→ `state.unbonding` 拼入同一 entry；成熟 drain 把 30 $COG **返还 B 上账户 1**（entry 携带**源端账户 id**，B 创世也有账户 1 故 drain 命中该账号——不是凭空的 account 5）。
+  - `produce` 对空块短路 `Ok(None)`，故成熟推进用 `seal`+`commit` 空块直驱而非 `produce`。
+- **单叶 Merkle 语义**：`from_leaf_hashes` 收**已哈希**叶，`apply_bridge_unbond` 以 `unbonding_merkle_leaf(entry)`（已哈希）过 `merkle::verify`，无兄弟时空 proof 下根须**等于**该叶 hash（已验证一致）。
+- **不引新 dep**；不动 wire 布局（B3 不变）/ mTLS / bearer / TTL。
+- **测试（净 +0 → 647）**：
+  - `bridge_unbond_mirrors_to_dest_and_matures`（`lib.rs`）：**替换** M171 空 stub `bridge_unbond_replay_is_rejected`。新 helper `build_source_unbond_envelope` 建真源链 A（bond+full-unbond、打补丁 `bridge_root`、重签 cert），B follow → ingest → 断言 `unbonding` 拼入 → **replay 第二次 ingest 被 `BridgeUnbondReplay` 拒** → 成熟 drain 返还账户 1。
+  - `bridge_unbond_round_trip`（`codec.rs`）：M171 保留不变。
+- **已知边界**：演示的「净零 bonded power 保持验证人集不变」是**让单张 cert 同认两高度的技巧**——真实跨链不换验证人集时同样成立；换集时须 relayer 随 `BridgeHeader` 带正确 post-apply `next_set`（`apply_bridge_header` 已支持，演示未覆盖该路径）。`apply_bridge_unbond` 与 `apply_bridge_redeem` 一样把 `source_cert` 验证 against `s.set`（follow 后 = next_set），故仅在源验证人集跨相邻高度稳定时成立——与 M31 redeem 同一隐性约束。`bridge_locks` 槽与 `bridge_unbondings` 槽复用同一 `bridge_root`，**不能同块同时非空消费**（M171 设计约束延续）。`lock_id: 0` 哨兵仍在 inclusion 失败分支（replay 已改走内容键，不再依赖它）。**不**做 `merkle::Proof` 的 `key: u64` 字段 / 多 entry 同块跨链 / 换验证人集跨链 e2e——属后续篮子。
 
 ## `BridgeUnbond` 跨链镜像（Milestone 171 · B3 wire）
 
