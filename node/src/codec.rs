@@ -715,7 +715,11 @@ fn enc_validator_set_inline(e: &mut Enc, vs: &crate::validator::ValidatorSet) {
 }
 
 fn dec_validator_set_inline(d: &mut Dec) -> Result<crate::validator::ValidatorSet, CodecError> {
-    let n = d.u32()? as usize;
+    let n_raw = d.u32()?;
+    if n_raw as u64 > MAX_ITEMS {
+        return Err(CodecError::TooManyItems(n_raw as u64));
+    }
+    let n = n_raw as usize;
     let mut vs = Vec::with_capacity(n);
     for _ in 0..n {
         let len = d.u32()? as usize;
@@ -3254,6 +3258,44 @@ mod tests {
         assert!(matches!(
             decode_bridge_header(&extra),
             Err(CodecError::TrailingBytes)
+        ));
+    }
+
+    /// M173 hardening: `next_set`'s inline count is a raw on-wire `u32`
+    /// (unlike every other length-prefixed list, which goes through
+    /// `Dec::count()`'s `MAX_ITEMS` cap). Before this fix a forged count near
+    /// `u32::MAX` reached `Vec::with_capacity` uncapped — a single malicious
+    /// `BridgeHeader` (reachable from an unauthenticated gossiped `Blocks`
+    /// message, since `require_peer_auth` defaults off) could abort the
+    /// process via an attempted allocation of `u32::MAX` `Validator` structs
+    /// (well over 100 GB), well before any further bytes are even present
+    /// in the buffer. Confirm the forged count is rejected before any
+    /// allocation is attempted (the buffer here is far too short to actually
+    /// hold that many entries, so success would mean a reservation was made
+    /// with no data backing it).
+    #[test]
+    fn bridge_header_rejects_forged_next_set_count() {
+        let b = sample_block();
+        let header = BlockHeader::from_block(&b);
+        let cert = sample_cert(header.hash(), header.height);
+        let op = BridgeHeader {
+            source_chain: [55u8; 32],
+            header,
+            cert,
+            next_set: sample_validator_set(),
+        };
+        let bytes = encode_bridge_header(&op);
+        // The inline validator-set count is the last 4+N*48 bytes; find and
+        // overwrite just the u32 count prefix with a huge forged value,
+        // keeping the (now-truncated, short) rest of the buffer as-is.
+        let real_count = op.next_set.validators().len() as u32;
+        // Each entry is a 4-byte length prefix + a 48-byte `Validator` leaf.
+        let count_pos = bytes.len() - 4 - (real_count as usize) * (4 + 48);
+        let mut forged = bytes[..count_pos].to_vec();
+        forged.extend_from_slice(&(u32::MAX).to_be_bytes());
+        assert!(matches!(
+            decode_bridge_header(&forged),
+            Err(CodecError::TooManyItems(n)) if n == u32::MAX as u64
         ));
     }
 

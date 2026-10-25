@@ -1393,6 +1393,15 @@ M165 保留 3 端点（`/unbonding`/`/stake-ops`/`/evidence`）为 `next=` 是�
 - **测试（+1 → 631）**：新 `unbonding_entry_hash_is_stable_and_collision_safe`（4 断言：clone 等、改任一字段 hash 不同、32 字节长）；扩展 `rpc_unbonding_list_over_tcp`/`rpc_stake_ops_list_over_tcp`/`rpc_evidence_list_over_tcp` in-process 测改 `next`→`cursor`。
 - **已知边界**：`UnbondingEntry` 字段顺序（account/amount/mature_height）+ LE 字节序 = hash 格式的隐性契约；改字段顺序或加字段 = 改 hash 格式 = 旧 cursor 解析失败（文档说明）。`encode_unbonding` 真正的 codec 入口（若未来要把 UnbondingEntry 入 wire/快照/跨链）属后续篮子。
 
+## 修复 `dec_validator_set_inline` 未校验长度的远程可触发崩溃（Milestone 174）
+
+生产就绪度评估的副产物——评估过程中在代码里找到一个真实可远程触发的漏洞，当场修复，不是提前规划的里程碑。
+
+- **漏洞**：`BridgeHeader.next_set` 的解码（`codec.rs` 的 `dec_validator_set_inline`）是唯一一处**内联**验证人集解码，与所有其余长度前缀列表都走 `Dec::count()`（有 `MAX_ITEMS = 1_000_000` 上限）不同——它直接 `let n = d.u32()? as usize` 读裸长度，立即 `Vec::with_capacity(n)`。一个伪造的、接近 `u32::MAX`（约 42.9 亿）的长度字段会让节点尝试为 `Validator`（48 字节/条）预留超百 GB 内存；Rust 的全局分配器在这类规模的分配失败上是**直接中止进程**（`abort`），不是可以 `catch_unwind` 的 panic——也不会先检查缓冲区剩余字节是否真的够多就先尝试分配。
+- **可达性**：`decode_block` → `dec_bridge_header` → `dec_validator_set_inline`，经 `GossipMsg::Blocks` 到达。`[network] require_peer_auth` 默认 `false`（`NetworkConfig::default()`），即一个只走 cleartext hello、**不持有任何验证人密钥**的对端，发一条精心构造的 `Blocks` 消息即可让任意节点进程中止——是一个真实的预认证 DoS，不需要先通过认证或拿到签名权。
+- **修复**：`dec_validator_set_inline` 读出裸 `u32` 后立即对 `MAX_ITEMS` 校验，超限返回 `CodecError::TooManyItems`，再分配——与其余所有列表解码的纪律看齐。不改 wire 格式（校验在解码端新增，编码端字节不变），对任何诚实对端零影响。
+- **测试（+1 → 653）**：`bridge_header_rejects_forged_next_set_count`（`codec.rs`）用真实编码的 `BridgeHeader` 定位 inline count 字段的字节偏移，覆写为 `u32::MAX`，断言在任何分配尝试之前即被 `TooManyItems(u32::MAX as u64)` 拒绝。
+
 ## `merkle::Proof` 加 authenticated `key`（Milestone 173）
 
 M172 结尾留了一笔技术债：`apply_bridge_unbond` 用 `lock_id: 0` 哨兵（inclusion 失败分支）+ 内容派生 SHA-256 dedup 键，因为 `merkle::Proof` 不携带真实的源端叶索引。M173 补上——但过程中发现朴素方案不安全，修正后才落地。
