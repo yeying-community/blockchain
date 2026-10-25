@@ -1393,6 +1393,35 @@ M165 保留 3 端点（`/unbonding`/`/stake-ops`/`/evidence`）为 `next=` 是�
 - **测试（+1 → 631）**：新 `unbonding_entry_hash_is_stable_and_collision_safe`（4 断言：clone 等、改任一字段 hash 不同、32 字节长）；扩展 `rpc_unbonding_list_over_tcp`/`rpc_stake_ops_list_over_tcp`/`rpc_evidence_list_over_tcp` in-process 测改 `next`→`cursor`。
 - **已知边界**：`UnbondingEntry` 字段顺序（account/amount/mature_height）+ LE 字节序 = hash 格式的隐性契约；改字段顺序或加字段 = 改 hash 格式 = 旧 cursor 解析失败（文档说明）。`encode_unbonding` 真正的 codec 入口（若未来要把 UnbondingEntry 入 wire/快照/跨链）属后续篮子。
 
+## `merkle::Proof` 加 authenticated `key`（Milestone 173）
+
+M172 结尾留了一笔技术债：`apply_bridge_unbond` 用 `lock_id: 0` 哨兵（inclusion 失败分支）+ 内容派生 SHA-256 dedup 键，因为 `merkle::Proof` 不携带真实的源端叶索引。M173 补上——但过程中发现朴素方案不安全，修正后才落地。
+
+- **`Proof` 新增两字段**（`merkle.rs`）：`key: u64`（叶的 0-based 索引）+ `leaf_count: u64`（生成 proof 时树的宽度）。`MerkleTree::proof(index)` 据此两字段填充。
+- **首次实现有漏洞，已发现并修正**：最初让 `verify` 仅凭 `key` 驱动 steps 的走位（奇数索引消费 `Left`、偶数索引视情况消费 `Right`）。问题是**促升（promotion）层不经过任何哈希**——一个无兄弟的孤节点原样抬升一级——所以"这层是促升（无 sibling）"和"key 错误导致这层误判为促升"在只看 steps 的逻辑下**无法区分**。穷举测试（`tampering_the_key_fails_verification`）在 n=2 时就抓到一个能逃逸的伪造 key。真正的修法是让 `verify` 额外知道 `leaf_count`，才能在每一层精确重放 `MerkleTree::proof` 当年的宽度减半序列。
+- **修正后的 `merkle::verify`**：维护 `(idx, width)` 逐层镜像 `proof()` 的生成逻辑：
+  ```rust
+  let has_sibling = (idx ^ 1) < width;
+  if has_sibling {
+      // steps[pos] 的 side 必须与 idx 的奇偶一致，否则拒绝
+  } else {
+      // 该层必是促升：idx 必须是偶数（促升节点总是"左孩子"位置）
+  }
+  idx /= 2; width = width.div_ceil(2);
+  ```
+  循环到 `width == 1` 后要求 `pos == steps.len()`（排除多余 steps）且计算根等于 `root`。`key`/`leaf_count` 任一被篡改，只要树里存在至少一层非促升级别，就会被 steps 的 side 校验或多余/缺失 steps 检测捕获。
+- **认证力度的测试证明**：`tampering_the_key_fails_verification` 对 n=1..33 每棵树的每个 index，穷举所有错误 `key` 值（含越界）验证全部拒绝；`tampering_leaf_count_fails_verification` 对促升密集的 n=5 index=4 穷举所有错误 `leaf_count` 验证全部拒绝；`tampering_a_sibling_fails_verification` / `flipping_a_step_side_fails_verification` 复测既有的篡改-sibling / 篡改-side 拒绝性质（现在在新 verify 实现下）。
+- **codec**（`codec.rs`）：`encode_proof`/`decode_proof` 在 `steps` 前追加 `u64 key ‖ u64 leaf_count`（+16 字节）。**自描述、零连锁改动**——proof 的每个嵌入者（`BridgeRedeem`、`BridgeUnbond`、`ProofEntry`、range/diff proof）都走一个 `u32` 长度前缀包装 `encode_proof` 的字节，proof 变长对它们逐字节透明。
+- **`apply_bridge_unbond` 清偿技术债**（`lib.rs`）：
+  - `BridgeInclusionInvalid.lock_id`：`0` 哨兵 → `op.proof.key`（已被 `merkle::verify` 认证的真实索引）。
+  - `BridgeSource.consumed_unbonds`：类型从 `BTreeSet<u64>`（M172 的内容派生 SHA-256 键）改为 `BTreeSet<(u64, u64)>` = `(source_header.height, proof.key)`。同一来源高度 + 同一叶索引重放即撞键被拒——语义更直接，且不再需要用 SHA-256 混淆一个本应是普通整数对的字段。
+- **真实 proof 生成路径**：M172 的 `build_source_unbond_envelope`（`lib.rs` 测试 helper）与 `cmd_mirror_unbond`（`main.rs` 演示）原先手搓空 `Proof { steps: vec![] }`，M173 改走真正的 `MerkleTree::proof(0)`——练兵新字段的真实生成路径，而不是手填 `key: 0, leaf_count: 1`。
+- **JSON 渲染**（`daemon.rs`）：`json_merkle_proof` 加 `"key"` 字段，`{"key":N,"steps":[...]}`；3 处 pinned-string 测试（`json_proof_entry_structured`/`json_batch_envelope_structured`/`json_lock_envelope_structured`）同步更新期望串。
+- **~20 处 `Proof { ... }` 字面量**（主要是测试，`codec.rs`/`daemon.rs`/`light.rs`/`net.rs`）补上 `key`/`leaf_count` 字段。
+- **不引新 dep**；不动其余 wire 布局（proof 的增长对所有嵌入者均自描述，无需改嵌入类型的编解码函数）。
+- **测试（+5 → 652）**：`merkle.rs` 新 `proof_key_is_the_leaf_index` + `tampering_the_key_fails_verification` + `tampering_a_sibling_fails_verification` + `flipping_a_step_side_fails_verification` + `tampering_leaf_count_fails_verification`。
+- **已知边界**：`leaf_count` 让 proof 比 M172 前多 8 字节（连同 `key` 共 +16）——对所有当前 wire 使用者均无感。`ChainState.consumed_unbonds` 的 snapshot codec（`encode_snapshot`/`decode_snapshot`）**从 M171 起就未持久化该字段**（`decode_snapshot` 写死空集）——M173 未新增此缺口，但字段改为 tuple 后更显眼；重启后 unbonding-mirror 的 replay 防护窗口理论上重开，**跨重启 replay 防护**仍属待办。`apply_bridge_redeem`（M31）与 `bridge.rs` 的 `verify_lock` 仍只读 `proof.steps` 不读 `key`（它们的 `lock_id` 已是独立显式字段，不需要从 proof 派生索引）——`key` 目前唯一消费者是 `apply_bridge_unbond`。**不**做 `consumed_unbonds` 跨重启持久化 / 不做严格 NFKD / 密钥轮换 / 轻节点 RPC TLS / OTel push exporter / bearer jitter——属后续篮子。
+
 ## `BridgeUnbond` 端到端演示 + apply 布线修复（Milestone 172）
 
 M171 加了 `BridgeUnbond` 类型 + codec + `apply_bridge_unbond` 函数体，但**从未把它接进 `apply_block_inner`**——`Block.bridge_unbondings` 向量从不被消费（函数标 `#[allow(dead_code)]`）。M172 真正把跨链镜像跑通：补齐 apply 布线、修复一个 replay-dedup 逻辑漏洞、加 `node mirror-unbond` 端到端演示 + 真跨链 e2e 测试。

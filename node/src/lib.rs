@@ -346,15 +346,17 @@ pub struct BridgeSource {
     /// been redeemed. Doubly-keyed by the source chain's identity at the
     /// apply layer (the BTreeMap is keyed by `source_chain`).
     pub consumed: BTreeSet<u64>,
-    /// M171/M172: replay dedup for cross-chain unbonding mirrors. Each
-    /// key is `u64::from_be_bytes(sha256(source_height_be ‖
-    /// unbonding_merkle_leaf(entry))[..8])` — a stable content+height
-    /// digest of a `BridgeUnbond` already spliced into this chain's own
-    /// `state.unbonding`. Re-submitting the same `(source_height, entry)`
-    /// pair collides on this key and is rejected; a distinct entry (or the
-    /// same entry re-committed at a later followed height) does not. See
-    /// `apply_bridge_unbond` step 5.
-    pub consumed_unbonds: BTreeSet<u64>,
+    /// M171/M172/M173: replay dedup for cross-chain unbonding mirrors. Each
+    /// element is `(source_height, leaf_index)` — the followed source height
+    /// the mirror was proven against, paired with the entry's authenticated
+    /// position in the source's `state.unbonding` (M173: `proof.key`, which
+    /// [`crate::merkle::verify`] binds to the proof). At any one source height
+    /// the unbonding vector holds exactly one entry per index, so this pair
+    /// names a source-side entry uniquely — a re-submission of the same
+    /// `(source_height, index)` collides and is rejected, while the same entry
+    /// re-committed at a later followed height carries a distinct pair and is
+    /// allowed. See `apply_bridge_unbond` step 5.
+    pub consumed_unbonds: BTreeSet<(u64, u64)>,
 }
 
 /// M31: self-authenticating op that advances `ChainState::bridge_sources` for
@@ -1920,37 +1922,29 @@ impl ChainState {
         if !crate::merkle::verify(&op.source_header.bridge_root, &leaf_hash, &op.proof) {
             return Err(ChainError::BridgeInclusionInvalid {
                 source: op.source_chain,
-                lock_id: 0, // M171: an unbonding proof has no `lock_id`
-                            // analogue; the content+height dedup key (step 5)
-                            // carries the wire-uniqueness signal instead.
+                // M173: the proof's authenticated leaf index stands in for the
+                // `lock_id` a bridge-lock redeem carries — `merkle::verify`
+                // binds `op.proof.key` to the proof, so it is a real position,
+                // no longer the M172 `0` sentinel.
+                lock_id: op.proof.key,
             });
         }
-        // 5. replay dedup. The wire-uniqueness signal for an unbonding
-        //    mirror is "this entry, committed at this source height":
-        //    a relayer that re-submits the same `(source_header.height,
-        //    entry)` pair must be rejected, while a genuinely distinct
-        //    entry (different account/amount/mature_height, or the same
-        //    entry re-committed at a later followed height) is allowed.
-        //    We derive a stable `u64` dedup key from
-        //    `sha256(source_height_be ‖ unbonding_merkle_leaf(entry))`
-        //    (first 8 bytes, BE) and track it in `consumed_unbonds`. This
-        //    is collision-resistant for honest and adversarial inputs
-        //    alike (it inherits SHA-256's preimage resistance) and does
-        //    not depend on a merkle-proof `key` field M170's `Step` does
-        //    not yet carry — see the `consumed_unbonds` doc comment and
-        //    the M173 follow-up.
-        let entry_key = {
-            let mut pre = Vec::with_capacity(8 + 32);
-            pre.extend_from_slice(&op.source_header.height.to_be_bytes());
-            pre.extend_from_slice(&leaf_hash);
-            let digest = crate::hash::sha256(&pre);
-            u64::from_be_bytes(digest[..8].try_into().unwrap())
-        };
+        // 5. replay dedup. The identity of an unbonding mirror is "the entry
+        //    at index `proof.key` of the source's `state.unbonding`, as
+        //    committed at source height `source_header.height`". M173's
+        //    `merkle::verify` authenticated `op.proof.key` as the real
+        //    source-side index in step 4 above, so we can dedup on the exact
+        //    `(height, index)` pair — at a given source height the unbonding
+        //    vector holds one entry per index, so the pair names a source
+        //    entry uniquely. A literal re-submission collides and is rejected;
+        //    the same entry re-committed at a later followed height carries a
+        //    distinct pair and is allowed.
+        let entry_key = (op.source_header.height, op.proof.key);
         if s.consumed_unbonds.contains(&entry_key) {
             return Err(ChainError::BridgeUnbondReplay {
                 source: op.source_chain,
                 height: op.source_header.height,
-                index: entry_key,
+                index: op.proof.key,
             });
         }
         // 6. mutate: splice the entry into the destination's own
@@ -4837,7 +4831,11 @@ mod tests {
             .iter()
             .map(unbonding_merkle_leaf)
             .collect();
-        let unbonding_root = merkle::MerkleTree::from_leaf_hashes(leaves).root();
+        let tree = merkle::MerkleTree::from_leaf_hashes(leaves);
+        let unbonding_root = tree.root();
+        // M173: real proof from the tree (exercises the authenticated `key`/
+        // `leaf_count` path end to end, rather than a hand-built literal).
+        let proof = tree.proof(0).expect("entry 0 exists");
         // Patch the block's `bridge_root` slot to the unbonding sub-tree
         // root and re-certify over the patched header (the genesis set is
         // unchanged — bond+full-unbond nets to zero bonded power).
@@ -4851,7 +4849,7 @@ mod tests {
         let cert =
             consensus::commit_block(&a_genesis_set, &kps, &ab1, 0, &voters).expect("re-certify");
         let entry = chain_a.state.unbonding[0].clone();
-        (ab1.header(), cert, merkle::Proof { steps: vec![] }, entry)
+        (ab1.header(), cert, proof, entry)
     }
 
     /// End-to-end: chain A produces a real `Unbond` → chain B follows A's

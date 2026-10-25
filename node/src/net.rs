@@ -3176,6 +3176,8 @@ mod tests {
         // round-trip is the property under test).
         let fake_account = crate::Account::default();
         let fake_proof = crate::merkle::Proof {
+            key: 0,
+            leaf_count: 2,
             steps: vec![crate::merkle::Step::Right([0xAA; 32])],
         };
         // M24: a single mixed-kind batched proof request with all three kinds

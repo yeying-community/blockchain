@@ -1474,6 +1474,8 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
 
 pub fn encode_proof(p: &Proof) -> Vec<u8> {
     let mut e = Enc(Vec::new());
+    e.u64(p.key); // M173: the leaf's authenticated index, ahead of the steps.
+    e.u64(p.leaf_count); // M173: the tree width `key` is authenticated against.
     e.u64(p.steps.len() as u64);
     for s in &p.steps {
         match s {
@@ -1493,6 +1495,8 @@ pub fn encode_proof(p: &Proof) -> Vec<u8> {
 /// Inverse of [`encode_proof`]. Trailing bytes are an error.
 pub fn decode_proof(buf: &[u8]) -> Result<Proof, CodecError> {
     let mut d = Dec { buf, pos: 0 };
+    let key = d.u64()?; // M173
+    let leaf_count = d.u64()?; // M173
     let n = d.count()?;
     let mut steps = Vec::with_capacity(n as usize);
     for _ in 0..n {
@@ -1508,7 +1512,11 @@ pub fn decode_proof(buf: &[u8]) -> Result<Proof, CodecError> {
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
-    Ok(Proof { steps })
+    Ok(Proof {
+        key,
+        leaf_count,
+        steps,
+    })
 }
 
 // --- M24: typed ProofKind / Validator / Reviewer / ProofEntry wire codecs ----
@@ -2330,7 +2338,11 @@ mod tests {
                 precommits: Vec::new(),
             },
             entry: u.clone(),
-            proof: crate::merkle::Proof { steps: vec![] },
+            proof: crate::merkle::Proof {
+                key: 0,
+                leaf_count: 1,
+                steps: vec![],
+            },
         };
         let bytes = encode_bridge_unbond(&op);
         let back = decode_bridge_unbond(&bytes).unwrap();
@@ -2717,6 +2729,8 @@ mod tests {
             domain: 42,
         };
         let fake_proof = Proof {
+            key: 0,
+            leaf_count: 2,
             steps: vec![Step::Right([0xCC; 32])],
         };
         let resp_items: Vec<Option<ProofEntry>> = vec![
@@ -2774,6 +2788,8 @@ mod tests {
             domain: 9,
         };
         let proof = Proof {
+            key: 1,
+            leaf_count: 4,
             steps: vec![Step::Left([0x11; 32]), Step::Right([0x22; 32])],
         };
         let entry = ProofEntry::GraphNode {
@@ -2832,7 +2848,11 @@ mod tests {
             embedding: [0.1; 8],
             domain: 42,
         };
-        let proof = crate::merkle::Proof { steps: vec![] };
+        let proof = crate::merkle::Proof {
+            key: 0,
+            leaf_count: 1,
+            steps: vec![],
+        };
         let claim = KnnClaim {
             query: [0.5; 8],
             k: 3,
@@ -2858,7 +2878,11 @@ mod tests {
             embedding: [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             domain: 5,
         };
-        let proof = crate::merkle::Proof { steps: vec![] };
+        let proof = crate::merkle::Proof {
+            key: 0,
+            leaf_count: 1,
+            steps: vec![],
+        };
         let claim = RangeClaim {
             query: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             min_sim: 0.5,
@@ -2897,7 +2921,11 @@ mod tests {
         let inclusion_entry = ProofEntry::Account {
             id: 1,
             account: acct,
-            proof: crate::merkle::Proof { steps: vec![] },
+            proof: crate::merkle::Proof {
+                key: 0,
+                leaf_count: 1,
+                steps: vec![],
+            },
         };
         let diff_env = DiffEnvelope {
             header_prev: crate::codec::BlockHeader {
@@ -2954,7 +2982,11 @@ mod tests {
                 added: vec![crate::GraphLeafAtHeight {
                     node_id: 0,
                     graph_node: g.clone(),
-                    proof: crate::merkle::Proof { steps: vec![] },
+                    proof: crate::merkle::Proof {
+                        key: 0,
+                        leaf_count: 1,
+                        steps: vec![],
+                    },
                 }],
                 dropped: vec![],
             },
@@ -3244,6 +3276,8 @@ mod tests {
                 signature: [6u8; 64],
             },
             proof: Proof {
+                key: 1,
+                leaf_count: 4,
                 steps: vec![Step::Left([1u8; 32]), Step::Right([2u8; 32])],
             },
         };
@@ -3289,6 +3323,8 @@ mod tests {
                 signature: [6u8; 64],
             },
             proof: Proof {
+                key: 0,
+                leaf_count: 2,
                 steps: vec![Step::Right([9u8; 32])],
             },
         }];

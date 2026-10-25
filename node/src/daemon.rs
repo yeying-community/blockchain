@@ -5049,7 +5049,8 @@ fn json_merkle_proof(p: &crate::merkle::Proof) -> String {
         })
         .collect::<Vec<_>>()
         .join(",");
-    format!("{{\"steps\":[{}]}}", steps)
+    // M173: expose the authenticated leaf index alongside the sibling path.
+    format!("{{\"key\":{},\"steps\":[{}]}}", p.key, steps)
 }
 
 /// M75: a `ProofEntry` as a `{"kind":…, <leaf fields>, "proof":{…}}` object. The
@@ -16667,7 +16668,11 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
                 accepted: 0,
                 nonce: 0,
             },
-            proof: crate::merkle::Proof { steps: vec![] },
+            proof: crate::merkle::Proof {
+                key: 0,
+                leaf_count: 1,
+                steps: vec![],
+            },
         };
         let p = json_account_proof(&ch, &entry);
         assert!(
@@ -16688,12 +16693,14 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // carrying its merkle inclusion path via `json_merkle_proof`.
         use crate::light::ProofEntry;
         let path = crate::merkle::Proof {
+            key: 1,
+            leaf_count: 5,
             steps: vec![
                 crate::merkle::Step::Left([0xAA; 32]),
                 crate::merkle::Step::Right([0xBB; 32]),
             ],
         };
-        let merkle_json = "\"proof\":{\"steps\":[{\"side\":\"left\",\"hash\":\"\
+        let merkle_json = "\"proof\":{\"key\":1,\"steps\":[{\"side\":\"left\",\"hash\":\"\
              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\
              {\"side\":\"right\",\"hash\":\"\
              bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}]}";
@@ -16799,6 +16806,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             domain: 42,
         };
         let path = crate::merkle::Proof {
+            key: 1,
+            leaf_count: 3,
             steps: vec![crate::merkle::Step::Left([0xAA; 32])],
         };
         let hdr = |height: u64| crate::codec::BlockHeader {
@@ -16911,7 +16920,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             "{j}"
         );
         assert!(
-            j.contains("\"proof\":{\"steps\":[{\"side\":\"left\",\"hash\":\""),
+            j.contains("\"proof\":{\"key\":1,\"steps\":[{\"side\":\"left\",\"hash\":\""),
             "{j}"
         );
 
@@ -16981,6 +16990,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
                 signature: [9u8; 64],
             },
             proof: crate::merkle::Proof {
+                key: 1,
+                leaf_count: 4,
                 steps: vec![
                     crate::merkle::Step::Left([1u8; 32]),
                     crate::merkle::Step::Right([2u8; 32]),
@@ -17011,7 +17022,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
 
         // Merkle inclusion path.
         assert!(
-            j.contains("\"proof\":{\"steps\":[{\"side\":\"left\",\"hash\":\""),
+            j.contains("\"proof\":{\"key\":1,\"steps\":[{\"side\":\"left\",\"hash\":\""),
             "{j}"
         );
         assert!(j.contains("{\"side\":\"right\",\"hash\":\""), "{j}");
@@ -17147,6 +17158,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
                 lock_id: 3,
                 lock,
                 proof: crate::merkle::Proof {
+                    key: 0,
+                    leaf_count: 2,
                     steps: vec![crate::merkle::Step::Right([4u8; 32])],
                 },
             }],

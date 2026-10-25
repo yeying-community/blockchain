@@ -3282,8 +3282,10 @@ fn cmd_mirror_unbond() {
         .iter()
         .map(unbonding_merkle_leaf)
         .collect();
-    let unbonding_root =
-        crate::merkle::MerkleTree::from_leaf_hashes(unbonding_leaves.clone()).root();
+    let unbonding_tree = crate::merkle::MerkleTree::from_leaf_hashes(unbonding_leaves.clone());
+    let unbonding_root = unbonding_tree.root();
+    // M173: real proof from the tree (authenticated `key`/`leaf_count`).
+    let unbonding_proof = unbonding_tree.proof(0).expect("entry 0 exists");
     // The driver already sealed block 1 with the correct post-apply
     // commitments (including `next_validators_root`, which now reflects
     // account 1's new bond). We only overwrite the `bridge_root` slot with
@@ -3328,7 +3330,7 @@ fn cmd_mirror_unbond() {
         source_header: a_header.clone(),
         source_cert: a_cert.clone(),
         entry: entry.clone(),
-        proof: crate::merkle::Proof { steps: vec![] },
+        proof: unbonding_proof,
     };
     let mut b_b2 = empty_next_block(&driver_b.chain, 2.0);
     b_b2.bridge_unbondings.push(mirror);
