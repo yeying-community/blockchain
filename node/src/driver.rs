@@ -265,6 +265,7 @@ impl ChainDriver {
                     bridge_locks: Vec::new(),
                     bridge_headers: Vec::new(),
                     bridge_redeems: Vec::new(),
+                    bridge_unbondings: Vec::new(),
                 }
             }
             None => return Ok(None),

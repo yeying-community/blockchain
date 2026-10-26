@@ -570,6 +570,7 @@ impl ValidatorTracker {
             bridge_locks: Vec::new(),
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
+            bridge_unbondings: Vec::new(),
         }
         .hash();
         ValidatorTracker {
@@ -2111,7 +2112,11 @@ mod tests {
             .clone();
         let header = crate::codec::BlockHeader::from_block(&block);
         let fake_account = crate::Account::default();
-        let empty_proof = merkle::Proof { steps: Vec::new() };
+        let empty_proof = merkle::Proof {
+            key: 0,
+            leaf_count: 1,
+            steps: Vec::new(),
+        };
         let entry = ProofEntry::Account {
             id: 999,
             account: fake_account,

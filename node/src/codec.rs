@@ -10,8 +10,8 @@ use crate::merkle::{Proof, Step};
 use crate::validator::ValidatorSet;
 use crate::validator::{Validator, ValidatorUpdate};
 use crate::{
-    Account, Block, BondKind, BridgeHeader, BridgeRedeem, BridgeSource, ChainState, Embedding,
-    Review, Reviewer, SlashEvidence, StakeOp, SubmissionTx, UnbondingEntry,
+    Account, Block, BondKind, BridgeHeader, BridgeRedeem, BridgeSource, BridgeUnbond, ChainState,
+    Embedding, Review, Reviewer, SlashEvidence, StakeOp, SubmissionTx, UnbondingEntry,
 };
 use zhixing_engine::DIM;
 use zhixing_engine::{CognitiveGraph, DeltaKParams, GraphNode};
@@ -101,6 +101,17 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     for op in &b.bridge_redeems {
         enc_bridge_redeem(&mut e, op);
     }
+    // M171 (B3 wire): bridge-unbond mirror op list (usually empty). Each
+    // carries the source header + cert + an `UnbondingEntry` (M170 codec)
+    // + the inclusion proof against `source_header.state_root`. Placed at
+    // the very tail of the cert-signed body so M168 B2 blocks continue
+    // to round-trip in their original wire format when no unbond mirrors
+    // are present (this section reads as a 0-length list for B2 inputs
+    // — the *M171* B3 path adds a length prefix here).
+    e.u64(b.bridge_unbondings.len() as u64);
+    for op in &b.bridge_unbondings {
+        enc_bridge_unbond(&mut e, op);
+    }
     e.0
 }
 
@@ -160,6 +171,11 @@ pub fn encode_header(h: &BlockHeader) -> Vec<u8> {
     // they are bound by SHA-256 commitments the cert signs.
     e.raw(&h.bridge_headers_commitment);
     e.raw(&h.bridge_redeems_commitment);
+    // M171 (B3 wire): seventh per-body commitment. Placed at the very
+    // tail of the cert-signed bytes so the prefix-stability contract
+    // for M168 / M31 / M30 fields is preserved byte-for-byte — only the
+    // tail grows.
+    e.raw(&h.bridge_unbondings_commitment);
     e.0
 }
 
@@ -212,6 +228,9 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
     bridge_headers_commitment.copy_from_slice(d.take(32)?);
     let mut bridge_redeems_commitment = [0u8; 32];
     bridge_redeems_commitment.copy_from_slice(d.take(32)?);
+    // M171 (B3 wire): seventh body commitment (bridge-unbond op list).
+    let mut bridge_unbondings_commitment = [0u8; 32];
+    bridge_unbondings_commitment.copy_from_slice(d.take(32)?);
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -232,6 +251,7 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
         bridge_locks_commitment,
         bridge_headers_commitment,
         bridge_redeems_commitment,
+        bridge_unbondings_commitment,
     })
 }
 
@@ -255,14 +275,14 @@ pub fn decode_certified_header(buf: &[u8]) -> Result<CertifiedHeader, CodecError
     //   + 32 (next_validators_root) + 32 (state_root) + 32 (accounts_root)
     //   + 32 (graph_root, M27) + 32 (bridge_root, M30) + 8 (n_updates u64) =
     //   220-byte fixed prefix ‖ n_updates * 48 bytes (u64 id ‖ 32-byte pubkey ‖
-    //   u64 power) ‖ 6 * 32-byte commitments = 192 bytes tail (M30 adds
+    //   u64 power) ‖ 7 * 32-byte commitments = 224 bytes tail (M30 adds
     //   bridge_locks_commitment; M31 adds bridge_headers_commitment +
-    //   bridge_redeems_commitment).
+    //   bridge_redeems_commitment; M171 B3 wire adds bridge_unbondings_commitment).
     if buf.len() < 220 {
         return Err(CodecError::UnexpectedEof);
     }
     let n_updates = u64::from_be_bytes(buf[212..220].try_into().unwrap());
-    let header_len = 220 + (n_updates as usize) * 48 + 192; // 412 base + 48 per update
+    let header_len = 220 + (n_updates as usize) * 48 + 224; // 444 base + 48 per update
     if buf.len() < header_len {
         return Err(CodecError::UnexpectedEof);
     }
@@ -371,6 +391,15 @@ pub struct BlockHeader {
     pub bridge_headers_commitment: crate::Hash,
     /// M31: SHA-256 over the canonical encoding of the bridge-redeem op list.
     pub bridge_redeems_commitment: crate::Hash,
+    /// M171 (B3 wire): SHA-256 over the canonical encoding of the
+    /// bridge-unbond op list (the cross-chain unbonding-mirror messages
+    /// carried by `Block::bridge_unbondings` — see M171 for the
+    /// semantic). Placed last in the per-body commitment tail so the
+    /// M168 B2 wire decoding still succeeds on any block that doesn't
+    /// carry unbond mirrors (B2 blocks just have a zero commitment
+    /// here, but the *B3* decoding path reads the additional 32 bytes
+    /// — see the migration note in the M171 README).
+    pub bridge_unbondings_commitment: crate::Hash,
 }
 
 impl BlockHeader {
@@ -421,6 +450,19 @@ impl BlockHeader {
                     .map(encode_bridge_redeem)
                     .collect::<Vec<_>>(),
             ),
+            // M171 (B3 wire): seventh per-body commitment, binding the
+            // bridge-unbond op list. Same commitment discipline as
+            // `bridge_headers_commitment` / `bridge_redeems_commitment` —
+            // the cert signs the commitment, not the bodies themselves,
+            // so a light client verifies inclusion against the
+            // commitment and the bodies against the per-op Merkle
+            // inclusion proof.
+            bridge_unbondings_commitment: list_commitment(
+                &b.bridge_unbondings
+                    .iter()
+                    .map(encode_bridge_unbond)
+                    .collect::<Vec<_>>(),
+            ),
         }
     }
 
@@ -447,6 +489,7 @@ impl BlockHeader {
         bridge_locks: Vec<crate::BridgeLock>,
         bridge_headers: Vec<BridgeHeader>,
         bridge_redeems: Vec<BridgeRedeem>,
+        bridge_unbondings: Vec<BridgeUnbond>,
     ) -> Block {
         Block {
             height: self.height,
@@ -465,6 +508,7 @@ impl BlockHeader {
             bridge_locks,
             bridge_headers,
             bridge_redeems,
+            bridge_unbondings,
         }
     }
 }
@@ -796,6 +840,57 @@ pub fn decode_bridge_redeem(buf: &[u8]) -> Result<BridgeRedeem, CodecError> {
     })
 }
 
+// --- M171: bridge-unbond mirror (B3 wire) ---------------------------------
+
+/// M171: canonical bytes of a [`BridgeUnbond`] — `u32 len ‖ source_header ‖
+/// u32 len ‖ source_cert ‖ u32 len ‖ entry ‖ u32 len ‖ proof`. Same
+/// length-prefixed inner-blob layout as `encode_bridge_redeem`, but the
+/// inner entry is the M170 `encode_unbonding` 24 BE bytes (the M170
+/// single-source-of-truth redesign unifies this with the snapshot frame,
+/// the state-root digest, and the cursor content-hash key).
+pub fn encode_bridge_unbond(op: &BridgeUnbond) -> Vec<u8> {
+    let hdr = encode_header(&op.source_header);
+    let cert = encode_commit(&op.source_cert);
+    let entry = encode_unbonding(&op.entry);
+    let proof = encode_proof(&op.proof);
+    let mut e = Enc(Vec::new());
+    e.raw(&op.source_chain);
+    e.u32(hdr.len() as u32);
+    e.raw(&hdr);
+    e.u32(cert.len() as u32);
+    e.raw(&cert);
+    e.u32(entry.len() as u32);
+    e.raw(&entry);
+    e.u32(proof.len() as u32);
+    e.raw(&proof);
+    e.0
+}
+
+/// M171: inverse of [`encode_bridge_unbond`]. Trailing bytes are an error.
+pub fn decode_bridge_unbond(buf: &[u8]) -> Result<BridgeUnbond, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let mut source_chain = [0u8; 32];
+    source_chain.copy_from_slice(d.take(32)?);
+    let hdr_len = d.u32()? as usize;
+    let source_header = decode_header(d.take(hdr_len)?)?;
+    let cert_len = d.u32()? as usize;
+    let source_cert = decode_commit(d.take(cert_len)?)?;
+    let entry_len = d.u32()? as usize;
+    let entry = decode_unbonding(d.take(entry_len)?)?;
+    let proof_len = d.u32()? as usize;
+    let proof = decode_proof(d.take(proof_len)?)?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(BridgeUnbond {
+        source_chain,
+        source_header,
+        source_cert,
+        entry,
+        proof,
+    })
+}
+
 fn enc_bridge_redeem(e: &mut Enc, op: &BridgeRedeem) {
     let bytes = encode_bridge_redeem(op);
     e.u32(bytes.len() as u32);
@@ -806,6 +901,18 @@ fn dec_bridge_redeem(d: &mut Dec) -> Result<BridgeRedeem, CodecError> {
     let n = d.u32()? as usize;
     let buf = d.take(n)?;
     decode_bridge_redeem(buf)
+}
+
+fn enc_bridge_unbond(e: &mut Enc, op: &BridgeUnbond) {
+    let bytes = encode_bridge_unbond(op);
+    e.u32(bytes.len() as u32);
+    e.raw(&bytes);
+}
+
+fn dec_bridge_unbond(d: &mut Dec) -> Result<BridgeUnbond, CodecError> {
+    let n = d.u32()? as usize;
+    let buf = d.take(n)?;
+    decode_bridge_unbond(buf)
 }
 
 // --- votes & equivocation evidence -------------------------------------------
@@ -941,6 +1048,42 @@ fn dec_evidence(d: &mut Dec) -> Result<SlashEvidence, CodecError> {
     let vote_a = dec_vote(d)?;
     let vote_b = dec_vote(d)?;
     Ok(SlashEvidence { vote_a, vote_b })
+}
+
+// --- unbonding queue (M170) -----------------------------------------------
+
+/// M170: canonical bytes of a single [`UnbondingEntry`] — `u64 BE account ‖ u64
+/// BE amount ‖ u64 BE mature_height` (24 bytes, no leading tag / length
+/// prefix). This is the same byte layout the snapshot frame and the
+/// `state_root` digest fold (see `ChainState::state_root` in `lib.rs`), and
+/// `UnbondingEntry::hash` hashes these exact bytes — keeping the wire, the
+/// state-root, and the content-hash key on a single canonical writer (the
+/// M166 "implicit contract" warning is resolved by this consolidation).
+pub fn encode_unbonding(u: &UnbondingEntry) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    e.u64(u.account);
+    e.u64(u.amount);
+    e.u64(u.mature_height);
+    e.0
+}
+
+/// Decode exactly one [`UnbondingEntry`] (inverse of [`encode_unbonding`]).
+/// Returns [`CodecError::TrailingBytes`] if extra bytes follow the 24-byte
+/// triple (same boundary contract as the other single-record codecs in this
+/// file, e.g. [`decode_account`]).
+pub fn decode_unbonding(buf: &[u8]) -> Result<UnbondingEntry, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let account = d.u64()?;
+    let amount = d.u64()?;
+    let mature_height = d.u64()?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(UnbondingEntry {
+        account,
+        amount,
+        mature_height,
+    })
 }
 
 // --- commit certificates -----------------------------------------------------
@@ -1147,12 +1290,12 @@ pub fn encode_snapshot(s: &ChainState) -> Vec<u8> {
         e.u64(*id);
         e.u64(*amt);
     }
-    // unbonding queue
+    // unbonding queue — M170: use the shared codec entry so the snapshot
+    // frame, the state-root digest, and the content-hash key are all
+    // derived from the same canonical 24 BE bytes.
     e.u64(s.unbonding.len() as u64);
     for u in &s.unbonding {
-        e.u64(u.account);
-        e.u64(u.amount);
-        e.u64(u.mature_height);
+        e.raw(&encode_unbonding(u));
     }
     // active validator set
     enc_validator_set(&mut e, &s.validators);
@@ -1297,6 +1440,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
                 head,
                 height: src_height,
                 consumed,
+                consumed_unbonds: std::collections::BTreeSet::new(),
             },
         );
     }
@@ -1330,6 +1474,8 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
 
 pub fn encode_proof(p: &Proof) -> Vec<u8> {
     let mut e = Enc(Vec::new());
+    e.u64(p.key); // M173: the leaf's authenticated index, ahead of the steps.
+    e.u64(p.leaf_count); // M173: the tree width `key` is authenticated against.
     e.u64(p.steps.len() as u64);
     for s in &p.steps {
         match s {
@@ -1349,6 +1495,8 @@ pub fn encode_proof(p: &Proof) -> Vec<u8> {
 /// Inverse of [`encode_proof`]. Trailing bytes are an error.
 pub fn decode_proof(buf: &[u8]) -> Result<Proof, CodecError> {
     let mut d = Dec { buf, pos: 0 };
+    let key = d.u64()?; // M173
+    let leaf_count = d.u64()?; // M173
     let n = d.count()?;
     let mut steps = Vec::with_capacity(n as usize);
     for _ in 0..n {
@@ -1364,7 +1512,11 @@ pub fn decode_proof(buf: &[u8]) -> Result<Proof, CodecError> {
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
-    Ok(Proof { steps })
+    Ok(Proof {
+        key,
+        leaf_count,
+        steps,
+    })
 }
 
 // --- M24: typed ProofKind / Validator / Reviewer / ProofEntry wire codecs ----
@@ -1736,6 +1888,19 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     for _ in 0..n_redeems {
         bridge_redeems.push(dec_bridge_redeem(&mut d)?);
     }
+    // M171 (B3 wire): bridge-unbond mirror op list. Length-prefixed; for
+    // B2 blocks (the M168 wire format) this section reads as a 0-length
+    // list — the M171 B3 path appends the length prefix here. Backward
+    // compatibility is preserved because the B2 wire ends after the
+    // bridge-redeems section; an M168-deployed decoder reading a B3
+    // block would error with `UnexpectedEof` (not silently corrupt
+    // state). Conversely, an M171 decoder reading an M168 B2 block
+    // reads `n = 0` here and continues.
+    let n_unbonds = d.count()?;
+    let mut bridge_unbondings = Vec::with_capacity(n_unbonds as usize);
+    for _ in 0..n_unbonds {
+        bridge_unbondings.push(dec_bridge_unbond(&mut d)?);
+    }
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -1756,6 +1921,7 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         bridge_locks,
         bridge_headers,
         bridge_redeems,
+        bridge_unbondings,
     })
 }
 
@@ -1964,6 +2130,7 @@ mod tests {
             // encode/decode fns have their own dedicated round-trip tests.
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
+            bridge_unbondings: Vec::new(),
             proposer: 0,
         }
     }
@@ -2147,6 +2314,56 @@ mod tests {
     }
 
     #[test]
+    fn bridge_unbond_round_trip() {
+        // M171 (B3 wire): the third bridge op codec. The 24-byte body
+        // matches `encode_unbonding` (M170), the rest mirrors
+        // `bridge_redeem_round_trip`. Round-trip is stable, hash matches
+        // `UnbondingEntry::hash` (M166/M170 single source of truth), and
+        // trailing bytes / truncated input are rejected with the same
+        // discipline as the other op codecs.
+        use crate::consensus::Commit;
+        let u = UnbondingEntry {
+            account: 7,
+            amount: 42 * crate::MICRO,
+            mature_height: 1000,
+        };
+        let h = crate::codec::BlockHeader::from_block(&sample_block());
+        let op = BridgeUnbond {
+            source_chain: [0x33u8; 32],
+            source_header: h.clone(),
+            source_cert: Commit {
+                height: h.height,
+                round: 0,
+                block_hash: h.hash(),
+                precommits: Vec::new(),
+            },
+            entry: u.clone(),
+            proof: crate::merkle::Proof {
+                key: 0,
+                leaf_count: 1,
+                steps: vec![],
+            },
+        };
+        let bytes = encode_bridge_unbond(&op);
+        let back = decode_bridge_unbond(&bytes).unwrap();
+        assert_eq!(encode_bridge_unbond(&back), bytes);
+        assert_eq!(back.entry, u);
+        // Trailing bytes rejected.
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(matches!(
+            decode_bridge_unbond(&extra),
+            Err(CodecError::TrailingBytes)
+        ));
+
+        // Truncated input rejected.
+        assert!(matches!(
+            decode_bridge_unbond(&bytes[..bytes.len() - 3]),
+            Err(CodecError::UnexpectedEof)
+        ));
+    }
+
+    #[test]
     fn evidence_round_trip() {
         let ev = sample_evidence(21);
         let bytes = encode_evidence(&ev);
@@ -2211,6 +2428,62 @@ mod tests {
             decode_block(&bytes),
             Err(CodecError::TrailingBytes)
         ));
+    }
+
+    #[test]
+    fn unbonding_round_trip() {
+        // M170: 24 BE bytes per entry (u64 account ‖ u64 amount ‖ u64
+        // mature_height). Round-trip is stable, hash matches the wire
+        // bytes (single-source-of-truth with `state_root` and the
+        // cursor content-hash key), trailing bytes are rejected.
+        let u = UnbondingEntry {
+            account: 21,
+            amount: 4 * crate::MICRO,
+            mature_height: 12345,
+        };
+        let bytes = encode_unbonding(&u);
+        assert_eq!(bytes.len(), 24);
+        let back = decode_unbonding(&bytes).unwrap();
+        assert_eq!(encode_unbonding(&back), bytes);
+        assert_eq!(back, u);
+        // Single source of truth: hashing the canonical bytes equals
+        // `UnbondingEntry::hash`, which the cursor pagination feeds into
+        // `key_after` / `last_key`.
+        assert_eq!(u.hash(), crate::hash::sha256(&bytes));
+
+        // Trailing bytes are rejected.
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(matches!(
+            decode_unbonding(&extra),
+            Err(CodecError::TrailingBytes)
+        ));
+
+        // Truncated input is rejected.
+        assert!(matches!(
+            decode_unbonding(&bytes[..23]),
+            Err(CodecError::UnexpectedEof)
+        ));
+    }
+
+    #[test]
+    fn unbonding_be_layout_uses_big_endian() {
+        // M170: pin the byte layout (the comment above `encode_unbonding`
+        // documents BE; this test guards against an accidental switch to
+        // LE that would silently change every existing cursor's hash
+        // without changing the field values).
+        let u = UnbondingEntry {
+            account: 0x0102_0304_0506_0708,
+            amount: 0x1112_1324_2526_3738,
+            mature_height: 0x4142_4344_4546_4748,
+        };
+        let bytes = encode_unbonding(&u);
+        assert_eq!(bytes.len(), 24);
+        let mut expected = Vec::with_capacity(24);
+        expected.extend_from_slice(&u.account.to_be_bytes());
+        expected.extend_from_slice(&u.amount.to_be_bytes());
+        expected.extend_from_slice(&u.mature_height.to_be_bytes());
+        assert_eq!(bytes, expected);
     }
 
     #[test]
@@ -2456,6 +2729,8 @@ mod tests {
             domain: 42,
         };
         let fake_proof = Proof {
+            key: 0,
+            leaf_count: 2,
             steps: vec![Step::Right([0xCC; 32])],
         };
         let resp_items: Vec<Option<ProofEntry>> = vec![
@@ -2513,6 +2788,8 @@ mod tests {
             domain: 9,
         };
         let proof = Proof {
+            key: 1,
+            leaf_count: 4,
             steps: vec![Step::Left([0x11; 32]), Step::Right([0x22; 32])],
         };
         let entry = ProofEntry::GraphNode {
@@ -2571,7 +2848,11 @@ mod tests {
             embedding: [0.1; 8],
             domain: 42,
         };
-        let proof = crate::merkle::Proof { steps: vec![] };
+        let proof = crate::merkle::Proof {
+            key: 0,
+            leaf_count: 1,
+            steps: vec![],
+        };
         let claim = KnnClaim {
             query: [0.5; 8],
             k: 3,
@@ -2597,7 +2878,11 @@ mod tests {
             embedding: [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             domain: 5,
         };
-        let proof = crate::merkle::Proof { steps: vec![] };
+        let proof = crate::merkle::Proof {
+            key: 0,
+            leaf_count: 1,
+            steps: vec![],
+        };
         let claim = RangeClaim {
             query: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             min_sim: 0.5,
@@ -2636,7 +2921,11 @@ mod tests {
         let inclusion_entry = ProofEntry::Account {
             id: 1,
             account: acct,
-            proof: crate::merkle::Proof { steps: vec![] },
+            proof: crate::merkle::Proof {
+                key: 0,
+                leaf_count: 1,
+                steps: vec![],
+            },
         };
         let diff_env = DiffEnvelope {
             header_prev: crate::codec::BlockHeader {
@@ -2655,6 +2944,7 @@ mod tests {
                 bridge_locks_commitment: [0u8; 32],
                 bridge_headers_commitment: [0u8; 32],
                 bridge_redeems_commitment: [0u8; 32],
+                bridge_unbondings_commitment: [0u8; 32],
                 proposer: 0,
             },
             cert_prev: crate::consensus::Commit {
@@ -2679,6 +2969,7 @@ mod tests {
                 bridge_locks_commitment: [0u8; 32],
                 bridge_headers_commitment: [0u8; 32],
                 bridge_redeems_commitment: [0u8; 32],
+                bridge_unbondings_commitment: [0u8; 32],
                 proposer: 0,
             },
             cert_new: crate::consensus::Commit {
@@ -2691,7 +2982,11 @@ mod tests {
                 added: vec![crate::GraphLeafAtHeight {
                     node_id: 0,
                     graph_node: g.clone(),
-                    proof: crate::merkle::Proof { steps: vec![] },
+                    proof: crate::merkle::Proof {
+                        key: 0,
+                        leaf_count: 1,
+                        steps: vec![],
+                    },
                 }],
                 dropped: vec![],
             },
@@ -2799,6 +3094,7 @@ mod tests {
                         bridge_locks_commitment: [0u8; 32],
                         bridge_headers_commitment: [0u8; 32],
                         bridge_redeems_commitment: [0u8; 32],
+                        bridge_unbondings_commitment: [0u8; 32],
                         proposer: 0,
                     },
                     cert_prev: crate::consensus::Commit {
@@ -2823,6 +3119,7 @@ mod tests {
                         bridge_locks_commitment: [0u8; 32],
                         bridge_headers_commitment: [0u8; 32],
                         bridge_redeems_commitment: [0u8; 32],
+                        bridge_unbondings_commitment: [0u8; 32],
                         proposer: 0,
                     },
                     cert_new: crate::consensus::Commit {
@@ -2979,6 +3276,8 @@ mod tests {
                 signature: [6u8; 64],
             },
             proof: Proof {
+                key: 1,
+                leaf_count: 4,
                 steps: vec![Step::Left([1u8; 32]), Step::Right([2u8; 32])],
             },
         };
@@ -3024,6 +3323,8 @@ mod tests {
                 signature: [6u8; 64],
             },
             proof: Proof {
+                key: 0,
+                leaf_count: 2,
                 steps: vec![Step::Right([9u8; 32])],
             },
         }];

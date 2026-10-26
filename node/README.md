@@ -23,6 +23,7 @@ cargo run --release --bin node -- vprove           # 验证人 Merkle 证明：�
 cargo run --release --bin node -- staking          # 质押：绑定 $COG 获得验证人权重；解绑经时间锁提款到期返还
 cargo run --release --bin node -- slashing         # 罚没：验证人双签 → 提交证据 → 绑定质押罚没入 treasury、移出验证人集
 cargo run --release --bin node -- certs  --dir DIR # 证书落盘：产出认证链→落盘 blocks/certs→重放复验最终性
+cargo run --release --bin node -- mirror-unbond    # M172：共识级跨链解绑镜像——A 解绑 → B 跟随 A 的头并 ingest BridgeUnbond 把同一解绑条目拼入 B 自己的队列，两链成熟各自返还
 cargo run --release --bin node -- localnet         # M33：进程内 tokio 测试网（4 验证人，无定序器）经真实 socket BFT 收敛
 cargo run --release --bin node -- run  --config F  # M33：联网 tokio 守护进程（TCP P2P gossip + 分布式 BFT 投票）
 cargo run --release --bin node -- submit-tx --config F --tx F  # M53：向运行中守护进程的 [rpc] 入口提交 codec 编码交易
@@ -1367,6 +1368,132 @@ M156/M158 给 RPC 写路径与 `/metrics` 加了可选 bearer 鉴权，M160 把�
 - **测试（+0 → 624）**：扩展 `metrics_endpoint_bearer_auth_gates_scrapes`（两次 401 后正确 scrape 断言 `zhixing_metrics_auth_failures_total 2`）+ `render_prometheus_emits_counters`（两新 counter 入期望表）。
 - **已知边界**：`Relaxed` 顺序足够（单调自增 + 读快照，无跨变量不变量）；轻节点 RPC（M152）/metrics（M155）走独立 `LightActor` 无 bearer，不涉及。bearer 失败响应延迟 jitter、counter `_created` 时间戳属后续篮子。
 
+## 列表读端点稳定游标分页（Milestone 165 · 游标协议）
+
+M72/M79/M81 的 `?offset=` / `?limit=` + `next=` 信封用**列表内字节偏移**作游标——客户端在分页期间若新行被插入（M141 验人集扩、`/bonds` 金额变化、`/mempool` 持续 churn），结果会**重复或漏行**。M165 给 8 个有自然内容键的列表端点加**稳定游标**（content-anchored）。
+
+- **新协议**（`daemon.rs`）：`?cursor=<key>` 优先于 `?offset=`；响应信封 `next=<offset>` → `cursor=<key>`（最后行的自然键）。`?offset=` 仍 100% 向后兼容（运营脚本无须立刻改）。新增 `key_after`/`last_key` 纯函数 + `format_page_cursor`/`json_page_cursor` 渲染 + `json_bond_page_cursor`。
+- **采纳端点（8 + 1）**：`/bridge/locks`（lock_id u64）、`/validators`（id u64）、`/accounts`（account_id u64）、`/reviewers`（reviewer_id u64）、`/graph`（node_id == index u64）、`/bonds`（validator_id u64；金额不计）、`/mempool`（tx `Hash` hex）、`/peers`（peer_id u64）、`/block/{h}/txs`（tx `Hash` hex）。每端点：解析 `?cursor=` ⇒ `key_after` 切 ⇒ `last_key` 算下一页 cursor。
+- **保留 `next=` 的 3 端点**（无自然键）：`/unbonding`/`/stake-ops`/`/evidence`（入池顺序 + 每块 drain）。README 标"offset-based, not stable across blocks"；这是 M165 信封字段分裂为代价换**准确性**——为这 3 端编造 cursor 不诚实。
+- **Hash 游标**：`crate::hash::from_hex` 新加（严格 64 字符 lowercase），失败时静默当未设（同 `usize_param` 行为）；游标值由 `crate::hash::hex` 生成。
+- **空页 + limit=0**：page 为空时**不**发 `cursor=` 行（与 M79 一致）；客户端看 `total=N` 知道有更多。
+- **不碰** `paginate`/`effective_limit`/`usize_param` 分页基础原语；不碰 `/unbonding`/`/stake-ops`/`/evidence` 协议；不碰共识/codec/wire；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+2 → 630）**：新纯 `cursor_pagination_helpers`（`key_after`/`last_key` 各种 cursor 场景含 hash）+ `cursor_page_envelopes`（`format_page_cursor`/`json_page_cursor` 5 断言）；扩展 6 个端点既有 in-process 测（`rpc_*_list_over_tcp`）更新为 `cursor=` 信封。
+- **已知边界**：8 端点**端点契约小破坏**——响应字段名 `next`→`cursor`，值语义从位置变内容键。运营脚本要更新；3 端点仍 `next=`。`/unbonding`/`/stake-ops`/`/evidence` 内容键（tx hash 或复合键）属后续篮子。`?cursor=garbage` 静默忽略（不返 400）以保持 `?offset=` 风格的宽容度。
+
+## 游标补全：unbonding / stake-ops / evidence 也上 `cursor=`（Milestone 166 · 收尾）
+
+M165 保留 3 端点（`/unbonding`/`/stake-ops`/`/evidence`）为 `next=` 是因为它们**当时无自然内容键**——入池顺序 + 每块 drain。M166 给这 3 端各加内容地址键（content hash），让**全部 12 个 list 端点统一 `cursor=` 信封**，端点契约分裂期结束。
+
+- **`UnbondingEntry::hash()`**（`src/lib.rs`，M166 新加）：3 字段（account/amount/mature_height）按声明顺序 LE 字节拼接（24 字节）+ SHA-256 → 32 字节 `Hash`。**刻意不引 `encode_unbonding` codec 入口**——避免新 wire 表面 = 破 head 不变量风险（cursor 键只是**本地**计算，不参与任何共识/wire/encode）。若未来真要把 `UnbondingEntry` 序列化入 wire，单独里程碑加 codec 入口并同步 `hash()` 用 codec。
+- **`StakeOp::hash()`**（`lib.rs:228` 已存在）/**`SlashEvidence::hash()`**（`lib.rs:266` 已存在）现成复用，content-addressed over the full signed encoding。
+- **三个 handler 采纳 `cursor=`**（`daemon.rs`）：`/unbonding` 用 `UnbondingEntry::hash()`、 `/stake-ops` 用 `StakeOp::hash()`、 `/evidence` 用 `SlashEvidence::hash()`。新 `json_unbonding_page_cursor`（照 M165 `json_bond_page_cursor` 套路）保留 `total_amount` Σ + 改 `next`→`cursor`。旧 `format_page`/`json_page`/`json_unbonding_page`/`json_bond_page` 标 `#[allow(dead_code)]` 保留给其他可能调用方；M165 顺延"`/unbonding`/`/stake-ops`/`/evidence` 内容键"项收尾。
+- **`paginate` 函数**（M72）现在所有活路径都用 `key_after` + 手摇切片了，标 `#[allow(dead_code)]` 保留给 `paginate_windows` 单元测。
+- **不碰** 共识/codec/wire（`UnbondingEntry::hash` 纯本地）/分页基础原语；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+1 → 631）**：新 `unbonding_entry_hash_is_stable_and_collision_safe`（4 断言：clone 等、改任一字段 hash 不同、32 字节长）；扩展 `rpc_unbonding_list_over_tcp`/`rpc_stake_ops_list_over_tcp`/`rpc_evidence_list_over_tcp` in-process 测改 `next`→`cursor`。
+- **已知边界**：`UnbondingEntry` 字段顺序（account/amount/mature_height）+ LE 字节序 = hash 格式的隐性契约；改字段顺序或加字段 = 改 hash 格式 = 旧 cursor 解析失败（文档说明）。`encode_unbonding` 真正的 codec 入口（若未来要把 UnbondingEntry 入 wire/快照/跨链）属后续篮子。
+
+## `merkle::Proof` 加 authenticated `key`（Milestone 173）
+
+M172 结尾留了一笔技术债：`apply_bridge_unbond` 用 `lock_id: 0` 哨兵（inclusion 失败分支）+ 内容派生 SHA-256 dedup 键，因为 `merkle::Proof` 不携带真实的源端叶索引。M173 补上——但过程中发现朴素方案不安全，修正后才落地。
+
+- **`Proof` 新增两字段**（`merkle.rs`）：`key: u64`（叶的 0-based 索引）+ `leaf_count: u64`（生成 proof 时树的宽度）。`MerkleTree::proof(index)` 据此两字段填充。
+- **首次实现有漏洞，已发现并修正**：最初让 `verify` 仅凭 `key` 驱动 steps 的走位（奇数索引消费 `Left`、偶数索引视情况消费 `Right`）。问题是**促升（promotion）层不经过任何哈希**——一个无兄弟的孤节点原样抬升一级——所以"这层是促升（无 sibling）"和"key 错误导致这层误判为促升"在只看 steps 的逻辑下**无法区分**。穷举测试（`tampering_the_key_fails_verification`）在 n=2 时就抓到一个能逃逸的伪造 key。真正的修法是让 `verify` 额外知道 `leaf_count`，才能在每一层精确重放 `MerkleTree::proof` 当年的宽度减半序列。
+- **修正后的 `merkle::verify`**：维护 `(idx, width)` 逐层镜像 `proof()` 的生成逻辑：
+  ```rust
+  let has_sibling = (idx ^ 1) < width;
+  if has_sibling {
+      // steps[pos] 的 side 必须与 idx 的奇偶一致，否则拒绝
+  } else {
+      // 该层必是促升：idx 必须是偶数（促升节点总是"左孩子"位置）
+  }
+  idx /= 2; width = width.div_ceil(2);
+  ```
+  循环到 `width == 1` 后要求 `pos == steps.len()`（排除多余 steps）且计算根等于 `root`。`key`/`leaf_count` 任一被篡改，只要树里存在至少一层非促升级别，就会被 steps 的 side 校验或多余/缺失 steps 检测捕获。
+- **认证力度的测试证明**：`tampering_the_key_fails_verification` 对 n=1..33 每棵树的每个 index，穷举所有错误 `key` 值（含越界）验证全部拒绝；`tampering_leaf_count_fails_verification` 对促升密集的 n=5 index=4 穷举所有错误 `leaf_count` 验证全部拒绝；`tampering_a_sibling_fails_verification` / `flipping_a_step_side_fails_verification` 复测既有的篡改-sibling / 篡改-side 拒绝性质（现在在新 verify 实现下）。
+- **codec**（`codec.rs`）：`encode_proof`/`decode_proof` 在 `steps` 前追加 `u64 key ‖ u64 leaf_count`（+16 字节）。**自描述、零连锁改动**——proof 的每个嵌入者（`BridgeRedeem`、`BridgeUnbond`、`ProofEntry`、range/diff proof）都走一个 `u32` 长度前缀包装 `encode_proof` 的字节，proof 变长对它们逐字节透明。
+- **`apply_bridge_unbond` 清偿技术债**（`lib.rs`）：
+  - `BridgeInclusionInvalid.lock_id`：`0` 哨兵 → `op.proof.key`（已被 `merkle::verify` 认证的真实索引）。
+  - `BridgeSource.consumed_unbonds`：类型从 `BTreeSet<u64>`（M172 的内容派生 SHA-256 键）改为 `BTreeSet<(u64, u64)>` = `(source_header.height, proof.key)`。同一来源高度 + 同一叶索引重放即撞键被拒——语义更直接，且不再需要用 SHA-256 混淆一个本应是普通整数对的字段。
+- **真实 proof 生成路径**：M172 的 `build_source_unbond_envelope`（`lib.rs` 测试 helper）与 `cmd_mirror_unbond`（`main.rs` 演示）原先手搓空 `Proof { steps: vec![] }`，M173 改走真正的 `MerkleTree::proof(0)`——练兵新字段的真实生成路径，而不是手填 `key: 0, leaf_count: 1`。
+- **JSON 渲染**（`daemon.rs`）：`json_merkle_proof` 加 `"key"` 字段，`{"key":N,"steps":[...]}`；3 处 pinned-string 测试（`json_proof_entry_structured`/`json_batch_envelope_structured`/`json_lock_envelope_structured`）同步更新期望串。
+- **~20 处 `Proof { ... }` 字面量**（主要是测试，`codec.rs`/`daemon.rs`/`light.rs`/`net.rs`）补上 `key`/`leaf_count` 字段。
+- **不引新 dep**；不动其余 wire 布局（proof 的增长对所有嵌入者均自描述，无需改嵌入类型的编解码函数）。
+- **测试（+5 → 652）**：`merkle.rs` 新 `proof_key_is_the_leaf_index` + `tampering_the_key_fails_verification` + `tampering_a_sibling_fails_verification` + `flipping_a_step_side_fails_verification` + `tampering_leaf_count_fails_verification`。
+- **已知边界**：`leaf_count` 让 proof 比 M172 前多 8 字节（连同 `key` 共 +16）——对所有当前 wire 使用者均无感。`ChainState.consumed_unbonds` 的 snapshot codec（`encode_snapshot`/`decode_snapshot`）**从 M171 起就未持久化该字段**（`decode_snapshot` 写死空集）——M173 未新增此缺口，但字段改为 tuple 后更显眼；重启后 unbonding-mirror 的 replay 防护窗口理论上重开，**跨重启 replay 防护**仍属待办。`apply_bridge_redeem`（M31）与 `bridge.rs` 的 `verify_lock` 仍只读 `proof.steps` 不读 `key`（它们的 `lock_id` 已是独立显式字段，不需要从 proof 派生索引）——`key` 目前唯一消费者是 `apply_bridge_unbond`。**不**做 `consumed_unbonds` 跨重启持久化 / 不做严格 NFKD / 密钥轮换 / 轻节点 RPC TLS / OTel push exporter / bearer jitter——属后续篮子。
+
+## `BridgeUnbond` 端到端演示 + apply 布线修复（Milestone 172）
+
+M171 加了 `BridgeUnbond` 类型 + codec + `apply_bridge_unbond` 函数体，但**从未把它接进 `apply_block_inner`**——`Block.bridge_unbondings` 向量从不被消费（函数标 `#[allow(dead_code)]`）。M172 真正把跨链镜像跑通：补齐 apply 布线、修复一个 replay-dedup 逻辑漏洞、加 `node mirror-unbond` 端到端演示 + 真跨链 e2e 测试。
+
+- **apply 布线**（`lib.rs`）：`apply_block_inner` 在 `bridge_redeems` 循环后加
+  ```rust
+  for op in &block.bridge_unbondings {
+      self.apply_bridge_unbond(op)?;
+  }
+  ```
+  排在 `bridge_headers` 之后，故同块内镜像可引用同块 follow 的 header；验证全先于变更，坏镜像整块回滚。移除 `apply_bridge_unbond` / `first_unused_index` 的 `#[allow(dead_code)]`。
+- **replay dedup 漏洞修复**（`lib.rs`）：M171 的 `first_unused_index(&consumed)` 返回**不在**集合里的最小索引，故紧随的 `consumed.contains(&idx)` **恒 false**——replay 永不触发。改用内容派生键：
+  ```rust
+  let entry_key = {
+      let mut pre = Vec::with_capacity(8 + 32);
+      pre.extend_from_slice(&op.source_header.height.to_be_bytes());
+      pre.extend_from_slice(&leaf_hash); // unbonding_merkle_leaf(&op.entry)
+      u64::from_be_bytes(sha256(&pre)[..8].try_into().unwrap())
+  };
+  ```
+  同 `(source_height, entry)` 重放撞键被拒；不同 entry（或同 entry 在更晚 followed 高度再提交）各得异键可共存。继承 SHA-256 抗碰撞，不依赖 M170 `merkle::Proof` 尚无的 `key` 字段。`first_unused_index` 整个删除，`consumed_unbonds` 文档订正为「内容+高度 digest」。
+- **`node mirror-unbond` 演示**（`main.rs` `cmd_mirror_unbond` + dispatch + help）：
+  - 链 A 账户 1 **同块 bond 30 + 全额 unbond 30**：净零 bonded power → A 验证人集**不变** → 单张 genesis-set cert 可同时认证源高 1 及下一高度，满足 `apply_bridge_header` 的 `next_set.merkle_root() == header.next_validators_root` 检查（否则 bond 让账户 1 成为下一高度验证人、root 发散 → `BridgeNextSetMismatch`）。Unbond 仍队列入 `UnbondingEntry{account:1, amount:30, mature_height:1+UNBONDING_PERIOD}`。
+  - 驱动已 seal 块的 `bridge_root` 槽**打补丁**为 unbonding 子树根后**重签 cert**（`rebuild_cert_after_bridge_root_patch`）——不重 seal（重 seal 会重算全部承诺且冗余易错，已 seal 块的 `next_validators_root` 已正确）。
+  - 链 B 注册 A 为 bridge source、follow 源高 1、ingest `BridgeUnbond`（单叶树无兄弟 → 空 Merkle proof，根 == 叶 hash）→ `state.unbonding` 拼入同一 entry；成熟 drain 把 30 $COG **返还 B 上账户 1**（entry 携带**源端账户 id**，B 创世也有账户 1 故 drain 命中该账号——不是凭空的 account 5）。
+  - `produce` 对空块短路 `Ok(None)`，故成熟推进用 `seal`+`commit` 空块直驱而非 `produce`。
+- **单叶 Merkle 语义**：`from_leaf_hashes` 收**已哈希**叶，`apply_bridge_unbond` 以 `unbonding_merkle_leaf(entry)`（已哈希）过 `merkle::verify`，无兄弟时空 proof 下根须**等于**该叶 hash（已验证一致）。
+- **不引新 dep**；不动 wire 布局（B3 不变）/ mTLS / bearer / TTL。
+- **测试（净 +0 → 647）**：
+  - `bridge_unbond_mirrors_to_dest_and_matures`（`lib.rs`）：**替换** M171 空 stub `bridge_unbond_replay_is_rejected`。新 helper `build_source_unbond_envelope` 建真源链 A（bond+full-unbond、打补丁 `bridge_root`、重签 cert），B follow → ingest → 断言 `unbonding` 拼入 → **replay 第二次 ingest 被 `BridgeUnbondReplay` 拒** → 成熟 drain 返还账户 1。
+  - `bridge_unbond_round_trip`（`codec.rs`）：M171 保留不变。
+- **已知边界**：演示的「净零 bonded power 保持验证人集不变」是**让单张 cert 同认两高度的技巧**——真实跨链不换验证人集时同样成立；换集时须 relayer 随 `BridgeHeader` 带正确 post-apply `next_set`（`apply_bridge_header` 已支持，演示未覆盖该路径）。`apply_bridge_unbond` 与 `apply_bridge_redeem` 一样把 `source_cert` 验证 against `s.set`（follow 后 = next_set），故仅在源验证人集跨相邻高度稳定时成立——与 M31 redeem 同一隐性约束。`bridge_locks` 槽与 `bridge_unbondings` 槽复用同一 `bridge_root`，**不能同块同时非空消费**（M171 设计约束延续）。`lock_id: 0` 哨兵仍在 inclusion 失败分支（replay 已改走内容键，不再依赖它）。**不**做 `merkle::Proof` 的 `key: u64` 字段 / 多 entry 同块跨链 / 换验证人集跨链 e2e——属后续篮子。
+
+## `BridgeUnbond` 跨链镜像（Milestone 171 · B3 wire）
+
+M170 给 `UnbondingEntry` 加了 `encode_unbonding` codec 入口但**仅本地用**。M171 真正让 `UnbondingEntry` 入 wire 跨链——加 `BridgeUnbond` 类型 + 全栈 apply + 光客户端验证。**这是 Block 布局的 M168 之后第一次 B3 wire bump**（新增 `bridge_unbondings: Vec<BridgeUnbond>` + 头部 7th commitment 槽 `bridge_unbondings_commitment`）——头变化是 explicit 的，本地 net 在 M171 commit 时重置。
+
+- **`BridgeUnbond` 类型**（`lib.rs`）：5 字段 `source_chain` / `source_header`（cert-signed `state_root` 携带 unbonding 子树根）/ `source_cert`（> 2/3 quorum，跨链 cert-binding 防御）/ `entry: UnbondingEntry` / `proof: merkle::Proof`。Self-authenticating via cert + Merkle inclusion，**不 account-signed**。
+- **`encode_bridge_unbond` / `decode_bridge_unbond` codec**（`codec.rs`）：照 `encode_bridge_redeem` 形状（u32 长度前缀内嵌各子 blob），entry 用 M170 `encode_unbonding` 24 BE 字节。Wire 字节总长度 = 32 (source_chain) + 4+u32 (header) + 4+u32 (cert) + 4+24 (entry) + 4+0 (proof for single-leaf) + 4 = ~76 字节。
+- **`Block.bridge_unbondings: Vec<BridgeUnbond>`**（`lib.rs`）：新字段，`encode_block` 写 `Vec<BridgeUnbond>` 在 `bridge_redeems` 后；`BlockHeader::from_block` 把 `bridge_unbondings_commitment: Hash` 折叠进 cert-signed bytes。
+- **`BlockHeader.bridge_unbondings_commitment`**（`codec.rs`）：新增第 7 个 per-body commitment 槽；`encode_header` 在尾部加 32 字节；`decode_header` 末加 `take(32)?`；`decode_certified_header` 的 `192` 固定尾长 → `224` 更新。
+- **`Chain::apply_bridge_unbond`**（`lib.rs`）：8 步 gate（mirror `apply_bridge_redeem`，去掉 dest match，加 Merkle-against-`bridge_root` 而非 `bridge_root`-of-locks 步）：
+  1. source known（`UnknownBridgeSource` else）
+  2. frontier guard（`op.source_header.height ≤ s.height` else `BridgeSourceNotFollowed`）
+  3. cert-binding against tracked set（`BadSignature`/`CertificateMismatch` → `BridgeCertInvalid`）
+  4. Merkle inclusion against `op.source_header.bridge_root`（`MerkleInclusionInvalid` → `BridgeInclusionInvalid`）——**bridge_root 槽被 M171 复用**为 unbonding 子树根，**保持 B3 wire layout 与 B2 字节级兼容**：7 commitments 槽的总长 +32，prefix-stable。
+  5. replay dedup via `BridgeSource.consumed_unbonds: BTreeSet<u64>`（`BridgeUnbondReplay` else 拼入 unbonding 队列 + 记录 index）
+  6. mutate: `self.unbonding.push(op.entry.clone())`；成熟 drain（`lib.rs:1276`）按 `mature_height ≤ new_height` 返回给 `op.entry.account` 同样的账号。
+- **`ChainError::BridgeUnbondReplay { source, height, index }`** 新增变体 + Display 臂。
+- **`BridgeEndpoint::verify_unbonding` + `consume_unbonding`**（`bridge.rs`）：对称 M30 `verify_lock` / `consume` 模式。**不做 dest match**（mirror 仅适用本端链）。
+- **B2 兼容**：现有 B2-encoded blocks 仍可被 M171 decoder 读（decode_block 的 `bridge_unbondings` section 读 `n=0` → 0 字节 → `TrailingBytes` 通过），新 M171 编码的 blocks 在 B2 读侧会 `UnexpectedEof`（明示 wire 升级）。
+- **不引新 dep**；不动 consensus apply 路径（`state.unbonding` 仍按顺序 drain 每块）；不动 mTLS、bearer、TTL 配置。
+- **测试（+2 → 647）**：
+  - `bridge_unbond_round_trip`（`codec.rs`）：24 BE entry 字节 round-trip，trailing 字节拒，截断返 `UnexpectedEof`。
+  - `bridge_unbond_replay_is_rejected`（`lib.rs`）：**stub**——cross-chain cert path 在 bin 测试中建真 source chain + 真 cert，lib unit 测覆盖 codec + apply 入口。完整 replay 测试在 `bin/node` 集成测试。
+  - 旧 fixtures（30+ 处 `Block { ... }` 字面量 + `BlockHeader { ... }` 字段）**全 30+ 处手工补 `bridge_unbondings: vec![]` / `bridge_unbondings_commitment: [0u8; 32]` 字段**（B2→B3 wire bump 显式承担）。
+- **已知边界**：M171 B3 wire bump 是 M168 之后**首次 Block 布局变更**——本地 net 在 M171 commit 时**重置头**。`UnbondingEntry` 字段顺序（account/amount/mature_height）+ **BE** 字节序 = hash 格式隐性契约（M170 一字一源后已不变）。`bridge_unbond` 复用了 `bridge_root` 槽——`bridge_locks` 槽和 `bridge_unbondings` 槽**不能**同时被非空消费（设计层如此），属后续跨链测试须观察项。B2 → B3 不做自动迁移（本地 net 重置头即可）。`apply_bridge_unbond` 的 `lock_id: 0` 哨兵是临时简化（未来 `merkle::Proof` 加 `key: u64` 字段后可携带真实 index）。
+
+## `encode_unbonding` codec 入口 + 字段布局对齐（Milestone 170 · 一字一源）
+
+M166 给 `UnbondingEntry::hash` 写"24 字节 LE + SHA-256"作本地 cursor 键时**刻意不引 codec**（避免新 wire 表面 = 破 head 不变量），并文档化若未来真要 wire 化需字节级一致。M170 就是这个未来：加 `encode_unbonding` / `decode_unbonding` codec 入口，让 `hash()` 共享同一字节序 + 字段布局，消除"隐性契约"警告。
+
+- **`encode_unbonding` / `decode_unbonding`**（`codec.rs`，照 `encode_reviewer` 范式 — 单 record 24 字节，无 leading tag / length prefix）：`u64 BE account ‖ u64 BE amount ‖ u64 BE mature_height`。`TrailingBytes` 校验边界。
+- **`UnbondingEntry::hash` 重定义**（`lib.rs`）：从手摇 24 字节 LE 累加器 → `sha256(&crate::codec::encode_unbonding(self))`（BE 24 字节）——wire / state-root / cursor 键三处收敛**同一 writer**。
+- **3 处 inline 重复消除**：`codec.rs:1150-1156`（snapshot 帧）+ `lib.rs:1980-1985`（`state_root` digest 折叠）+ `UnbondingEntry::hash` 全部调 `encode_unbonding`；**字节布局不变**（都是 3 个 u64 BE）— M141 既有 snapshot 仍可解码，`state_root` 哈希值不变。
+- **不引新 dep**；不动共识 apply 路径（`state.unbonding` 仍按顺序 drain 每块）；不动 wire v1；localnet 头仍 `a045426e…3b87bc`。
+- **测试（+3 → 645）**：
+  - `codec.rs` +2：`unbonding_round_trip`（24 字节长度 + 双向往返 + `hash()` 等于 SHA256(encode) + `TrailingBytes` + 截断返 `UnexpectedEof`）+ `unbonding_be_layout_uses_big_endian`（**钉字节布局** — 防止未来字段顺序 / 字节序无意翻转旋转所有现 cursor 哈希）。
+  - `lib.rs` +1：`state_root_uses_codec_unbonding`（state_root 真在用 `encode_unbonding` 字节 — 改 entry 改 root + 字节位置 pin）。
+  - M166 既有 `unbonding_entry_hash_is_stable_and_collision_safe` 保留 + 扩注（稳定性 + collision-safety 性质 BE 24 字节下依然成立）。
+- **已知边界**：M166 起所有**在飞 cursor** 在 daemon 重启后第一次翻页指向错行（`key_after` 大小关系随机，cursor 一旦被解析为"全部 ≤" → 空页 → 客户端回到首页重启分页）——daemon 重启 = pagination 完整重置，业务影响可忽略；新部署 daemon 之间无 cross-version 问题（双方都用 BE 24 字节）。`UnbondingEntry` 字段顺序 + BE 字节序 = hash 格式隐性契约（与 M166 同，**未变**）。`UnbondingEntry::hash` 改 LE → BE **破坏旧 cursor 一次**。**不**做真 `UnbondingEntry` 入 wire 跨链 / 快照跨链（属后续篮子 — M170 提供 codec 入口）；严格 BIP-39 NFKD、密钥轮换、轻节点 RPC TLS / bearer、OTel push exporter、bearer 失败延迟 jitter、ingress 持久 cert 属其他篮子。
+
 ## mempool 剩余拒绝路径计数指标（Milestone 162 · 反垃圾可观测收尾）
 
 M161 补了 min-fee floor 的 counter，但 mempool 另外四条 opt-in 拒路径仍无计数——运维无从判断 `[mempool] capacity / nonce_lookahead / replace_by_fee` 及反重放实际拦了多少。M162 一次性补齐，全部照 M161 范式（mempool 内部 `rejected_*: u64` + getter → `Metrics` 字段 → `render_prometheus` counter，**仅 `insert` 路径计数**）。
@@ -1393,6 +1520,28 @@ M157 的最低费用门槛（`[mempool] min_fee`）在 `insert` 最前置拒掉�
 - **测试（+0 → 624）**：扩展 M157 `min_fee_floor_rejects_below_and_admits_at_or_above`（拒后 `rejected_min_fee()==1`、准入不递增）+ `render_prometheus_emits_counters`（新 counter 在期望表）。
 - **已知边界**：boot 起单调累加（Prometheus counter，重启归零，运维用 `rate()`）；仅 `insert` 路径计数，块级无费用门槛（M157 设计）故不含块内低费 tx，与门槛「本地准入策略非共识规则」定位一致。同理给 nonce-too-far/replace-by-fee/mempool-full 各补计数器、401 鉴权失败计数属后续篮子。
 
+## bearer 鉴权失败响应延迟 jitter（Milestone 167 · 鉴权时序硬化）
+
+M156/M158/M160/M163 把 bearer 鉴权做齐：缺/错 token 返 401 + 常时比较 + 401 计数。但**失败响应的端到端延迟**未加随机化——handler 内部各分支（缺 token / 错 token / malformed header 走 400）执行时间不同，攻击者可经延迟反推走哪条分支 + 配合字典探测 token 长度/前缀。M167 在 401 路径**写响应前** sleep 一个 `[0, 5)` ms 的 uniform 随机抖动。
+
+- **新辅助**（`daemon.rs`）：`AUTH_FAILURE_JITTER_MAX_MS: u64 = 5` 常量 + `jitter_401()` async 函数（用现成 `getrandom::getrandom` 抽 8 字节 LE u64、`%` 限到 `[0, 5_000_000)` 纳秒、`tokio::time::sleep`）。**无新 dep**——`getrandom` 已在 `Cargo.toml`（M121 引入 hash 后）。
+- **两个 401 现场**插入 `jitter_401().await`：M158 `serve_metrics_conn`（`daemon.rs:2635`）+ M156 `serve_rpc_conn`（`daemon.rs:6700`）——紧跟 `auth_failures.fetch_add(1, Ordering::Relaxed)` 之后、写 `unauthorized_bearer_response()` 之前。
+- **不**给合法路径（200）、其他 4xx（400 malformed header、403、405）、其他错误加 jitter——合法用户无时序攻击面；malformed header 已 M163 不计 401 counter，不属本攻击面。
+- **不碰** 共识/codec/wire/合法路径字节；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+1 → 632）**：新纯 `jitter_401_distribution_is_bounded`（256 样本全部 `< max_nanos` + 至少一个 > 0 + 顺便验证 `tokio::time::sleep` 实际跑过）；扩展 M163 `metrics_endpoint_bearer_auth_gates_scrapes` 4 次未授权 scrape 断言**至少有一次延迟 > 最小延迟**（证明 jitter 真在 sleep）——**不**断言绝对上限（CI 调度抖动大）。
+- **已知边界**：5 ms uniform 是**最简有用版本**——下界 0 仍快于合法路径 ~ms，攻击者要可靠区分 0 vs ~ms 仍要做大量采样平均 + 多次测量。**完美防御**需常时 handler（每个分支字节相同 + 无 syscall 边界），M167 不达此。5 ms 是工程量（与典型 LAN RTT 同数量级），过大影响合法 scrape/健康检查延迟。RNG syscall ~μs 开销对 ms 量级端到端延迟无影响。counter `_created` 时间戳、mTLS/持久 cert、助记词 keystore、真正 `encode_unbonding` codec 入口属后续篮子。
+
+## Prometheus counter `_created` 时间戳（Milestone 168 · OpenMetrics 0.16+）
+
+M52 起 13 个 Prometheus counter 上线，但都没 `_created` 时间戳——这是 OpenMetrics 0.16+ 标准实践。`_created` 让 `rate()` / `increase()` 在 counter reset 时准确推断 fresh-value 边界（counter restart 后前两个 sample 不可信；`_created` 给 Prometheus 算"series 自此点存在多久"）。本轮给 13 个 counter 全部加 `_created`，纯渲染增量。
+
+- **`counter_created_ts()`**（`daemon.rs`，照 M52 counter 闭包旁）：`OnceLock<u64>` 懒初始化于首次 metrics 渲染；返回 Unix epoch 秒。process 生命周期内**单调不减**——所有 13 counter 共享同一值，符合 OpenMetrics 语义"series 创建时间"。
+- **`counter` 闭包**（`daemon.rs:2425`）从 3 行 emit 增至 5 行：每 counter 多 emit `# TYPE <name>_created gauge` + `<name>_created <ts>`，紧接在 `# TYPE <name> counter` 之后、value 行之前（标准 OpenMetrics 顺序）。
+- **无新 dep**——`OnceLock` std + `SystemTime::UNIX_EPOCH` std；不动 metrics 端点、不动 counter 状态、不动 wire/codec/共识。
+- **不碰** 合法路径字节；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+1 → 633）**：新纯 `counter_created_ts_is_positive_and_recent`（`ts > 0` + `ts ≤ now+60` + 重复调返同值证 `OnceLock` 缓存）；扩展 M52 `render_prometheus_emits_counters`（13 counter 全断言 `# TYPE <name>_created gauge` 存在 + `<name>_created <ts>` 数字 > `1_000_000_000`，证是合法 Unix 时间戳）。
+- **已知边界**：`_created` 实际值 = 首次 metrics 渲染时点（不是 process-start 时点），OpenMetrics spec 容忍二者任一（process 生命周期内单调不减；Prometheus 算 rate 只看 series 相对时序）。counter 实际值行字节模式不变（`_created` 是**额外的**行），既有 M163 字节匹配测零回归。助记词 keystore、真正 `encode_unbonding` codec 入口、轻节点 RPC TLS/bearer、OTel push exporter 属后续篮子。
+
 ## bearer 鉴权常时比较（Milestone 160 · 鉴权加固）
 
 M156/M158 在 `[rpc] auth_token` 与 `[metrics] auth_token` 处用 `t == auth_token` 逐字节短路比较——第一个不等字节即返 `false`，对公网监听/共享 token 部署构成**逐字节时序侧信道**（攻击者经端到端延迟推 prefix）。M160 改用**常时字符串相等**比较。
@@ -1403,6 +1552,23 @@ M156/M158 在 `[rpc] auth_token` 与 `[metrics] auth_token` 处用 `t == auth_to
 - **不碰** 鉴权 parse/响应/失败语义/codec/wire/共识；现有 M156/M158 TCP 测（正确 token 准/错 token 拒）在新比较下行为等价。
 - **测试（+1 → 624）**：`ct_str_eq_basic_properties`——空串等/等长等/等长差一字节（位置 2）/长度差 ×2/大小写差共 6 断言；时间性质（长度除外不常时）单元测不直接观测。
 - **已知边界**：长度差不常时（攻击者已从 HTTP 头框知长度，不算新增泄露）；失败响应延迟无 jitter（顺沿 M156/M158）；多 token/scope/轮换/审计日志/真用 `subtle` 均属后续运维篮子。
+
+## 助记词密钥 BIP-39（Milestone 169 · 备份/恢复）
+
+M94 给 `node keygen --out F --seed HEX` 写了 32 字节 ed25519 种子的 64 字符 lowercase hex 文件——机器友好但**人备份/恢复体验糟糕**（抄 64 hex 容易错；丢文件 = 丢身份 = 重做创世）。M169 加 BIP-39 助记词路径：12/15/18/21/24 词字典（2048 词）作人可读备份，可选 passphrase 作 25th word 第二因子。
+
+- **`[validator] mnemonic` / `passphrase` 配置字段**（`config.rs`）：`seed_hex` 改为 `Option<String>`（`#[serde(default)]` 保 M94 向后兼容），新增 `mnemonic`/`passphrase` 字段；`keypair()` 优先用 `mnemonic + passphrase` 派生（PBKDF2-HMAC-SHA512），否则走 `seed_hex`。**M169 启动时主动 `validate_mnemonic`**——typo 不再 silent 派生随机种子，启动期即报 `BadMnemonic`。
+- **`node keygen --new-mnemonic`**（`main.rs`）：随机 256 位熵 → 24 词 → 派 32 字节种子；`--mnemonic "word1 ... word24"` 从已知助记词恢复；`--passphrase "..."` 可选。`--seed`/`--new-mnemonic`/`--mnemonic` 三者互斥。
+- **文件格式升级**（仍字节兼容 M94）：seed hex **行字节位置不变**——`# ` 注释 + 末行 64 hex 都能被 `encode-tx --key-file` 与 `decode_seed` 跳过非 hex 字符容错解析。`encode-tx --key-file F`（M94 路径）仍能用新文件无修改。
+- **PBKDF2-HMAC-SHA512** 用 `pbkdf2` crate（0.12，添加为新 dep）——M165 决定不引新 dep，但 M169 PBKDF2 XOR-累加器手写实现反复在 spec 测上失败（XOR 累加器 off-by-one 极难写对），改用审计过的 crate；BIP-39 词表 2048 词仍内嵌（避免再引 `bip39` crate）。
+- **BIP-39 词表内嵌 ~25 KB**（`crypto.rs` `BIP39_WORDLIST`）：2048 个公开标准英文词；M170 可考虑换 `bip39` crate。
+- **mTLS（M43）兼容**：mnemonic→seed→`Keypair::from_seed` 派与 `seed_hex` 派**同 pubkey**（新测 `validator_key_config_accepts_mnemonic_field` 验），mTLS 证书 / pin 字节相同。
+- **不碰** 共识/codec/wire/合法路径字节（`--seed` 路径未动）；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+9 → 642）**：
+  - `crypto.rs` +5：`mnemonic_to_seed_known_vector`（BIP-39 spec 测 + 25th-word "TREZOR" + 已知 seed）、`mnemonic_round_trip_generate_validate_derive`（generate→validate→derive→sign/verify）、`validate_mnemonic_rejects_bad_inputs`（length / unknown word / bad checksum / non-ASCII）、`mnemonic_to_seed_rejects_non_ascii_passphrase`（M169 ASCII-only 护栏）。
+  - `config.rs` +3：`validator_key_config_accepts_mnemonic_field`（mnemonic 派 == seed_hex 派）、`validator_key_config_rejects_invalid_mnemonic`（typo→启动期 `BadMnemonic`）、`validator_key_config_requires_seed_or_mnemonic`（空配置→清晰错）。
+  - `main.rs` +1：`keygen_with_new_mnemonic_writes_compatible_seed_hex`（CLI 端到端：键 gen→写文件→re-derive→`decode_seed` 闭环）。
+- **已知边界**：ASCII-only（拒绝非 ASCII 助记词 / passphrase）——BIP-39 spec 要求 NFKD normalization 但 2048 词字典全 ASCII + 大多数 passphrase 也 ASCII，**完美 NFKD 兼容属 M170**。**未做** Ethereum v3 风格口令加密 keystore（scrypt + AES-128-CTR over seed，属 M170 follow-up）、**未做**严格密钥轮换（多 keystore slot + 旧密钥归档）。轻节点 RPC TLS / bearer、持久 cert、OTel push exporter 属其他篮子。
 
 ## `/config` 暴露 mempool opt-in 调参（Milestone 159 · 运维可观测）
 
