@@ -31,6 +31,7 @@ pub mod crypto;
 pub mod daemon;
 pub mod driver;
 pub mod hash;
+pub mod keystore;
 pub mod light;
 pub mod mempool;
 pub mod merkle;
