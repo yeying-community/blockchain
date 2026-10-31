@@ -548,6 +548,21 @@ pub struct NetworkConfig {
     /// peer count), tight enough to bound abuse. Must be ≥ 1.
     #[serde(default = "default_max_inbound_connections")]
     pub max_inbound_connections: usize,
+    /// M178: persist the **encryption-only** TLS cert + key (DER) at this path
+    /// instead of regenerating an ephemeral pair each boot. Paired with
+    /// `tls_key_path` (both-or-neither). When set and the files exist they are
+    /// loaded; otherwise a fresh pair is generated once and written (key `0600`).
+    /// A stable cert ⇒ a stable fingerprint operators can pin (trust-on-first-use
+    /// survives restarts). Shared by the P2P encryption-only, metrics, and RPC
+    /// TLS acceptors, so there is one fingerprint to pin. **Ignored** by the
+    /// genesis-pinned mTLS path (`require_peer_certs`), whose credential is
+    /// already deterministic from the validator seed. Unset (default) ⇒ the
+    /// pre-M178 ephemeral behavior (fresh cert each boot).
+    #[serde(default)]
+    pub tls_cert_path: Option<String>,
+    /// M178: companion private-key DER path for `tls_cert_path` (both-or-neither).
+    #[serde(default)]
+    pub tls_key_path: Option<String>,
 }
 
 /// M177: default inbound-connection ceiling (see
@@ -567,7 +582,22 @@ impl NetworkConfig {
                 detail: "max_inbound_connections must be >= 1".into(),
             });
         }
+        // M178: the persistent-cert paths are both-or-neither (a cert without its
+        // key, or vice versa, can neither load nor be written coherently).
+        if self.tls_cert_path.is_some() != self.tls_key_path.is_some() {
+            return Err(ConfigError::BadNetwork {
+                detail: "tls_cert_path and tls_key_path must be set together".into(),
+            });
+        }
         Ok(())
+    }
+
+    /// M178: the `(cert, key)` persistence paths when both are configured.
+    pub fn tls_persist_paths(&self) -> Option<(&str, &str)> {
+        match (&self.tls_cert_path, &self.tls_key_path) {
+            (Some(c), Some(k)) => Some((c.as_str(), k.as_str())),
+            _ => None,
+        }
     }
 }
 
@@ -585,6 +615,8 @@ impl Default for NetworkConfig {
             require_peer_certs: false,
             advertise_addr: String::new(),
             max_inbound_connections: default_max_inbound_connections(),
+            tls_cert_path: None,
+            tls_key_path: None,
         }
     }
 }
@@ -1374,6 +1406,38 @@ mod tests {
         bad.max_inbound_connections = 0;
         assert!(matches!(
             bad.validate(),
+            Err(ConfigError::BadNetwork { .. })
+        ));
+    }
+
+    #[test]
+    fn tls_persist_paths_are_both_or_neither() {
+        // M178: default ⇒ no persistence (None), validate ok.
+        let n = NetworkConfig::default();
+        assert!(n.tls_persist_paths().is_none());
+        n.validate().expect("default valid");
+
+        // Both set ⇒ Some pair, validate ok.
+        let mut both = NetworkConfig::default();
+        both.tls_cert_path = Some("/d/cert.der".into());
+        both.tls_key_path = Some("/d/key.der".into());
+        assert_eq!(
+            both.tls_persist_paths(),
+            Some(("/d/cert.der", "/d/key.der"))
+        );
+        both.validate().expect("both set valid");
+
+        // Only one set ⇒ validation error (can't load/write coherently).
+        let mut only_cert = NetworkConfig::default();
+        only_cert.tls_cert_path = Some("/d/cert.der".into());
+        assert!(matches!(
+            only_cert.validate(),
+            Err(ConfigError::BadNetwork { .. })
+        ));
+        let mut only_key = NetworkConfig::default();
+        only_key.tls_key_path = Some("/d/key.der".into());
+        assert!(matches!(
+            only_key.validate(),
             Err(ConfigError::BadNetwork { .. })
         ));
     }

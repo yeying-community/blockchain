@@ -1394,6 +1394,19 @@ M165 保留 3 端点（`/unbonding`/`/stake-ops`/`/evidence`）为 `next=` 是�
 - **测试（+1 → 631）**：新 `unbonding_entry_hash_is_stable_and_collision_safe`（4 断言：clone 等、改任一字段 hash 不同、32 字节长）；扩展 `rpc_unbonding_list_over_tcp`/`rpc_stake_ops_list_over_tcp`/`rpc_evidence_list_over_tcp` in-process 测改 `next`→`cursor`。
 - **已知边界**：`UnbondingEntry` 字段顺序（account/amount/mature_height）+ LE 字节序 = hash 格式的隐性契约；改字段顺序或加字段 = 改 hash 格式 = 旧 cursor 解析失败（文档说明）。`encode_unbonding` 真正的 codec 入口（若未来要把 UnbondingEntry 入 wire/快照/跨链）属后续篮子。
 
+## 持久化加密-only TLS 证书（Milestone 178）
+
+审计前预备。生产就绪度评估标记过：P2P / metrics / RPC 三处的 TLS 都是临时自签证书，每次重启经 `rcgen` 现生成一张新的，指纹每次都变——运维没法固定证书指纹（trust-on-first-use 每次重启就断）。
+
+- **范围**：只针对**加密-only** TLS（`enable_tls` 不带 `require_peer_certs`）。genesis-pinned mTLS（`require_peer_certs`）的证书本就从验证人 seed 确定性派生、天生持久，不在本轮。
+- **`load_or_create_encrypt_only_tls_setup(cert_path, key_path)`**（`daemon.rs`）：两文件都在 → 加载；否则生成一次 → 写盘（证书普通权限、私钥 `write_private_der` 走 `0600`）→ 用。存 **DER**（正是 rustls 消费的字节形，也是指纹计算的字节形），所以加载只是 `fs::read` → `CertificateDer` / `PrivateKeyDer`，**无需 PEM 解析、不引新 dep**。
+- **重构**：抽出共享尾 `encrypt_only_setup_from_der(cert_der, key_der)`（幂等装 ring crypto provider + 建 accept-any server/client config）。临时路径 `build_encrypt_only_tls_setup`（现生成）与持久路径都调它，零行为分叉。
+- **配置**：`NetworkConfig` 加 `tls_cert_path` / `tls_key_path`（`Option<String>`，`#[serde(default)]`）。`validate` 强制**成对或都无**（单边设置 → `BadNetwork`，因为单证书或单密钥既无法加载也无法连贯写）。新 `tls_persist_paths()` 取出 `(cert, key)` 对。
+- **接线**：三处 acceptor——P2P 加密-only（`Node::start` 的 `match (mtls, persist_paths)`：仅在非 mTLS 且配置了路径时走持久）、metrics、RPC（经 `encrypt_only_acceptor` 闭包），以及 light 节点（永远加密-only）——配置了就持久、否则临时。**一张持久证书供三处共用**，运维只需 pin 一个指纹。
+- **向后兼容**：默认 unset ⇒ 逐字节保持 pre-M178 临时证书行为。私钥 `0600` 写盘逻辑在 daemon 内自带（`write_private_der`，不跨模块依赖 `main.rs` 的 `write_key_file`）。
+- **测试（+2 → 676）**：`persistent_tls_cert_is_generated_then_reused`（`daemon.rs`——首调文件不存在 ⇒ 生成+写盘；再调 ⇒ 加载不重生成（cert/key 字节逐一不变，即指纹跨重启稳定）；Unix 下私钥 `0600`。确定性、不碰 socket 故无端口冲突 flaky）+ `tls_persist_paths_are_both_or_neither`（`config.rs`——默认 None 合法、成对合法、单边 `BadNetwork`）。既有 metrics/RPC TLS 集成测走共享代码的临时分支、全绿即证重构无回归。
+- **已知边界**：加密-only TLS 仍是 accept-any-cert（M41 本就无 PKI、不校验服务端身份）——持久化只是稳定指纹供带外 pin，**不改变"加密-only 不认证对端"的语义**（对端认证仍归 `require_peer_auth` / mTLS）；证书不做到期 / 轮换调度（自签长期有效，轮换 = 删文件重启重生成）；存 DER 而非 PEM（运维取指纹：`openssl x509 -inform DER -in cert.der -fingerprint -sha256`），PEM 便利性属后续可选项；metrics/RPC 与 P2P 共用同一对路径（一个指纹），若要分端点独立证书属后续项。
+
 ## 监听端连接数上限（Milestone 177 · 预认证 DoS 硬化）
 
 审计前预备。我自己的生产就绪度评估标记过：三条 accept 循环——P2P `run_listener`、以及启用时的 metrics / RPC 端点——对每个被 `accept` 的连接无条件 `tokio::spawn` 一个处理任务，**无并发上限**。P2P 层 `require_peer_auth` 默认关闭，所以一个不持任何密钥的攻击者狂开连接就能耗尽文件描述符 / 内存。
