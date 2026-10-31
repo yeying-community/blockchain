@@ -2218,6 +2218,21 @@ impl ChainState {
             for id in &src.consumed {
                 e.u64(*id);
             }
+            // M176: fold the cross-chain unbonding replay-dedup set into the
+            // consensus digest. This is NOT mere local bookkeeping: a block
+            // carrying a replayed `BridgeUnbond` is rejected by a node that has
+            // the `(source_height, index)` pair in `consumed_unbonds` but
+            // ACCEPTED by one that doesn't (e.g. a snapshot-synced node). Before
+            // M176 the pair was absent from `state_root`, so those two nodes
+            // agreed on `state_root` yet disagreed on the block's validity — a
+            // latent fork. Folding it here (and persisting it in the snapshot,
+            // see `encode_snapshot`) makes the set consensus-critical and
+            // fork-safe. `BTreeSet` iterates sorted, so the bytes are canonical.
+            e.u64(src.consumed_unbonds.len() as u64);
+            for (height, index) in &src.consumed_unbonds {
+                e.u64(*height);
+                e.u64(*index);
+            }
         }
         sha256(&e.0)
     }

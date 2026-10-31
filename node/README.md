@@ -1394,6 +1394,23 @@ M165 保留 3 端点（`/unbonding`/`/stake-ops`/`/evidence`）为 `next=` 是�
 - **测试（+1 → 631）**：新 `unbonding_entry_hash_is_stable_and_collision_safe`（4 断言：clone 等、改任一字段 hash 不同、32 字节长）；扩展 `rpc_unbonding_list_over_tcp`/`rpc_stake_ops_list_over_tcp`/`rpc_evidence_list_over_tcp` in-process 测改 `next`→`cursor`。
 - **已知边界**：`UnbondingEntry` 字段顺序（account/amount/mature_height）+ LE 字节序 = hash 格式的隐性契约；改字段顺序或加字段 = 改 hash 格式 = 旧 cursor 解析失败（文档说明）。`encode_unbonding` 真正的 codec 入口（若未来要把 UnbondingEntry 入 wire/快照/跨链）属后续篮子。
 
+## 修复 `consumed_unbonds` 的跨链重放防护漏洞（Milestone 176 · 潜在共识分叉）
+
+M175 之后继续审计前预备。M171/M172 引入的 `BridgeSource.consumed_unbonds`（跨链 unbonding 镜像的重放去重集，M173 起类型是 `BTreeSet<(source_height, index)>`）**既不进 `state_root`、也不进 snapshot codec**（decode 侧写死空集）。这比先前记的"重启后重放窗口重开"严重——是一个**潜在共识分叉**：
+
+- `apply_bridge_unbond`（`lib.rs`）用 `consumed_unbonds` **决定区块有效性**：遇到 `(source_height, index)` 已在集合里的重放 `BridgeUnbond` 就返回 `BridgeUnbondReplay`，令整块无效回滚。
+- 但该集合不在 `state_root` 里 ⇒ 持有该对的**全量重放节点**会拒绝这个重放区块，而丢了该集合的 **snapshot-同步节点**会接受它。两者 `state_root` 相同、却对同一区块的有效性分歧 ⇒ 分叉。
+
+**三处修复**：
+1. **`state_root`**（`lib.rs`）：在 `bridge_sources` 循环里折入 `consumed_unbonds`——`u64(len)` + 每个 `(height, index)` 两个 `u64`。`BTreeSet` 有序迭代保证字节规范。这把它从"本地簿记"升为共识关键状态，分叉不再可能（两节点集合不同 ⇒ `state_root` 不同 ⇒ 承诺检查/证书复验会抓到）。
+2. **snapshot**（`codec.rs`）：`encode_snapshot` 持久化该集合，`decode_snapshot` 读回。snapshot-同步节点遂恢复与全量节点一致的集合。
+3. **`SNAPSHOT_VERSION` 1 → 2**：字节布局变了，严格版本校验拒收 v1 旧 snapshot（`BadEnum`），运维须重新 snap——pre-production，snapshot 本就可弃。
+
+**head 中性**：`state_root` 的新增字节只在有 `bridge_sources` 的链上出现（`demo`/`localnet`/除桥接测试外的全部测试都 `bridge_sources: vec![]`，循环体不执行）。故 localnet 头不动、全套既有测试绿即为证。**M134 `verify_snapshot_against_header` 自动获益**——它比对 decode 后重算的 `state_root` 与 header 的 `state_root`，现在二者都含 `consumed_unbonds`，所以一个丢了该集合的 snapshot 会 `state_root` 不符而被拒（正是我们要的安全性质）。
+
+- **测试（+2 → 672）**：`snapshot_round_trips_consumed_unbonds`（构造带非空 `consumed`+`consumed_unbonds` 的 `BridgeSource`，encode→decode 完整保真 + 再编码稳定）+ `state_root_covers_consumed_unbonds`（只往该集合加一个 `(height, index)` 就使 `state_root` 变化——钉死共识关键性）。既有 `snapshot_rejects_bad_version_and_trailing_bytes`（用 version=999）仍有效。
+- **已知边界 / 文档观察**：实测 localnet 头已是 `1215aa75…566e86`，而 README 多条里程碑仍写 wire-v1 的 `a045426e…3b87bc`——这是 **M171 B3 wire bump**（新增 block 字段 `bridge_unbondings` + 头部承诺槽）合法移头但未在文档改写新值的遗留，**非 M176 回归**（已 stash 对比 M175 提交态，同为 `1215aa75`，确认 M176 head 中性）；修正那些陈旧的头值字符串属后续文档清理。`consumed`（BridgeRedeem 的 lock_id 去重集）从 M31 起就正确进了 `state_root` 与 snapshot——只有 M171 新加的 `consumed_unbonds` 漏了，本轮补齐。
+
 ## 加密验证人 keystore（Milestone 175 · Web3 Secret Storage v3）
 
 审计前预备的第一项。在此之前，验证人私钥只有明文形态：配置里的 `seed_hex = "..."` 或 `mnemonic = "..."`，或 `keygen` 写出的明文 seed 文件。对主网验证人这不可接受。M175 加一条**可选**的加密路径，不动既有明文路径（向后兼容）。
