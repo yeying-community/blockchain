@@ -58,7 +58,7 @@ use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::{rustls, TlsAcceptor, TlsConnector};
 use tracing::{debug, error, info, warn};
 
@@ -1914,20 +1914,45 @@ async fn handle_conn<C: TransportCmd>(
     writer.abort();
 }
 
+/// M177: try to reserve one inbound-connection slot from `limiter`, returning a
+/// permit to hold for the connection's lifetime (released on drop) or `None` if
+/// the concurrency cap is already reached. Non-blocking: at the cap we drop the
+/// new connection rather than queue it, so a flood of inbound sockets can never
+/// grow the task count or memory without bound. Each accept loop
+/// ([`run_listener`], [`run_metrics`], [`run_rpc`]) previously spawned one task
+/// per accepted connection with no ceiling — the pre-M177 DoS surface.
+fn admit_inbound(limiter: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    limiter.clone().try_acquire_owned().ok()
+}
+
 async fn run_listener<C: TransportCmd + Send + 'static>(
     listener: TcpListener,
     ctx: Arc<AuthContext>,
     cmd: mpsc::UnboundedSender<C>,
+    max_conns: usize,
 ) {
     let my_id = ctx.my_id;
+    let limiter = Arc::new(Semaphore::new(max_conns));
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((stream, addr)) => {
+                // M177: refuse past the concurrency cap instead of spawning an
+                // unbounded task. The permit lives inside the spawned task and
+                // frees the slot when the connection ends.
+                let permit = match admit_inbound(&limiter) {
+                    Some(p) => p,
+                    None => {
+                        warn!(node = my_id, %addr, "inbound connection cap reached; dropping");
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let ctx = ctx.clone();
                 let cmd = cmd.clone();
                 // Wrap (TLS accept) inside the spawned task so a slow or hostile
                 // TLS handshake never blocks the accept loop.
                 tokio::spawn(async move {
+                    let _permit = permit; // held for the connection's lifetime
                     let _ = stream.set_nodelay(true);
                     match server_wrap(&ctx, stream).await {
                         Ok((s, binding)) => handle_conn(s, binding, ctx, cmd).await,
@@ -2600,15 +2625,26 @@ async fn run_metrics(
     auth_failures: Arc<AtomicU64>,
     tls: Option<TlsAcceptor>,
     cmd: mpsc::UnboundedSender<Cmd>,
+    max_conns: usize,
 ) {
+    let limiter = Arc::new(Semaphore::new(max_conns));
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((stream, addr)) => {
+                let permit = match admit_inbound(&limiter) {
+                    Some(p) => p,
+                    None => {
+                        warn!(node = my_id, %addr, "metrics connection cap reached; dropping");
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let tls = tls.clone();
                 let auth_token = auth_token.clone();
                 let auth_failures = auth_failures.clone();
                 let cmd = cmd.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let _ = stream.set_nodelay(true);
                     match wrap_optional_tls(stream, tls).await {
                         Ok(s) => serve_metrics_conn(s, auth_token, auth_failures, cmd).await,
@@ -2980,15 +3016,26 @@ async fn run_rpc(
     auth_failures: Arc<AtomicU64>,
     tls: Option<TlsAcceptor>,
     cmd: mpsc::UnboundedSender<Cmd>,
+    max_conns: usize,
 ) {
+    let limiter = Arc::new(Semaphore::new(max_conns));
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((stream, addr)) => {
+                let permit = match admit_inbound(&limiter) {
+                    Some(p) => p,
+                    None => {
+                        warn!(node = my_id, %addr, "rpc connection cap reached; dropping");
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let token = auth_token.clone();
                 let tls = tls.clone();
                 let auth_failures = auth_failures.clone();
                 let cmd = cmd.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let _ = stream.set_nodelay(true);
                     match wrap_optional_tls(stream, tls).await {
                         Ok(s) => serve_rpc_conn(s, token, auth_failures, cmd).await,
@@ -7177,7 +7224,12 @@ impl Node {
             role = if is_validator { "validator" } else { "follower" },
             "listening",
         );
-        tokio::spawn(run_listener(listener, auth.clone(), cmd_tx.clone()));
+        tokio::spawn(run_listener(
+            listener,
+            auth.clone(),
+            cmd_tx.clone(),
+            cfg.network.max_inbound_connections,
+        ));
 
         // outbound connectors (dial higher ids only → one link per pair)
         for p in &cfg.peers {
@@ -7217,6 +7269,7 @@ impl Node {
                 metrics_auth_failures.clone(),
                 metrics_tls.clone(),
                 cmd_tx.clone(),
+                cfg.network.max_inbound_connections,
             ));
         }
 
@@ -7235,6 +7288,7 @@ impl Node {
                 rpc_auth_failures.clone(),
                 rpc_tls.clone(),
                 cmd_tx.clone(),
+                cfg.network.max_inbound_connections,
             ));
         }
 
@@ -7643,7 +7697,12 @@ impl LightNode {
 
         let listener = TcpListener::bind(listen).await?;
         info!(node = my_id, addr = %listener.local_addr()?, peers = peer_ids.len(), role = "light", "listening");
-        tokio::spawn(run_listener(listener, auth.clone(), cmd_tx.clone()));
+        tokio::spawn(run_listener(
+            listener,
+            auth.clone(),
+            cmd_tx.clone(),
+            cfg.network.max_inbound_connections,
+        ));
 
         // dial higher ids only → one link per pair (same rule as the full node)
         for p in &cfg.peers {
@@ -8140,6 +8199,26 @@ fn parse_rotation(rotation: &str) -> tracing_appender::rolling::Rotation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admit_inbound_enforces_the_concurrency_cap() {
+        // M177: the admission gate hands out exactly `cap` permits; past that it
+        // returns None (the accept loop then drops the new connection). Freeing a
+        // permit (connection ends) reopens a slot. This is the core of the
+        // per-listener DoS bound; the three accept loops wire it in identically.
+        let limiter = Arc::new(Semaphore::new(2));
+        let p1 = admit_inbound(&limiter).expect("slot 1");
+        let p2 = admit_inbound(&limiter).expect("slot 2");
+        assert!(admit_inbound(&limiter).is_none(), "cap reached ⇒ refused");
+        drop(p1); // a connection ends
+        let p3 = admit_inbound(&limiter).expect("slot freed by drop");
+        // Two live permits again ⇒ full.
+        assert!(admit_inbound(&limiter).is_none());
+        drop(p2);
+        drop(p3);
+        // All freed ⇒ cap available again.
+        assert!(admit_inbound(&limiter).is_some());
+    }
 
     #[test]
     fn self_advertise_addr_prefers_override() {

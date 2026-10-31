@@ -1394,6 +1394,20 @@ M165 保留 3 端点（`/unbonding`/`/stake-ops`/`/evidence`）为 `next=` 是�
 - **测试（+1 → 631）**：新 `unbonding_entry_hash_is_stable_and_collision_safe`（4 断言：clone 等、改任一字段 hash 不同、32 字节长）；扩展 `rpc_unbonding_list_over_tcp`/`rpc_stake_ops_list_over_tcp`/`rpc_evidence_list_over_tcp` in-process 测改 `next`→`cursor`。
 - **已知边界**：`UnbondingEntry` 字段顺序（account/amount/mature_height）+ LE 字节序 = hash 格式的隐性契约；改字段顺序或加字段 = 改 hash 格式 = 旧 cursor 解析失败（文档说明）。`encode_unbonding` 真正的 codec 入口（若未来要把 UnbondingEntry 入 wire/快照/跨链）属后续篮子。
 
+## 监听端连接数上限（Milestone 177 · 预认证 DoS 硬化）
+
+审计前预备。我自己的生产就绪度评估标记过：三条 accept 循环——P2P `run_listener`、以及启用时的 metrics / RPC 端点——对每个被 `accept` 的连接无条件 `tokio::spawn` 一个处理任务，**无并发上限**。P2P 层 `require_peer_auth` 默认关闭，所以一个不持任何密钥的攻击者狂开连接就能耗尽文件描述符 / 内存。
+
+- **机制**：每条 accept 循环持一个 `tokio::sync::Semaphore(max)`。新 helper `admit_inbound` 在 `accept` 后做 `try_acquire_owned`：
+  - 拿到 `OwnedSemaphorePermit` → 把它 move 进 spawn 的任务（连接活着就占着，任务结束 drop 释放槽位），再处理连接；
+  - 到上限（`try_acquire_owned` 失败）→ **立即 `drop(stream)` 关掉新连接并继续 accept**，不堆积任务。
+  非阻塞：满了就拒，不排队，所以连接洪水无法把任务数 / 内存推到无界。
+- **配置**：`NetworkConfig` 加 `max_inbound_connections: usize`，`#[serde(default = ...)]` = **256**（对任何真实验证人网够用——入站受 peer 数约束；对滥用够紧）。每条监听器各自计数。`NetworkConfig::validate()` 拒 0（否则 accept-then-drop 永久停摆），`load_node_config` 调用之；新 `ConfigError::BadNetwork`。
+- **向后兼容**：旧 `[network]` 段缺该键 ⇒ serde 填 256，既有配置原样工作。localnet / 既有 daemon 测试每节点只有 ≤ 几条入站，远低于上限，故行为不变（全套 socket 集成测绿即证三条循环接线正确）。
+- **不引新 dep**：`tokio` 已含 `sync` feature（`Semaphore`/`OwnedSemaphorePermit`）。
+- **测试（+2 → 674）**：`admit_inbound_enforces_the_concurrency_cap`（`daemon.rs`——恰发 `cap` 个 permit、满后 `None`、drop 一个释放槽位、再满再拒的确定性单元测；不碰 socket 故无端口冲突 flaky 风险，这也是刻意的——现有套件已有硬编码端口冲突的偶发 flaky）+ `max_inbound_connections_defaults_parses_and_validates`（`config.rs`——缺键回落 256、显式值解析、0 被 `BadNetwork` 拒）。
+- **已知边界**：只做**并发连接数**上限（最根本的稳态资源界），**未做 accept 速率**（每秒新连接）令牌桶——并发上限已封顶资源，被拒连接立即关闭成本极低，速率桶属可选精化；metrics/RPC 与 P2P 共用同一 `max_inbound_connections`（运维端点连接数远小于该值，无碍），若要为运维端点单设更小上限属后续项；单个已认证 peer 内部的消息层限速（M161/M162 的 mempool tx 限速）是另一层，本轮不动。
+
 ## 修复 `consumed_unbonds` 的跨链重放防护漏洞（Milestone 176 · 潜在共识分叉）
 
 M175 之后继续审计前预备。M171/M172 引入的 `BridgeSource.consumed_unbonds`（跨链 unbonding 镜像的重放去重集，M173 起类型是 `BTreeSet<(source_height, index)>`）**既不进 `state_root`、也不进 snapshot codec**（decode 侧写死空集）。这比先前记的"重启后重放窗口重开"严重——是一个**潜在共识分叉**：

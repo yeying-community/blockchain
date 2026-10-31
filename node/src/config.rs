@@ -42,6 +42,9 @@ pub enum ConfigError {
     BadLogRotation { value: String },
     /// M54: a `[mempool]` tuning value was out of range (e.g. zero capacity).
     BadMempool { detail: String },
+    /// M177: a `[network]` tuning value was out of range (e.g. zero
+    /// `max_inbound_connections`).
+    BadNetwork { detail: String },
     /// M141: a `[snapshot]` boot config was internally incoherent (e.g. a cert
     /// without a trusted validator set, or vice versa).
     BadSnapshot { detail: String },
@@ -80,6 +83,7 @@ impl std::fmt::Display for ConfigError {
                 )
             }
             ConfigError::BadMempool { detail } => write!(f, "config bad mempool: {detail}"),
+            ConfigError::BadNetwork { detail } => write!(f, "config bad network: {detail}"),
             ConfigError::BadSnapshot { detail } => write!(f, "config bad snapshot: {detail}"),
             ConfigError::BadMnemonic { detail } => {
                 write!(f, "config bad mnemonic: {detail}")
@@ -535,6 +539,36 @@ pub struct NetworkConfig {
     /// address). Empty (the default) ⇒ advertise the bind `listen`, exactly the
     /// M39 behavior (byte-identical back-compat).
     pub advertise_addr: String,
+    /// M177: ceiling on concurrently-served inbound connections per accept loop
+    /// (the P2P listener, and — when enabled — the metrics and RPC endpoints).
+    /// Past this many live connections, a newly accepted socket is dropped
+    /// immediately instead of spawning another handler task, so a connection
+    /// flood can't exhaust file descriptors / memory. Applies per listener.
+    /// Default 256 — generous for any real validator mesh (inbound is bounded by
+    /// peer count), tight enough to bound abuse. Must be ≥ 1.
+    #[serde(default = "default_max_inbound_connections")]
+    pub max_inbound_connections: usize,
+}
+
+/// M177: default inbound-connection ceiling (see
+/// [`NetworkConfig::max_inbound_connections`]). A free function so `#[serde(default
+/// = ...)]` can fill it when the key is absent from an older `[network]` section.
+fn default_max_inbound_connections() -> usize {
+    256
+}
+
+impl NetworkConfig {
+    /// M177: reject a nonsensical inbound-connection ceiling. Zero would make the
+    /// listener accept then immediately drop every connection (a permanent
+    /// outage), so it is a config error rather than a silent no-op.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_inbound_connections == 0 {
+            return Err(ConfigError::BadNetwork {
+                detail: "max_inbound_connections must be >= 1".into(),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Default for NetworkConfig {
@@ -550,6 +584,7 @@ impl Default for NetworkConfig {
             bind_channel: false,
             require_peer_certs: false,
             advertise_addr: String::new(),
+            max_inbound_connections: default_max_inbound_connections(),
         }
     }
 }
@@ -1076,6 +1111,8 @@ pub fn load_node_config(path: &str) -> Result<NodeConfig, ConfigError> {
     }
     // M54: reject out-of-range `[mempool]` tuning (zero capacity/cap, negatives).
     cfg.mempool.validate()?;
+    // M177: reject a nonsensical inbound-connection ceiling.
+    cfg.network.validate()?;
     Ok(cfg)
 }
 
@@ -1297,6 +1334,48 @@ mod tests {
         assert!(!n.bind_channel);
         // M43: genesis-pinned mTLS is off by default (byte-identical pre-M43 TLS path).
         assert!(!n.require_peer_certs);
+        // M177: inbound-connection ceiling defaults to 256 (DoS bound).
+        assert_eq!(n.max_inbound_connections, 256);
+    }
+
+    #[test]
+    fn max_inbound_connections_defaults_parses_and_validates() {
+        // M177: absent from an older `[network]` section ⇒ the 256 default
+        // (serde `default =`), so legacy configs keep working.
+        let legacy = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [network]
+            enable_peer_exchange = false
+        "#;
+        let cfg: NodeConfig = toml::from_str(legacy).unwrap();
+        assert_eq!(cfg.network.max_inbound_connections, 256);
+        cfg.network.validate().expect("default is valid");
+
+        // An explicit value parses and survives validation.
+        let set = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [network]
+            max_inbound_connections = 32
+        "#;
+        let cfg: NodeConfig = toml::from_str(set).unwrap();
+        assert_eq!(cfg.network.max_inbound_connections, 32);
+        cfg.network.validate().expect("32 is valid");
+
+        // Zero is rejected (it would accept-then-drop every connection forever).
+        let mut bad = NetworkConfig::default();
+        bad.max_inbound_connections = 0;
+        assert!(matches!(
+            bad.validate(),
+            Err(ConfigError::BadNetwork { .. })
+        ));
     }
 
     #[test]
