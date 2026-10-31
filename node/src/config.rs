@@ -42,12 +42,20 @@ pub enum ConfigError {
     BadLogRotation { value: String },
     /// M54: a `[mempool]` tuning value was out of range (e.g. zero capacity).
     BadMempool { detail: String },
+    /// M177: a `[network]` tuning value was out of range (e.g. zero
+    /// `max_inbound_connections`).
+    BadNetwork { detail: String },
     /// M141: a `[snapshot]` boot config was internally incoherent (e.g. a cert
     /// without a trusted validator set, or vice versa).
     BadSnapshot { detail: String },
     /// M169: a `[validator] mnemonic` field failed BIP-39 validation
     /// (unknown word, bad length, bad checksum, or non-ASCII input).
     BadMnemonic { detail: String },
+    /// M175: the encrypted keystore at `[validator] encrypted_keystore_path`
+    /// could not be read, parsed, or decrypted (wrong password / tampered /
+    /// unsupported params). The underlying cause is deliberately coarse on the
+    /// decrypt side so a wrong password is not distinguishable from tampering.
+    KeystoreDecrypt { detail: String },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -75,9 +83,13 @@ impl std::fmt::Display for ConfigError {
                 )
             }
             ConfigError::BadMempool { detail } => write!(f, "config bad mempool: {detail}"),
+            ConfigError::BadNetwork { detail } => write!(f, "config bad network: {detail}"),
             ConfigError::BadSnapshot { detail } => write!(f, "config bad snapshot: {detail}"),
             ConfigError::BadMnemonic { detail } => {
                 write!(f, "config bad mnemonic: {detail}")
+            }
+            ConfigError::KeystoreDecrypt { detail } => {
+                write!(f, "config keystore decrypt: {detail}")
             }
         }
     }
@@ -315,6 +327,15 @@ pub struct ValidatorKeyConfig {
     /// and in the optional `[validator] passphrase = "..."` TOML line.
     #[serde(default)]
     pub passphrase: Option<String>,
+    /// M175: path to an encrypted JSON keystore (Web3 Secret Storage v3:
+    /// scrypt KDF + AES-128-CTR + Keccak-256 MAC). When set, this takes
+    /// precedence over `mnemonic` and `seed_hex` — the secret never lives in
+    /// the config file. Decryption needs a password, which is read from stdin
+    /// at node startup (never from the config), so this field is resolved via
+    /// [`ValidatorKeyConfig::keypair_with_password`], not the bare
+    /// [`ValidatorKeyConfig::keypair`].
+    #[serde(default)]
+    pub encrypted_keystore_path: Option<String>,
 }
 
 impl ValidatorKeyConfig {
@@ -323,8 +344,50 @@ impl ValidatorKeyConfig {
     /// [`Keypair`]. `mnemonic` takes precedence over `seed_hex` when both
     /// are set; the legacy single-form configs (M94) keep working unchanged
     /// because `seed_hex` is the only field they set.
+    ///
+    /// M175: if `encrypted_keystore_path` is set, this method errors — an
+    /// encrypted keystore needs a password, which must be supplied via
+    /// [`Self::keypair_with_password`]. The daemon reads that password from
+    /// stdin at startup; tests pass it directly.
     pub fn keypair(&self) -> Result<crate::Keypair, ConfigError> {
-        let seed = if let Some(words) = &self.mnemonic {
+        if self.encrypted_keystore_path.is_some() {
+            return Err(ConfigError::KeystoreDecrypt {
+                detail: "encrypted_keystore_path is set; a password is required \
+                         (resolve via keypair_with_password, not keypair)"
+                    .to_string(),
+            });
+        }
+        let seed = self.seed_from_mnemonic_or_hex()?;
+        Ok(crate::Keypair::from_seed(seed))
+    }
+
+    /// M175: resolve the signing key, supplying `password` for the encrypted
+    /// keystore path. Precedence: `encrypted_keystore_path` (decrypt with
+    /// `password`) > `mnemonic` > `seed_hex`. The `password` is ignored for the
+    /// mnemonic/seed_hex paths (they carry no at-rest encryption), so a caller
+    /// can always route through this method; the bare [`Self::keypair`] stays
+    /// for call sites that never use a keystore.
+    pub fn keypair_with_password(&self, password: &str) -> Result<crate::Keypair, ConfigError> {
+        if let Some(path) = &self.encrypted_keystore_path {
+            let json = std::fs::read_to_string(path).map_err(|e| ConfigError::KeystoreDecrypt {
+                detail: format!("read `{path}`: {e}"),
+            })?;
+            let seed = crate::keystore::decrypt_seed(&json, password).map_err(|e| {
+                ConfigError::KeystoreDecrypt {
+                    detail: e.to_string(),
+                }
+            })?;
+            return Ok(crate::Keypair::from_seed(seed));
+        }
+        let seed = self.seed_from_mnemonic_or_hex()?;
+        Ok(crate::Keypair::from_seed(seed))
+    }
+
+    /// Shared seed resolution for the two non-keystore paths (mnemonic, then
+    /// seed_hex). Factored out so [`Self::keypair`] and
+    /// [`Self::keypair_with_password`] stay byte-identical on these paths.
+    fn seed_from_mnemonic_or_hex(&self) -> Result<[u8; 32], ConfigError> {
+        if let Some(words) = &self.mnemonic {
             // M169: validate the mnemonic up front so a typo in the
             // operator's `mnemonic = "..."` line fails at startup with a
             // clear `BadMnemonic` error (the PBKDF2 derivation would
@@ -340,32 +403,33 @@ impl ValidatorKeyConfig {
                     detail: e.to_string(),
                 }
             })?;
-            s
+            Ok(s)
         } else {
             let hex = self
                 .seed_hex
                 .as_deref()
                 .ok_or_else(|| ConfigError::BadMnemonic {
-                    detail: "no seed_hex and no mnemonic set".to_string(),
+                    detail: "no seed_hex, no mnemonic, and no encrypted_keystore_path set"
+                        .to_string(),
                 })?;
-            decode_seed(hex, "validator.seed_hex")?
-        };
-        Ok(crate::Keypair::from_seed(seed))
+            decode_seed(hex, "validator.seed_hex")
+        }
     }
 }
 
 impl Default for ValidatorKeyConfig {
-    // M169: all fields are `Option<String>` + `bool`, so `Default` is the
-    // inert `(false, None, None, None)` shape. A bare `[validator]` table
-    // deserializes to this; `keypair()` then errors out at startup with
-    // a "no seed_hex and no mnemonic" message, which is what an operator
-    // who forgot to configure the key should see.
+    // M169/M175: all fields are `Option<String>` + `bool`, so `Default` is the
+    // inert all-None shape. A bare `[validator]` table deserializes to this;
+    // `keypair()` then errors out at startup with a "no seed_hex, no mnemonic,
+    // no encrypted_keystore_path" message, which is what an operator who forgot
+    // to configure the key should see.
     fn default() -> Self {
         ValidatorKeyConfig {
             enabled: false,
             seed_hex: None,
             mnemonic: None,
             passphrase: None,
+            encrypted_keystore_path: None,
         }
     }
 }
@@ -475,6 +539,66 @@ pub struct NetworkConfig {
     /// address). Empty (the default) ⇒ advertise the bind `listen`, exactly the
     /// M39 behavior (byte-identical back-compat).
     pub advertise_addr: String,
+    /// M177: ceiling on concurrently-served inbound connections per accept loop
+    /// (the P2P listener, and — when enabled — the metrics and RPC endpoints).
+    /// Past this many live connections, a newly accepted socket is dropped
+    /// immediately instead of spawning another handler task, so a connection
+    /// flood can't exhaust file descriptors / memory. Applies per listener.
+    /// Default 256 — generous for any real validator mesh (inbound is bounded by
+    /// peer count), tight enough to bound abuse. Must be ≥ 1.
+    #[serde(default = "default_max_inbound_connections")]
+    pub max_inbound_connections: usize,
+    /// M178: persist the **encryption-only** TLS cert + key (DER) at this path
+    /// instead of regenerating an ephemeral pair each boot. Paired with
+    /// `tls_key_path` (both-or-neither). When set and the files exist they are
+    /// loaded; otherwise a fresh pair is generated once and written (key `0600`).
+    /// A stable cert ⇒ a stable fingerprint operators can pin (trust-on-first-use
+    /// survives restarts). Shared by the P2P encryption-only, metrics, and RPC
+    /// TLS acceptors, so there is one fingerprint to pin. **Ignored** by the
+    /// genesis-pinned mTLS path (`require_peer_certs`), whose credential is
+    /// already deterministic from the validator seed. Unset (default) ⇒ the
+    /// pre-M178 ephemeral behavior (fresh cert each boot).
+    #[serde(default)]
+    pub tls_cert_path: Option<String>,
+    /// M178: companion private-key DER path for `tls_cert_path` (both-or-neither).
+    #[serde(default)]
+    pub tls_key_path: Option<String>,
+}
+
+/// M177: default inbound-connection ceiling (see
+/// [`NetworkConfig::max_inbound_connections`]). A free function so `#[serde(default
+/// = ...)]` can fill it when the key is absent from an older `[network]` section.
+fn default_max_inbound_connections() -> usize {
+    256
+}
+
+impl NetworkConfig {
+    /// M177: reject a nonsensical inbound-connection ceiling. Zero would make the
+    /// listener accept then immediately drop every connection (a permanent
+    /// outage), so it is a config error rather than a silent no-op.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_inbound_connections == 0 {
+            return Err(ConfigError::BadNetwork {
+                detail: "max_inbound_connections must be >= 1".into(),
+            });
+        }
+        // M178: the persistent-cert paths are both-or-neither (a cert without its
+        // key, or vice versa, can neither load nor be written coherently).
+        if self.tls_cert_path.is_some() != self.tls_key_path.is_some() {
+            return Err(ConfigError::BadNetwork {
+                detail: "tls_cert_path and tls_key_path must be set together".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// M178: the `(cert, key)` persistence paths when both are configured.
+    pub fn tls_persist_paths(&self) -> Option<(&str, &str)> {
+        match (&self.tls_cert_path, &self.tls_key_path) {
+            (Some(c), Some(k)) => Some((c.as_str(), k.as_str())),
+            _ => None,
+        }
+    }
 }
 
 impl Default for NetworkConfig {
@@ -490,6 +614,9 @@ impl Default for NetworkConfig {
             bind_channel: false,
             require_peer_certs: false,
             advertise_addr: String::new(),
+            max_inbound_connections: default_max_inbound_connections(),
+            tls_cert_path: None,
+            tls_key_path: None,
         }
     }
 }
@@ -1016,6 +1143,8 @@ pub fn load_node_config(path: &str) -> Result<NodeConfig, ConfigError> {
     }
     // M54: reject out-of-range `[mempool]` tuning (zero capacity/cap, negatives).
     cfg.mempool.validate()?;
+    // M177: reject a nonsensical inbound-connection ceiling.
+    cfg.network.validate()?;
     Ok(cfg)
 }
 
@@ -1237,6 +1366,80 @@ mod tests {
         assert!(!n.bind_channel);
         // M43: genesis-pinned mTLS is off by default (byte-identical pre-M43 TLS path).
         assert!(!n.require_peer_certs);
+        // M177: inbound-connection ceiling defaults to 256 (DoS bound).
+        assert_eq!(n.max_inbound_connections, 256);
+    }
+
+    #[test]
+    fn max_inbound_connections_defaults_parses_and_validates() {
+        // M177: absent from an older `[network]` section ⇒ the 256 default
+        // (serde `default =`), so legacy configs keep working.
+        let legacy = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [network]
+            enable_peer_exchange = false
+        "#;
+        let cfg: NodeConfig = toml::from_str(legacy).unwrap();
+        assert_eq!(cfg.network.max_inbound_connections, 256);
+        cfg.network.validate().expect("default is valid");
+
+        // An explicit value parses and survives validation.
+        let set = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [network]
+            max_inbound_connections = 32
+        "#;
+        let cfg: NodeConfig = toml::from_str(set).unwrap();
+        assert_eq!(cfg.network.max_inbound_connections, 32);
+        cfg.network.validate().expect("32 is valid");
+
+        // Zero is rejected (it would accept-then-drop every connection forever).
+        let mut bad = NetworkConfig::default();
+        bad.max_inbound_connections = 0;
+        assert!(matches!(
+            bad.validate(),
+            Err(ConfigError::BadNetwork { .. })
+        ));
+    }
+
+    #[test]
+    fn tls_persist_paths_are_both_or_neither() {
+        // M178: default ⇒ no persistence (None), validate ok.
+        let n = NetworkConfig::default();
+        assert!(n.tls_persist_paths().is_none());
+        n.validate().expect("default valid");
+
+        // Both set ⇒ Some pair, validate ok.
+        let mut both = NetworkConfig::default();
+        both.tls_cert_path = Some("/d/cert.der".into());
+        both.tls_key_path = Some("/d/key.der".into());
+        assert_eq!(
+            both.tls_persist_paths(),
+            Some(("/d/cert.der", "/d/key.der"))
+        );
+        both.validate().expect("both set valid");
+
+        // Only one set ⇒ validation error (can't load/write coherently).
+        let mut only_cert = NetworkConfig::default();
+        only_cert.tls_cert_path = Some("/d/cert.der".into());
+        assert!(matches!(
+            only_cert.validate(),
+            Err(ConfigError::BadNetwork { .. })
+        ));
+        let mut only_key = NetworkConfig::default();
+        only_key.tls_key_path = Some("/d/key.der".into());
+        assert!(matches!(
+            only_key.validate(),
+            Err(ConfigError::BadNetwork { .. })
+        ));
     }
 
     #[test]
@@ -2247,6 +2450,7 @@ mod tests {
                     .to_string(),
             ),
             passphrase: None,
+            encrypted_keystore_path: None,
         }
         .keypair()
         .unwrap();
@@ -2255,6 +2459,7 @@ mod tests {
             seed_hex: Some(hex(&seed_a)),
             mnemonic: None,
             passphrase: None,
+            encrypted_keystore_path: None,
         }
         .keypair()
         .unwrap();
@@ -2276,6 +2481,7 @@ mod tests {
                     .to_string(),
             ),
             passphrase: None,
+            encrypted_keystore_path: None,
         };
         match bad.keypair() {
             Err(ConfigError::BadMnemonic { detail }) => {
@@ -2297,6 +2503,111 @@ mod tests {
             }
             other => panic!("expected BadMnemonic, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn encrypted_keystore_path_requires_password() {
+        // M175: `keypair()` (the password-less entry point) must refuse an
+        // encrypted keystore rather than silently falling through to another
+        // field — the secret cannot be resolved without a password.
+        let vc = ValidatorKeyConfig {
+            enabled: true,
+            seed_hex: None,
+            mnemonic: None,
+            passphrase: None,
+            encrypted_keystore_path: Some("/nonexistent/keystore.json".to_string()),
+        };
+        match vc.keypair() {
+            Err(ConfigError::KeystoreDecrypt { detail }) => {
+                assert!(detail.contains("password"), "{detail}");
+            }
+            other => panic!("expected KeystoreDecrypt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encrypted_keystore_round_trips_through_config() {
+        // M175: write an encrypted keystore to a temp file, point a
+        // `ValidatorKeyConfig` at it, and confirm `keypair_with_password`
+        // recovers the same signing key the seed produces directly — and that
+        // a wrong password fails.
+        let seed = [0x3cu8; 32];
+        let ks = crate::keystore::encrypt_seed(&seed, "s3cret-pass").unwrap();
+        let json = crate::keystore::to_json(&ks).unwrap();
+        let dir = std::env::temp_dir().join(format!("zx-ks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keystore.json");
+        std::fs::write(&path, json).unwrap();
+
+        let vc = ValidatorKeyConfig {
+            enabled: true,
+            seed_hex: None,
+            mnemonic: None,
+            passphrase: None,
+            encrypted_keystore_path: Some(path.to_string_lossy().to_string()),
+        };
+        let from_keystore = vc.keypair_with_password("s3cret-pass").unwrap();
+        let direct = crate::Keypair::from_seed(seed);
+        assert_eq!(from_keystore.public(), direct.public());
+
+        // Wrong password ⇒ KeystoreDecrypt (MAC mismatch underneath).
+        match vc.keypair_with_password("wrong") {
+            Err(ConfigError::KeystoreDecrypt { .. }) => {}
+            other => panic!("expected KeystoreDecrypt, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keystore_takes_precedence_over_mnemonic_and_seed_hex() {
+        // M175: when all three key sources are set, the encrypted keystore
+        // wins in `keypair_with_password`. We prove this by pointing at a
+        // keystore holding a DIFFERENT seed than the seed_hex/mnemonic would
+        // produce, and checking the resolved key matches the keystore's seed.
+        let keystore_seed = [0xAAu8; 32];
+        let ks = crate::keystore::encrypt_seed(&keystore_seed, "pw").unwrap();
+        let json = crate::keystore::to_json(&ks).unwrap();
+        let dir = std::env::temp_dir().join(format!("zx-ksprec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keystore.json");
+        std::fs::write(&path, json).unwrap();
+
+        let other_seed = [0xBBu8; 32]; // what seed_hex alone would yield
+        let vc = ValidatorKeyConfig {
+            enabled: true,
+            seed_hex: Some(hex(&other_seed)),
+            mnemonic: None,
+            passphrase: None,
+            encrypted_keystore_path: Some(path.to_string_lossy().to_string()),
+        };
+        let resolved = vc.keypair_with_password("pw").unwrap();
+        assert_eq!(
+            resolved.public(),
+            crate::Keypair::from_seed(keystore_seed).public(),
+            "keystore seed must win over seed_hex"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keypair_with_password_falls_back_to_seed_hex_when_no_keystore() {
+        // M175: with no keystore path, `keypair_with_password` behaves exactly
+        // like `keypair` (password ignored) — proving a single call site can
+        // route every config shape through the password-aware method.
+        let seed = [0x44u8; 32];
+        let vc = ValidatorKeyConfig {
+            enabled: true,
+            seed_hex: Some(hex(&seed)),
+            mnemonic: None,
+            passphrase: None,
+            encrypted_keystore_path: None,
+        };
+        let a = vc.keypair().unwrap();
+        let b = vc.keypair_with_password("ignored").unwrap();
+        assert_eq!(a.public(), b.public());
+        assert_eq!(a.public(), crate::Keypair::from_seed(seed).public());
     }
 
     fn unit_vec(dim: usize) -> Vec<f32> {

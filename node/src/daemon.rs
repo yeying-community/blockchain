@@ -58,7 +58,7 @@ use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::{rustls, TlsAcceptor, TlsConnector};
 use tracing::{debug, error, info, warn};
 
@@ -1914,20 +1914,45 @@ async fn handle_conn<C: TransportCmd>(
     writer.abort();
 }
 
+/// M177: try to reserve one inbound-connection slot from `limiter`, returning a
+/// permit to hold for the connection's lifetime (released on drop) or `None` if
+/// the concurrency cap is already reached. Non-blocking: at the cap we drop the
+/// new connection rather than queue it, so a flood of inbound sockets can never
+/// grow the task count or memory without bound. Each accept loop
+/// ([`run_listener`], [`run_metrics`], [`run_rpc`]) previously spawned one task
+/// per accepted connection with no ceiling — the pre-M177 DoS surface.
+fn admit_inbound(limiter: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    limiter.clone().try_acquire_owned().ok()
+}
+
 async fn run_listener<C: TransportCmd + Send + 'static>(
     listener: TcpListener,
     ctx: Arc<AuthContext>,
     cmd: mpsc::UnboundedSender<C>,
+    max_conns: usize,
 ) {
     let my_id = ctx.my_id;
+    let limiter = Arc::new(Semaphore::new(max_conns));
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((stream, addr)) => {
+                // M177: refuse past the concurrency cap instead of spawning an
+                // unbounded task. The permit lives inside the spawned task and
+                // frees the slot when the connection ends.
+                let permit = match admit_inbound(&limiter) {
+                    Some(p) => p,
+                    None => {
+                        warn!(node = my_id, %addr, "inbound connection cap reached; dropping");
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let ctx = ctx.clone();
                 let cmd = cmd.clone();
                 // Wrap (TLS accept) inside the spawned task so a slow or hostile
                 // TLS handshake never blocks the accept loop.
                 tokio::spawn(async move {
+                    let _permit = permit; // held for the connection's lifetime
                     let _ = stream.set_nodelay(true);
                     match server_wrap(&ctx, stream).await {
                         Ok((s, binding)) => handle_conn(s, binding, ctx, cmd).await,
@@ -2111,13 +2136,79 @@ fn build_encrypt_only_tls_setup() -> io::Result<TlsSetup> {
     // Fresh self-signed cert + key for this process (SAN "zhixing-node").
     let cert = rcgen::generate_simple_self_signed(vec!["zhixing-node".to_string()])
         .map_err(|e| io::Error::other(format!("self-signed cert generation failed: {e}")))?;
-    let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
-    let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der())
+    let cert_der = cert.cert.der().to_vec();
+    let key_der = cert.key_pair.serialize_der();
+    encrypt_only_setup_from_der(cert_der, key_der)
+}
+
+/// M178: an encryption-only TLS setup whose self-signed cert+key **persist** at
+/// `cert_path` / `key_path` (DER). If both files exist they are loaded; otherwise
+/// a fresh pair is generated and written (the key `0600`). A stable cert means a
+/// stable fingerprint operators can pin — trust-on-first-use survives restarts,
+/// unlike the ephemeral [`build_encrypt_only_tls_setup`] that regenerates every
+/// boot. The DER bytes are exactly what rustls consumes and what a fingerprint is
+/// computed over, so no PEM parsing (and no extra dependency) is needed.
+fn load_or_create_encrypt_only_tls_setup(cert_path: &str, key_path: &str) -> io::Result<TlsSetup> {
+    let (cert_der, key_der) = if std::path::Path::new(cert_path).exists()
+        && std::path::Path::new(key_path).exists()
+    {
+        (std::fs::read(cert_path)?, std::fs::read(key_path)?)
+    } else {
+        let cert = rcgen::generate_simple_self_signed(vec!["zhixing-node".to_string()])
+            .map_err(|e| io::Error::other(format!("self-signed cert generation failed: {e}")))?;
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.key_pair.serialize_der();
+        if let Some(parent) = std::path::Path::new(cert_path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(cert_path, &cert_der)?;
+        write_private_der(key_path, &key_der)?;
+        (cert_der, key_der)
+    };
+    encrypt_only_setup_from_der(cert_der, key_der)
+}
+
+/// M178: write a private-key DER with owner-only (`0600`) permissions on Unix (no
+/// world-readable window: created with mode `0600`, re-asserted after). On other
+/// platforms a plain write (no POSIX mode). Mirrors the `cmd_keygen` key-file
+/// discipline, kept here so the daemon has no cross-module dependency.
+fn write_private_der(path: &str, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
+/// M178: build the encryption-only [`TlsSetup`] (accept-any client verifier) from
+/// already-materialized cert+key DER — the shared tail of the ephemeral
+/// [`build_encrypt_only_tls_setup`] and the persistent
+/// [`load_or_create_encrypt_only_tls_setup`].
+fn encrypt_only_setup_from_der(cert_der: Vec<u8>, key_der: Vec<u8>) -> io::Result<TlsSetup> {
+    // Install the ring crypto provider process-wide (idempotent) so this path is
+    // self-sufficient even when `[network] enable_tls` is off and no P2P TLS
+    // setup ran first (a metrics/RPC-only TLS node).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let cert = rustls::pki_types::CertificateDer::from(cert_der);
+    let key = rustls::pki_types::PrivateKeyDer::try_from(key_der)
         .map_err(|e| io::Error::other(format!("private key encoding failed: {e}")))?;
 
     let server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)
+        .with_single_cert(vec![cert], key)
         .map_err(|e| io::Error::other(format!("TLS server config failed: {e}")))?;
 
     let client_config = rustls::ClientConfig::builder()
@@ -2600,15 +2691,26 @@ async fn run_metrics(
     auth_failures: Arc<AtomicU64>,
     tls: Option<TlsAcceptor>,
     cmd: mpsc::UnboundedSender<Cmd>,
+    max_conns: usize,
 ) {
+    let limiter = Arc::new(Semaphore::new(max_conns));
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((stream, addr)) => {
+                let permit = match admit_inbound(&limiter) {
+                    Some(p) => p,
+                    None => {
+                        warn!(node = my_id, %addr, "metrics connection cap reached; dropping");
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let tls = tls.clone();
                 let auth_token = auth_token.clone();
                 let auth_failures = auth_failures.clone();
                 let cmd = cmd.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let _ = stream.set_nodelay(true);
                     match wrap_optional_tls(stream, tls).await {
                         Ok(s) => serve_metrics_conn(s, auth_token, auth_failures, cmd).await,
@@ -2980,15 +3082,26 @@ async fn run_rpc(
     auth_failures: Arc<AtomicU64>,
     tls: Option<TlsAcceptor>,
     cmd: mpsc::UnboundedSender<Cmd>,
+    max_conns: usize,
 ) {
+    let limiter = Arc::new(Semaphore::new(max_conns));
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((stream, addr)) => {
+                let permit = match admit_inbound(&limiter) {
+                    Some(p) => p,
+                    None => {
+                        warn!(node = my_id, %addr, "rpc connection cap reached; dropping");
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let token = auth_token.clone();
                 let tls = tls.clone();
                 let auth_failures = auth_failures.clone();
                 let cmd = cmd.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let _ = stream.set_nodelay(true);
                     match wrap_optional_tls(stream, tls).await {
                         Ok(s) => serve_rpc_conn(s, token, auth_failures, cmd).await,
@@ -7090,23 +7203,37 @@ impl Node {
             } else {
                 None
             };
-            Some(build_tls_setup(mtls)?)
+            // M178: in encryption-only mode (no mTLS), persist the self-signed
+            // cert when `[network] tls_cert_path`/`tls_key_path` are set, so the
+            // fingerprint is stable across restarts. mTLS ignores this (its cert
+            // is derived from the genesis seed, already deterministic).
+            match (mtls, cfg.network.tls_persist_paths()) {
+                (None, Some((cert, key))) => {
+                    Some(load_or_create_encrypt_only_tls_setup(cert, key)?)
+                }
+                (mtls, _) => Some(build_tls_setup(mtls)?),
+            }
         } else {
             None
         };
         // M164: per-endpoint encryption-only TLS for `[metrics]` and `[rpc]`.
         // Independent acceptors (not the P2P `tls`) — these endpoints don't need
         // mTLS, just channel encryption so bearer tokens and metrics bodies are
-        // not sniffable. Ephemeral self-signed cert via the same primitive the
-        // P2P "encryption-only" mode uses; `enable_tls = false` ⇒ `None` and
-        // the accept loop falls straight through to plaintext.
+        // not sniffable. M178: share the persistent cert when configured (one
+        // fingerprint to pin), else an ephemeral self-signed cert per boot.
+        let encrypt_only_acceptor = || -> io::Result<TlsAcceptor> {
+            Ok(match cfg.network.tls_persist_paths() {
+                Some((cert, key)) => load_or_create_encrypt_only_tls_setup(cert, key)?.acceptor,
+                None => build_encrypt_only_tls_setup()?.acceptor,
+            })
+        };
         let metrics_tls = if cfg.metrics.as_ref().map(|m| m.enable_tls).unwrap_or(false) {
-            Some(build_encrypt_only_tls_setup()?.acceptor)
+            Some(encrypt_only_acceptor()?)
         } else {
             None
         };
         let rpc_tls = if cfg.rpc.as_ref().map(|r| r.enable_tls).unwrap_or(false) {
-            Some(build_encrypt_only_tls_setup()?.acceptor)
+            Some(encrypt_only_acceptor()?)
         } else {
             None
         };
@@ -7177,7 +7304,12 @@ impl Node {
             role = if is_validator { "validator" } else { "follower" },
             "listening",
         );
-        tokio::spawn(run_listener(listener, auth.clone(), cmd_tx.clone()));
+        tokio::spawn(run_listener(
+            listener,
+            auth.clone(),
+            cmd_tx.clone(),
+            cfg.network.max_inbound_connections,
+        ));
 
         // outbound connectors (dial higher ids only → one link per pair)
         for p in &cfg.peers {
@@ -7217,6 +7349,7 @@ impl Node {
                 metrics_auth_failures.clone(),
                 metrics_tls.clone(),
                 cmd_tx.clone(),
+                cfg.network.max_inbound_connections,
             ));
         }
 
@@ -7235,6 +7368,7 @@ impl Node {
                 rpc_auth_failures.clone(),
                 rpc_tls.clone(),
                 cmd_tx.clone(),
+                cfg.network.max_inbound_connections,
             ));
         }
 
@@ -7596,7 +7730,12 @@ impl LightNode {
             .map(|(id, pk, _)| (*id, *pk))
             .collect();
         let tls = if cfg.network.enable_tls {
-            Some(build_tls_setup(None)?)
+            // M178: a light node is always encryption-only (no validator key, so
+            // never mTLS); persist the cert when configured, mirroring the full node.
+            Some(match cfg.network.tls_persist_paths() {
+                Some((cert, key)) => load_or_create_encrypt_only_tls_setup(cert, key)?,
+                None => build_tls_setup(None)?,
+            })
         } else {
             None
         };
@@ -7643,7 +7782,12 @@ impl LightNode {
 
         let listener = TcpListener::bind(listen).await?;
         info!(node = my_id, addr = %listener.local_addr()?, peers = peer_ids.len(), role = "light", "listening");
-        tokio::spawn(run_listener(listener, auth.clone(), cmd_tx.clone()));
+        tokio::spawn(run_listener(
+            listener,
+            auth.clone(),
+            cmd_tx.clone(),
+            cfg.network.max_inbound_connections,
+        ));
 
         // dial higher ids only → one link per pair (same rule as the full node)
         for p in &cfg.peers {
@@ -8140,6 +8284,66 @@ fn parse_rotation(rotation: &str) -> tracing_appender::rolling::Rotation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistent_tls_cert_is_generated_then_reused() {
+        // M178: first call (files absent) generates + writes the cert/key DER; a
+        // second call loads them unchanged (byte-identical), so the fingerprint is
+        // stable across restarts. `load_or_create` creates the parent dir itself.
+        let dir = tmp_dir("tls-persist");
+        let cp = format!("{dir}/tls/cert.der");
+        let kp = format!("{dir}/tls/key.der");
+
+        assert!(!std::path::Path::new(&cp).exists());
+        load_or_create_encrypt_only_tls_setup(&cp, &kp).expect("generate");
+        assert!(std::path::Path::new(&cp).exists() && std::path::Path::new(&kp).exists());
+        let cert1 = std::fs::read(&cp).unwrap();
+        let key1 = std::fs::read(&kp).unwrap();
+        assert!(!cert1.is_empty() && !key1.is_empty());
+
+        // Second call: files present ⇒ load, not regenerate (bytes unchanged).
+        load_or_create_encrypt_only_tls_setup(&cp, &kp).expect("reload");
+        assert_eq!(
+            std::fs::read(&cp).unwrap(),
+            cert1,
+            "cert reused across restart"
+        );
+        assert_eq!(
+            std::fs::read(&kp).unwrap(),
+            key1,
+            "key reused across restart"
+        );
+
+        // The key file is owner-only on Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&kp).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "key file must be 0600");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn admit_inbound_enforces_the_concurrency_cap() {
+        // M177: the admission gate hands out exactly `cap` permits; past that it
+        // returns None (the accept loop then drops the new connection). Freeing a
+        // permit (connection ends) reopens a slot. This is the core of the
+        // per-listener DoS bound; the three accept loops wire it in identically.
+        let limiter = Arc::new(Semaphore::new(2));
+        let p1 = admit_inbound(&limiter).expect("slot 1");
+        let p2 = admit_inbound(&limiter).expect("slot 2");
+        assert!(admit_inbound(&limiter).is_none(), "cap reached ⇒ refused");
+        drop(p1); // a connection ends
+        let p3 = admit_inbound(&limiter).expect("slot freed by drop");
+        // Two live permits again ⇒ full.
+        assert!(admit_inbound(&limiter).is_none());
+        drop(p2);
+        drop(p3);
+        // All freed ⇒ cap available again.
+        assert!(admit_inbound(&limiter).is_some());
+    }
 
     #[test]
     fn self_advertise_addr_prefers_override() {

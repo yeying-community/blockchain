@@ -315,6 +315,7 @@ fn main() {
         "rpc" => cmd_rpc(&args),
         "encode-tx" => cmd_encode_tx(&args),
         "keygen" => cmd_keygen(&args),
+        "encrypt-key" => cmd_encrypt_key(&args),
         "mirror-unbond" => cmd_mirror_unbond(),
         "localnet" => cmd_localnet(),
         "status" => cmd_status(dir_arg(&args)),
@@ -415,7 +416,9 @@ fn usage() {
     eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--fee MICRO] [--nonce N] [--config F]  author+sign a tx offline into a submit-tx file; print its hash; M122: --fee paid to the proposer (default 0), --nonce must equal the author's account nonce (default 0)");
     eprintln!("  node inspect-tx --tx F [--pubkey HEX]  decode a codec-encoded tx file and print its fields + content hash; with --pubkey, also verify the signature (the read-side companion to encode-tx)");
     eprintln!("  node keygen --out F [--seed HEX]  generate (or derive from a 64-hex seed) an ed25519 keypair; write the seed file (for encode-tx --key-file) and print the pubkey");
+    eprintln!("  node keygen ... --new-mnemonic [--encrypt]  M169/M175: generate a fresh BIP-39 mnemonic; --encrypt (M175) writes an encrypted Web3SS keystore to --out (prompts for a password) instead of a plaintext seed file");
     eprintln!("  node keygen ... --genesis-id N [--balance MICRO] [--power P]  also print a ready-to-paste genesis [[accounts]] (and, with --power, [[validators]]) entry");
+    eprintln!("  node encrypt-key --out F [--passphrase S] [--force]  M175: encrypt an existing seed (64-hex) or BIP-39 mnemonic (read no-echo from the terminal) into a Web3 Secret Storage v3 keystore (scrypt + AES-128-CTR); prompts for an encryption password; the plaintext never touches disk; refuses to overwrite --out unless --force");
     eprintln!("  node pubkey (--key-file F | --seed HEX) [--genesis-id N ...]  derive + print the pubkey for an existing seed WITHOUT writing a file (read-only; pairs with inspect-tx --pubkey)");
     eprintln!("  node localnet           spin up an in-process tokio testnet (4 validators, no sequencer) and show all nodes converge via distributed BFT voting over real sockets");
     eprintln!("  node status --dir DIR   replay the block log and print state");
@@ -3672,9 +3675,26 @@ fn check_config(config_path: &str) -> Result<String, config::ConfigError> {
     let genesis = gcfg.to_genesis()?;
     // Validate the validator key material too (an enabled `[validator]` section) — a bad key
     // should fail the dry-run, not first surface when `run` tries to vote.
+    // M175: for an encrypted keystore we can't decrypt without the operator's
+    // password (and a dry-run shouldn't prompt), so we validate it structurally
+    // — the file must exist and parse as a v3 keystore — without recovering the
+    // key. The seed_hex/mnemonic paths are fully derived as before.
     let role = match cfg.validator.as_ref() {
         Some(vc) if vc.enabled => {
-            vc.keypair()?;
+            if let Some(path) = vc.encrypted_keystore_path.as_deref() {
+                let json = std::fs::read_to_string(path).map_err(|e| {
+                    config::ConfigError::KeystoreDecrypt {
+                        detail: format!("read `{path}`: {e}"),
+                    }
+                })?;
+                zhixing_node::keystore::parse_keystore(&json).map_err(|e| {
+                    config::ConfigError::KeystoreDecrypt {
+                        detail: e.to_string(),
+                    }
+                })?;
+            } else {
+                vc.keypair()?;
+            }
             "validator"
         }
         _ => "follower",
@@ -4050,11 +4070,19 @@ fn cmd_run(config_path: String, args: &[String]) {
 
     // M33: an enabled `[validator]` section makes this node a voting validator;
     // absent or disabled ⇒ a pure follower that syncs + verifies but never votes.
+    // M175: if the validator key is an encrypted keystore, read its password
+    // (no-echo prompt, or `ZHIXING_KEYSTORE_PASSWORD` for unattended boot) and
+    // decrypt; otherwise the seed_hex/mnemonic path needs no password.
     let validator_key = match cfg.validator.as_ref() {
-        Some(vc) if vc.enabled => Some(
-            vc.keypair()
-                .unwrap_or_else(|e| fail_msg("validator key", &e)),
-        ),
+        Some(vc) if vc.enabled => {
+            let kp = if let Some(path) = vc.encrypted_keystore_path.as_deref() {
+                let password = read_keystore_password(path);
+                vc.keypair_with_password(&password)
+            } else {
+                vc.keypair()
+            };
+            Some(kp.unwrap_or_else(|e| fail_msg("validator key", &e)))
+        }
         _ => None,
     };
 
@@ -4584,6 +4612,32 @@ fn cmd_keygen(args: &[String]) {
     };
 
     let (seed_hex, pub_hex) = keygen_derive(seed);
+
+    // M175: `--encrypt` writes an encrypted Web3SS keystore to `--out` instead
+    // of the plaintext seed file. The mnemonic (if any) is still printed to the
+    // terminal so the operator can write it on paper, but the seed never
+    // touches disk unencrypted. The password is prompted (no-echo) and never
+    // stored. `--genesis-id` emission still works (it only needs the pubkey).
+    if args.iter().any(|a| a == "--encrypt") {
+        refuse_overwrite(out_path, args);
+        let password = prompt_new_password();
+        let ks = zhixing_node::keystore::encrypt_seed(&seed, &password)
+            .unwrap_or_else(|e| fail_msg("encrypt keystore", &e.to_string()));
+        let json =
+            zhixing_node::keystore::to_json(&ks).unwrap_or_else(|e| fail_msg("keystore json", &e));
+        write_key_file(out_path, &json).unwrap_or_else(|e| fail("write keystore", e));
+        println!("pubkey {pub_hex}");
+        println!("keystore {out_path}");
+        if !mnemonic_text.is_empty() {
+            println!("mnemonic: {mnemonic_text}");
+        }
+        println!("Store the password securely; it is NOT in the keystore file.");
+        if let Some(entries) = keygen_genesis_entries(args, &pub_hex) {
+            print!("{entries}");
+        }
+        return;
+    }
+
     // M169: stamp the mnemonic + passphrase as `# ` comment lines above the
     // seed hex. `encode-tx --key-file` and `decode_seed` both skip
     // non-hex-prefixed lines and the trailing newline, so the file is
@@ -4613,6 +4667,102 @@ fn cmd_keygen(args: &[String]) {
     if let Some(entries) = keygen_genesis_entries(args, &pub_hex) {
         print!("{entries}");
     }
+}
+
+/// M175: encrypt an existing key (plaintext seed-hex or BIP-39 mnemonic) into a
+/// Web3 Secret Storage v3 keystore. Interactive: reads the secret and a new
+/// password from the terminal (no-echo for the password). The plaintext is
+/// never written to disk. Use this to migrate a legacy `seed_hex = "..."` /
+/// `mnemonic = "..."` config to an encrypted `encrypted_keystore_path`.
+///
+/// Flags: `--out <path>` (default `./keystore.json`, refuses to overwrite an
+/// existing file unless `--force`), optional `--passphrase` for a BIP-39 25th
+/// word when the input is a mnemonic.
+fn cmd_encrypt_key(args: &[String]) {
+    let out_path = opt_arg(args, "--out").unwrap_or("keystore.json");
+    refuse_overwrite(out_path, args);
+
+    // Read the secret (seed-hex or mnemonic) from the terminal with NO echo —
+    // this is the exact key material the keystore exists to protect, so it must
+    // not land in terminal scrollback / tmux history / a screen recording.
+    // `rpassword` reads from /dev/tty without echoing.
+    let line = rpassword::prompt_password(
+        "Enter seed (64-char hex) or BIP-39 mnemonic (12/15/18/21/24 words): ",
+    )
+    .unwrap_or_else(|e| fail("read secret", e));
+    let input = line.trim();
+    if input.is_empty() {
+        fail_msg("encrypt-key", "no secret provided");
+    }
+
+    // A 64-char lowercase-hex string is a raw seed; anything else is treated as
+    // a mnemonic phrase (which must then validate under BIP-39).
+    let seed = if input.len() == 64 && input.bytes().all(|b| b.is_ascii_hexdigit()) {
+        config::decode_seed(input, "seed").unwrap_or_else(|e| fail_msg("decode seed", &e))
+    } else {
+        zhixing_node::crypto::validate_mnemonic(input)
+            .unwrap_or_else(|e| fail_msg("mnemonic validate", &e.to_string()));
+        let passphrase = opt_arg(args, "--passphrase").unwrap_or_default();
+        let mut s = [0u8; 32];
+        zhixing_node::crypto::mnemonic_to_seed(input, passphrase, &mut s)
+            .unwrap_or_else(|e| fail_msg("mnemonic derive", &e.to_string()));
+        s
+    };
+
+    let password = prompt_new_password();
+    let ks = zhixing_node::keystore::encrypt_seed(&seed, &password)
+        .unwrap_or_else(|e| fail_msg("encrypt keystore", &e.to_string()));
+    let json =
+        zhixing_node::keystore::to_json(&ks).unwrap_or_else(|e| fail_msg("keystore json", &e));
+    write_key_file(out_path, &json).unwrap_or_else(|e| fail("write keystore", e));
+
+    let (_, pub_hex) = keygen_derive(seed);
+    println!("pubkey {pub_hex}");
+    println!("keystore {out_path}");
+    println!("Store the password securely; it is NOT in the keystore file.");
+}
+
+/// M175: refuse to clobber an existing output file unless `--force` is given.
+/// A validator keystore (or seed) is irrecoverable once truncated, so the key
+/// tools treat an existing `--out` path as a stop rather than overwriting it.
+fn refuse_overwrite(path: &str, args: &[String]) {
+    if std::path::Path::new(path).exists() && !args.iter().any(|a| a == "--force") {
+        fail_msg(
+            "output",
+            &format!("`{path}` already exists (pass --force to overwrite)"),
+        );
+    }
+}
+
+/// M175: prompt for a new password twice (no-echo) and require the two entries
+/// to match. Used by `encrypt-key` and `keygen --encrypt`. Exits on mismatch.
+fn prompt_new_password() -> String {
+    let pw = rpassword::prompt_password("Enter encryption password: ")
+        .unwrap_or_else(|e| fail("read password", e));
+    if pw.is_empty() {
+        fail_msg("password", "empty password is not allowed");
+    }
+    let confirm = rpassword::prompt_password("Confirm password: ")
+        .unwrap_or_else(|e| fail("read password", e));
+    if pw != confirm {
+        fail_msg("password", "passwords do not match");
+    }
+    pw
+}
+
+/// M175: prompt once (no-echo) for an existing keystore's decryption password.
+/// Falls back to the `ZHIXING_KEYSTORE_PASSWORD` environment variable when set
+/// (systemd `EnvironmentFile` / CI), so an unattended daemon need not have a
+/// TTY. The env-var path trades `/proc/<pid>/environ` exposure for automation;
+/// interactive operators should prefer the prompt.
+fn read_keystore_password(path: &str) -> String {
+    if let Ok(pw) = std::env::var("ZHIXING_KEYSTORE_PASSWORD") {
+        if !pw.is_empty() {
+            return pw;
+        }
+    }
+    rpassword::prompt_password(format!("Enter keystore password for {path}: "))
+        .unwrap_or_else(|e| fail("read keystore password", e))
 }
 
 /// End-to-end showcase on the production path: launch a small tokio testnet
@@ -5939,6 +6089,71 @@ mod tests {
             write_check_config_fixture("validator", &valid_genesis_body(&pub_hex), &vsec);
         let summary = check_config(&cpath).expect("valid validator config");
         assert!(summary.contains("\nrole validator\n"), "{summary}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_config_validates_encrypted_keystore_without_password() {
+        // M175: a `[validator]` pointing at an encrypted keystore is validated
+        // *structurally* by the dry-run — the file must exist and parse as a v3
+        // keystore — without decrypting (no password prompt in a dry-run). We
+        // generate a real keystore for the genesis validator's seed, point the
+        // config at it, and confirm the dry-run reports role "validator".
+        let seed = seed_for(1);
+        let (_seed_hex, pub_hex) = keygen_derive(seed);
+        let ks = zhixing_node::keystore::encrypt_seed(&seed, "dry-run-pw").unwrap();
+        let json = zhixing_node::keystore::to_json(&ks).unwrap();
+
+        let (cpath, dir) = write_check_config_fixture(
+            "ks-valid",
+            &valid_genesis_body(&pub_hex),
+            // placeholder; we rewrite the config below once we know the dir.
+            "",
+        );
+        let ks_path = dir.join("keystore.json");
+        std::fs::write(&ks_path, &json).unwrap();
+        // Rewrite node.toml to add the keystore validator section now that the
+        // keystore file exists at a known path.
+        let gpath = dir.join("genesis.toml");
+        let cfg = format!(
+            "genesis = \"{}\"\n[node]\nid = 1\nlisten = \"127.0.0.1:9021\"\ndata_dir = \"{}/data\"\n\
+             [validator]\nenabled = true\nencrypted_keystore_path = \"{}\"\n",
+            gpath.to_str().unwrap(),
+            dir.to_str().unwrap(),
+            ks_path.to_str().unwrap(),
+        );
+        std::fs::write(&cpath, cfg).unwrap();
+
+        let summary = check_config(&cpath).expect("keystore config validates structurally");
+        assert!(summary.contains("\nrole validator\n"), "{summary}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_config_surfaces_corrupt_keystore() {
+        // M175: a keystore file that is not valid v3 JSON ⇒ the dry-run returns
+        // an Err (KeystoreDecrypt) rather than silently passing.
+        let (_seed_hex, pub_hex) = keygen_derive(seed_for(1));
+        let (cpath, dir) =
+            write_check_config_fixture("ks-corrupt", &valid_genesis_body(&pub_hex), "");
+        let ks_path = dir.join("keystore.json");
+        std::fs::write(&ks_path, "{ not a keystore }").unwrap();
+        let gpath = dir.join("genesis.toml");
+        let cfg = format!(
+            "genesis = \"{}\"\n[node]\nid = 1\nlisten = \"127.0.0.1:9021\"\ndata_dir = \"{}/data\"\n\
+             [validator]\nenabled = true\nencrypted_keystore_path = \"{}\"\n",
+            gpath.to_str().unwrap(),
+            dir.to_str().unwrap(),
+            ks_path.to_str().unwrap(),
+        );
+        std::fs::write(&cpath, cfg).unwrap();
+        assert!(
+            matches!(
+                check_config(&cpath),
+                Err(config::ConfigError::KeystoreDecrypt { .. })
+            ),
+            "corrupt keystore must fail the dry-run"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -28,6 +28,7 @@ cargo run --release --bin node -- localnet         # M33：进程内 tokio 测�
 cargo run --release --bin node -- run  --config F  # M33：联网 tokio 守护进程（TCP P2P gossip + 分布式 BFT 投票）
 cargo run --release --bin node -- submit-tx --config F --tx F  # M53：向运行中守护进程的 [rpc] 入口提交 codec 编码交易
 cargo run --release --bin node -- encode-tx --key-file F --out F --author N …  # M56：离线装配+签名一条交易到 submit-tx 文件
+cargo run --release --bin node -- encrypt-key --out F              # M175：把现有 seed/助记词加密成 Web3SS v3 keystore（scrypt+AES-128-CTR，交互式输入密码）
 cargo run --release --bin node -- status --dir DIR # 重放区块日志并打印状态
 cargo test --release                               # 421 项单元测试（见下）
 ```
@@ -1392,6 +1393,85 @@ M165 保留 3 端点（`/unbonding`/`/stake-ops`/`/evidence`）为 `next=` 是�
 - **不碰** 共识/codec/wire（`UnbondingEntry::hash` 纯本地）/分页基础原语；localnet 头仍 wire v1 `a045426e…3b87bc`。
 - **测试（+1 → 631）**：新 `unbonding_entry_hash_is_stable_and_collision_safe`（4 断言：clone 等、改任一字段 hash 不同、32 字节长）；扩展 `rpc_unbonding_list_over_tcp`/`rpc_stake_ops_list_over_tcp`/`rpc_evidence_list_over_tcp` in-process 测改 `next`→`cursor`。
 - **已知边界**：`UnbondingEntry` 字段顺序（account/amount/mature_height）+ LE 字节序 = hash 格式的隐性契约；改字段顺序或加字段 = 改 hash 格式 = 旧 cursor 解析失败（文档说明）。`encode_unbonding` 真正的 codec 入口（若未来要把 UnbondingEntry 入 wire/快照/跨链）属后续篮子。
+
+## 持久化加密-only TLS 证书（Milestone 178）
+
+审计前预备。生产就绪度评估标记过：P2P / metrics / RPC 三处的 TLS 都是临时自签证书，每次重启经 `rcgen` 现生成一张新的，指纹每次都变——运维没法固定证书指纹（trust-on-first-use 每次重启就断）。
+
+- **范围**：只针对**加密-only** TLS（`enable_tls` 不带 `require_peer_certs`）。genesis-pinned mTLS（`require_peer_certs`）的证书本就从验证人 seed 确定性派生、天生持久，不在本轮。
+- **`load_or_create_encrypt_only_tls_setup(cert_path, key_path)`**（`daemon.rs`）：两文件都在 → 加载；否则生成一次 → 写盘（证书普通权限、私钥 `write_private_der` 走 `0600`）→ 用。存 **DER**（正是 rustls 消费的字节形，也是指纹计算的字节形），所以加载只是 `fs::read` → `CertificateDer` / `PrivateKeyDer`，**无需 PEM 解析、不引新 dep**。
+- **重构**：抽出共享尾 `encrypt_only_setup_from_der(cert_der, key_der)`（幂等装 ring crypto provider + 建 accept-any server/client config）。临时路径 `build_encrypt_only_tls_setup`（现生成）与持久路径都调它，零行为分叉。
+- **配置**：`NetworkConfig` 加 `tls_cert_path` / `tls_key_path`（`Option<String>`，`#[serde(default)]`）。`validate` 强制**成对或都无**（单边设置 → `BadNetwork`，因为单证书或单密钥既无法加载也无法连贯写）。新 `tls_persist_paths()` 取出 `(cert, key)` 对。
+- **接线**：三处 acceptor——P2P 加密-only（`Node::start` 的 `match (mtls, persist_paths)`：仅在非 mTLS 且配置了路径时走持久）、metrics、RPC（经 `encrypt_only_acceptor` 闭包），以及 light 节点（永远加密-only）——配置了就持久、否则临时。**一张持久证书供三处共用**，运维只需 pin 一个指纹。
+- **向后兼容**：默认 unset ⇒ 逐字节保持 pre-M178 临时证书行为。私钥 `0600` 写盘逻辑在 daemon 内自带（`write_private_der`，不跨模块依赖 `main.rs` 的 `write_key_file`）。
+- **测试（+2 → 676）**：`persistent_tls_cert_is_generated_then_reused`（`daemon.rs`——首调文件不存在 ⇒ 生成+写盘；再调 ⇒ 加载不重生成（cert/key 字节逐一不变，即指纹跨重启稳定）；Unix 下私钥 `0600`。确定性、不碰 socket 故无端口冲突 flaky）+ `tls_persist_paths_are_both_or_neither`（`config.rs`——默认 None 合法、成对合法、单边 `BadNetwork`）。既有 metrics/RPC TLS 集成测走共享代码的临时分支、全绿即证重构无回归。
+- **已知边界**：加密-only TLS 仍是 accept-any-cert（M41 本就无 PKI、不校验服务端身份）——持久化只是稳定指纹供带外 pin，**不改变"加密-only 不认证对端"的语义**（对端认证仍归 `require_peer_auth` / mTLS）；证书不做到期 / 轮换调度（自签长期有效，轮换 = 删文件重启重生成）；存 DER 而非 PEM（运维取指纹：`openssl x509 -inform DER -in cert.der -fingerprint -sha256`），PEM 便利性属后续可选项；metrics/RPC 与 P2P 共用同一对路径（一个指纹），若要分端点独立证书属后续项。
+
+## 监听端连接数上限（Milestone 177 · 预认证 DoS 硬化）
+
+审计前预备。我自己的生产就绪度评估标记过：三条 accept 循环——P2P `run_listener`、以及启用时的 metrics / RPC 端点——对每个被 `accept` 的连接无条件 `tokio::spawn` 一个处理任务，**无并发上限**。P2P 层 `require_peer_auth` 默认关闭，所以一个不持任何密钥的攻击者狂开连接就能耗尽文件描述符 / 内存。
+
+- **机制**：每条 accept 循环持一个 `tokio::sync::Semaphore(max)`。新 helper `admit_inbound` 在 `accept` 后做 `try_acquire_owned`：
+  - 拿到 `OwnedSemaphorePermit` → 把它 move 进 spawn 的任务（连接活着就占着，任务结束 drop 释放槽位），再处理连接；
+  - 到上限（`try_acquire_owned` 失败）→ **立即 `drop(stream)` 关掉新连接并继续 accept**，不堆积任务。
+  非阻塞：满了就拒，不排队，所以连接洪水无法把任务数 / 内存推到无界。
+- **配置**：`NetworkConfig` 加 `max_inbound_connections: usize`，`#[serde(default = ...)]` = **256**（对任何真实验证人网够用——入站受 peer 数约束；对滥用够紧）。每条监听器各自计数。`NetworkConfig::validate()` 拒 0（否则 accept-then-drop 永久停摆），`load_node_config` 调用之；新 `ConfigError::BadNetwork`。
+- **向后兼容**：旧 `[network]` 段缺该键 ⇒ serde 填 256，既有配置原样工作。localnet / 既有 daemon 测试每节点只有 ≤ 几条入站，远低于上限，故行为不变（全套 socket 集成测绿即证三条循环接线正确）。
+- **不引新 dep**：`tokio` 已含 `sync` feature（`Semaphore`/`OwnedSemaphorePermit`）。
+- **测试（+2 → 674）**：`admit_inbound_enforces_the_concurrency_cap`（`daemon.rs`——恰发 `cap` 个 permit、满后 `None`、drop 一个释放槽位、再满再拒的确定性单元测；不碰 socket 故无端口冲突 flaky 风险，这也是刻意的——现有套件已有硬编码端口冲突的偶发 flaky）+ `max_inbound_connections_defaults_parses_and_validates`（`config.rs`——缺键回落 256、显式值解析、0 被 `BadNetwork` 拒）。
+- **已知边界**：只做**并发连接数**上限（最根本的稳态资源界），**未做 accept 速率**（每秒新连接）令牌桶——并发上限已封顶资源，被拒连接立即关闭成本极低，速率桶属可选精化；metrics/RPC 与 P2P 共用同一 `max_inbound_connections`（运维端点连接数远小于该值，无碍），若要为运维端点单设更小上限属后续项；单个已认证 peer 内部的消息层限速（M161/M162 的 mempool tx 限速）是另一层，本轮不动。
+
+## 修复 `consumed_unbonds` 的跨链重放防护漏洞（Milestone 176 · 潜在共识分叉）
+
+M175 之后继续审计前预备。M171/M172 引入的 `BridgeSource.consumed_unbonds`（跨链 unbonding 镜像的重放去重集，M173 起类型是 `BTreeSet<(source_height, index)>`）**既不进 `state_root`、也不进 snapshot codec**（decode 侧写死空集）。这比先前记的"重启后重放窗口重开"严重——是一个**潜在共识分叉**：
+
+- `apply_bridge_unbond`（`lib.rs`）用 `consumed_unbonds` **决定区块有效性**：遇到 `(source_height, index)` 已在集合里的重放 `BridgeUnbond` 就返回 `BridgeUnbondReplay`，令整块无效回滚。
+- 但该集合不在 `state_root` 里 ⇒ 持有该对的**全量重放节点**会拒绝这个重放区块，而丢了该集合的 **snapshot-同步节点**会接受它。两者 `state_root` 相同、却对同一区块的有效性分歧 ⇒ 分叉。
+
+**三处修复**：
+1. **`state_root`**（`lib.rs`）：在 `bridge_sources` 循环里折入 `consumed_unbonds`——`u64(len)` + 每个 `(height, index)` 两个 `u64`。`BTreeSet` 有序迭代保证字节规范。这把它从"本地簿记"升为共识关键状态，分叉不再可能（两节点集合不同 ⇒ `state_root` 不同 ⇒ 承诺检查/证书复验会抓到）。
+2. **snapshot**（`codec.rs`）：`encode_snapshot` 持久化该集合，`decode_snapshot` 读回。snapshot-同步节点遂恢复与全量节点一致的集合。
+3. **`SNAPSHOT_VERSION` 1 → 2**：字节布局变了，严格版本校验拒收 v1 旧 snapshot（`BadEnum`），运维须重新 snap——pre-production，snapshot 本就可弃。
+
+**head 中性**：`state_root` 的新增字节只在有 `bridge_sources` 的链上出现（`demo`/`localnet`/除桥接测试外的全部测试都 `bridge_sources: vec![]`，循环体不执行）。故 localnet 头不动、全套既有测试绿即为证。**M134 `verify_snapshot_against_header` 自动获益**——它比对 decode 后重算的 `state_root` 与 header 的 `state_root`，现在二者都含 `consumed_unbonds`，所以一个丢了该集合的 snapshot 会 `state_root` 不符而被拒（正是我们要的安全性质）。
+
+- **测试（+2 → 672）**：`snapshot_round_trips_consumed_unbonds`（构造带非空 `consumed`+`consumed_unbonds` 的 `BridgeSource`，encode→decode 完整保真 + 再编码稳定）+ `state_root_covers_consumed_unbonds`（只往该集合加一个 `(height, index)` 就使 `state_root` 变化——钉死共识关键性）。既有 `snapshot_rejects_bad_version_and_trailing_bytes`（用 version=999）仍有效。
+- **已知边界 / 文档观察**：实测 localnet 头已是 `1215aa75…566e86`，而 README 多条里程碑仍写 wire-v1 的 `a045426e…3b87bc`——这是 **M171 B3 wire bump**（新增 block 字段 `bridge_unbondings` + 头部承诺槽）合法移头但未在文档改写新值的遗留，**非 M176 回归**（已 stash 对比 M175 提交态，同为 `1215aa75`，确认 M176 head 中性）；修正那些陈旧的头值字符串属后续文档清理。`consumed`（BridgeRedeem 的 lock_id 去重集）从 M31 起就正确进了 `state_root` 与 snapshot——只有 M171 新加的 `consumed_unbonds` 漏了，本轮补齐。
+
+## 加密验证人 keystore（Milestone 175 · Web3 Secret Storage v3）
+
+审计前预备的第一项。在此之前，验证人私钥只有明文形态：配置里的 `seed_hex = "..."` 或 `mnemonic = "..."`，或 `keygen` 写出的明文 seed 文件。对主网验证人这不可接受。M175 加一条**可选**的加密路径，不动既有明文路径（向后兼容）。
+
+- **格式**：以太坊 Web3 Secret Storage **v3** 的子集（Geth/Parity keystore JSON）。`scrypt`(N=2^18, r=8, p=1, dklen=32) 从密码派生 32 字节；前 16 字节是 AES-128-CTR 密钥，后 16 字节与密文拼接后过 Keccak-256 得 MAC。唯一偏离标准的是 plaintext——这里是 32 字节 ed25519 seed（`Keypair::from_seed` 的输入），而非 secp256k1 私钥。**刻意不自创格式**：外部审计机构已审过这套 KDF/MAC/参数无数遍，复用它直接缩小审计面。
+  ```json
+  {"crypto":{"kdf":"scrypt","kdfparams":{"dklen":32,"n":262144,"r":8,"p":1,"salt":"<hex>"},
+   "cipher":"aes-128-ctr","cipherparams":{"iv":"<hex>"},"ciphertext":"<hex>","mac":"<hex>"},
+   "id":"<uuid-v4>","version":3}
+  ```
+- **`src/keystore.rs`**（新模块，把全部密码学集中一处便于审计专项 review）：
+  - `encrypt_seed(&[u8;32], password) -> EncryptedKeystore`：随机 salt/iv/id（`getrandom`），scrypt 派生，AES-128-CTR 加密，Keccak-256 MAC。
+  - `decrypt_seed(json, password) -> [u8;32]`：**先验 MAC 再解密**——错密码与篡改 ciphertext 都返回 `MacMismatch`，两种情况刻意不可区分，且永不吐出密钥材料。MAC 用常量时间比较。
+  - `parse_keystore(json)`：只做结构/schema/hex/参数校验，**不解密**（供 `check-config` dry-run 用，不需要密码）。
+  - `to_json`：pretty JSON。UUID `id` 由 16 字节 `getrandom` 手工格式化（版本/变体 nibble 置位），**不引 `uuid` crate**。
+- **`src/config.rs`**：`ValidatorKeyConfig` 加 `encrypted_keystore_path: Option<String>`。优先级 keystore > mnemonic > seed_hex。新 `keypair_with_password(password)` 走 keystore 解密；`keypair()`（无密码入口）对 keystore 配置返回 `ConfigError::KeystoreDecrypt` 指向前者（既有 seed_hex/mnemonic 调用点不受影响）。非 keystore 路径两个方法行为逐字节一致（抽出 `seed_from_mnemonic_or_hex`）。
+- **`src/main.rs` CLI**：
+  - `node encrypt-key --out F [--passphrase S] [--force]`：交互式把现有 seed-hex 或 BIP-39 mnemonic 加密成 keystore。**明文也从终端无回显读**（`rpassword`——这正是 keystore 要保护的密钥材料，不能落终端 scrollback），密码无回显 + 二次确认，plaintext 永不落盘；`--out` 存在即拒绝覆盖（除非 `--force`）。用于把 legacy 明文配置迁移到 `encrypted_keystore_path`。
+  - `node keygen --new-mnemonic --encrypt [--force]`：一步生成助记词 + 加密 keystore（助记词仍打印到终端供抄写，seed 不以明文落盘）；同样拒绝覆盖已存在的 `--out`。
+  - `node run`：keystore 配置下启动时无回显提示密码，或读 `ZHIXING_KEYSTORE_PASSWORD` 环境变量（systemd `EnvironmentFile`/CI 无人值守用）。密码永不写入配置文件或磁盘。
+  - `node check-config`：对 keystore 配置做结构校验（文件存在 + 解析为 v3 + scrypt 参数边界）而不解密——dry-run 不该提示密码。
+- **scrypt 成本上界**（防被篡改的 keystore 做资源耗尽）：`validate_scrypt_cost` 对文件里的 `(n, r, p)` 设天花板——`128·N·r ≤ 1 GiB` 工作内存、`r ≥ 1`、`p ∈ [1, 16]`。没有这个上界，一个能写配置目录的攻击者把 keystore 的 `n` 改成 2^40（仍是合法的 2 的幂）就能让 `node run` 在 scrypt KDF 处 OOM；现在 dry-run 与 decrypt 都在**任何 KDF 工作之前**拒绝。标准 Web3SS profile（N=2^18, r=8 ⇒ 256 MiB）舒适落在界内。
+- **依赖**：新增 `scrypt`/`aes`/`ctr`/`sha3`/`serde_json`/`rpassword`，全部与既有 `sha2`/`hmac`/`pbkdf2` 同代（`digest 0.10`/`cipher 0.4`），无第二代 trait 进依赖树；`serde_json` 原已经 `tracing-subscriber` 间接在树里。`rpassword` 保证密码（及导入时的明文密钥）无回显——一个会把密钥/密码回显到终端的工具本身就是审计发现。
+- **测试（+17 → 670）**：`keystore.rs` 11（往返；错密码 `MacMismatch`；篡改 ciphertext；不支持的 version/kdf/cipher；Web3SS schema 形状 + UUID 形状；`checked_log_n` 幂次校验；运维手工上调 `n` 后仍能解密——证明读的是文件参数而非编译常量；同 seed+密码两次加密得不同 salt/密文但都能解回；**MAC 哈希是 Keccak-256 而非 SHA3-256**——用空输入 KAT `c5d2…a470` 钉死，防静默 interop 破坏，这是 round-trip 自洽测试抓不到的；scrypt 成本边界强制；资源耗尽型 keystore 端到端被拒）+ `config.rs` 4（keystore 需密码；配置经真实 keystore 文件往返 + 错密码失败；keystore 优先级压过 seed_hex；无 keystore 时 `keypair_with_password` 回落 seed_hex）+ `main.rs` 2（check-config 结构校验真实 keystore 报 role validator；损坏 keystore 报 `KeystoreDecrypt`）。对照 Ethereum 官方 Web3SS scrypt 整体 KAT（解密其发布的 keystore JSON → 32 字节私钥）作为后续补项——仅因本构建环境无网络取不到那串精确密文/mac 字节而顺延；构造按 Web3SS 规范逐字段对齐（AES 密钥 = DK[0..16]，MAC = Keccak256(DK[16..32] ‖ ciphertext)，AES-128-CTR 128-bit 大端计数器），Keccak + round-trip 测试已覆盖原语与自洽性。
+- **已知边界**：`N=2^18` 是 Web3SS 2017 基线（为审计对齐而非最强；keystore 是明文 JSON，运维可在成本上界内手工上调 `n`，代码读文件的 `n` 而非编译常量——已测）；只加密 seed 不加密 mnemonic（seed 推导确定性，加密 seed 足够且与 `seed_hex` 路径统一）；交互式密码提示需 TTY（`rpassword` 读 `/dev/tty`），自动化走 `ZHIXING_KEYSTORE_PASSWORD`（以 `/proc/<pid>/environ` 暴露换无人值守，交互式运维应优先提示）；plaintext 保护的是**静态密钥**（被盗的配置目录/备份/笔记本），不保护运行中进程内存；解密后的 seed 与密码**未 zeroize**——模块头显式声明不保护运行时内存，且 ed25519-dalek 的 `SigningKey` 本身也未 zeroize-wrap，部分 zeroize 只给假保证，故保持诚实声明留作后续；强度取决于密码（建议 ≥20 字符随机）。**不**做密钥轮换（M176 候选）、HSM/KMS 集成、多 keystore slot——属后续篮子。
+
+## 修复 `dec_validator_set_inline` 未校验长度的远程可触发崩溃（Milestone 174）
+
+生产就绪度评估的副产物——评估过程中在代码里找到一个真实可远程触发的漏洞，当场修复，不是提前规划的里程碑。
+
+- **漏洞**：`BridgeHeader.next_set` 的解码（`codec.rs` 的 `dec_validator_set_inline`）是唯一一处**内联**验证人集解码，与所有其余长度前缀列表都走 `Dec::count()`（有 `MAX_ITEMS = 1_000_000` 上限）不同——它直接 `let n = d.u32()? as usize` 读裸长度，立即 `Vec::with_capacity(n)`。一个伪造的、接近 `u32::MAX`（约 42.9 亿）的长度字段会让节点尝试为 `Validator`（48 字节/条）预留超百 GB 内存；Rust 的全局分配器在这类规模的分配失败上是**直接中止进程**（`abort`），不是可以 `catch_unwind` 的 panic——也不会先检查缓冲区剩余字节是否真的够多就先尝试分配。
+- **可达性**：`decode_block` → `dec_bridge_header` → `dec_validator_set_inline`，经 `GossipMsg::Blocks` 到达。`[network] require_peer_auth` 默认 `false`（`NetworkConfig::default()`），即一个只走 cleartext hello、**不持有任何验证人密钥**的对端，发一条精心构造的 `Blocks` 消息即可让任意节点进程中止——是一个真实的预认证 DoS，不需要先通过认证或拿到签名权。
+- **修复**：`dec_validator_set_inline` 读出裸 `u32` 后立即对 `MAX_ITEMS` 校验，超限返回 `CodecError::TooManyItems`，再分配——与其余所有列表解码的纪律看齐。不改 wire 格式（校验在解码端新增，编码端字节不变），对任何诚实对端零影响。
+- **测试（+1 → 653）**：`bridge_header_rejects_forged_next_set_count`（`codec.rs`）用真实编码的 `BridgeHeader` 定位 inline count 字段的字节偏移，覆写为 `u32::MAX`，断言在任何分配尝试之前即被 `TooManyItems(u32::MAX as u64)` 拒绝。
 
 ## `merkle::Proof` 加 authenticated `key`（Milestone 173）
 

@@ -715,7 +715,11 @@ fn enc_validator_set_inline(e: &mut Enc, vs: &crate::validator::ValidatorSet) {
 }
 
 fn dec_validator_set_inline(d: &mut Dec) -> Result<crate::validator::ValidatorSet, CodecError> {
-    let n = d.u32()? as usize;
+    let n_raw = d.u32()?;
+    if n_raw as u64 > MAX_ITEMS {
+        return Err(CodecError::TooManyItems(n_raw as u64));
+    }
+    let n = n_raw as usize;
     let mut vs = Vec::with_capacity(n);
     for _ in 0..n {
         let len = d.u32()? as usize;
@@ -1182,7 +1186,15 @@ pub fn decode_account(buf: &[u8]) -> Result<Account, CodecError> {
 // excludes them, so decode reproduces a *byte-identical* `ChainState`.
 
 /// Current snapshot wire version. Bumped if the layout ever changes.
-pub const SNAPSHOT_VERSION: u32 = 1;
+///
+/// v2 (M176): each `BridgeSource` now also serializes `consumed_unbonds` (the
+/// cross-chain unbonding replay-dedup set). v1 dropped it on decode, which —
+/// once that set became consensus-critical (folded into `state_root`) — would
+/// let a snapshot-synced node diverge from a full-replay node on a replayed
+/// `BridgeUnbond`. A v1 snapshot is now rejected (strict version check), so an
+/// operator must regenerate; this is pre-production and snapshots are
+/// disposable.
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 /// Write the account's state fields into the shared stream (same layout as
 /// [`encode_account`], inlined so the snapshot controls framing).
@@ -1322,6 +1334,14 @@ pub fn encode_snapshot(s: &ChainState) -> Vec<u8> {
         for c in &src.consumed {
             e.u64(*c);
         }
+        // M176 (snapshot v2): persist the unbonding replay-dedup set too, so a
+        // snapshot-synced node recovers the same consensus-critical state a
+        // full-replay node holds. BTreeSet iterates sorted ⇒ canonical bytes.
+        e.u64(src.consumed_unbonds.len() as u64);
+        for (height, index) in &src.consumed_unbonds {
+            e.u64(*height);
+            e.u64(*index);
+        }
     }
     e.0
 }
@@ -1433,6 +1453,15 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
         for _ in 0..cn {
             consumed.insert(d.u64()?);
         }
+        // M176 (snapshot v2): the unbonding replay-dedup set, as `(source_height,
+        // index)` pairs.
+        let un = d.count()?;
+        let mut consumed_unbonds = std::collections::BTreeSet::new();
+        for _ in 0..un {
+            let height = d.u64()?;
+            let index = d.u64()?;
+            consumed_unbonds.insert((height, index));
+        }
         bridge_sources.insert(
             chain,
             BridgeSource {
@@ -1440,7 +1469,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
                 head,
                 height: src_height,
                 consumed,
-                consumed_unbonds: std::collections::BTreeSet::new(),
+                consumed_unbonds,
             },
         );
     }
@@ -3257,6 +3286,44 @@ mod tests {
         ));
     }
 
+    /// M173 hardening: `next_set`'s inline count is a raw on-wire `u32`
+    /// (unlike every other length-prefixed list, which goes through
+    /// `Dec::count()`'s `MAX_ITEMS` cap). Before this fix a forged count near
+    /// `u32::MAX` reached `Vec::with_capacity` uncapped — a single malicious
+    /// `BridgeHeader` (reachable from an unauthenticated gossiped `Blocks`
+    /// message, since `require_peer_auth` defaults off) could abort the
+    /// process via an attempted allocation of `u32::MAX` `Validator` structs
+    /// (well over 100 GB), well before any further bytes are even present
+    /// in the buffer. Confirm the forged count is rejected before any
+    /// allocation is attempted (the buffer here is far too short to actually
+    /// hold that many entries, so success would mean a reservation was made
+    /// with no data backing it).
+    #[test]
+    fn bridge_header_rejects_forged_next_set_count() {
+        let b = sample_block();
+        let header = BlockHeader::from_block(&b);
+        let cert = sample_cert(header.hash(), header.height);
+        let op = BridgeHeader {
+            source_chain: [55u8; 32],
+            header,
+            cert,
+            next_set: sample_validator_set(),
+        };
+        let bytes = encode_bridge_header(&op);
+        // The inline validator-set count is the last 4+N*48 bytes; find and
+        // overwrite just the u32 count prefix with a huge forged value,
+        // keeping the (now-truncated, short) rest of the buffer as-is.
+        let real_count = op.next_set.validators().len() as u32;
+        // Each entry is a 4-byte length prefix + a 48-byte `Validator` leaf.
+        let count_pos = bytes.len() - 4 - (real_count as usize) * (4 + 48);
+        let mut forged = bytes[..count_pos].to_vec();
+        forged.extend_from_slice(&(u32::MAX).to_be_bytes());
+        assert!(matches!(
+            decode_bridge_header(&forged),
+            Err(CodecError::TooManyItems(n)) if n == u32::MAX as u64
+        ));
+    }
+
     #[test]
     fn bridge_redeem_round_trip() {
         let b = sample_block();
@@ -3433,5 +3500,72 @@ mod tests {
             decode_snapshot(&extra),
             Err(CodecError::TrailingBytes)
         ));
+    }
+
+    /// M176: build a `ChainState` with a bridge source whose `consumed` and
+    /// `consumed_unbonds` sets are both non-empty.
+    fn state_with_consumed_unbonds() -> ChainState {
+        let mut s = sample_state();
+        let set = ValidatorSet::new(vec![Validator {
+            id: 21,
+            pubkey: crate::Keypair::from_seed([21u8; 32]).public(),
+            power: 1,
+        }]);
+        let mut consumed = std::collections::BTreeSet::new();
+        consumed.insert(7u64);
+        let mut consumed_unbonds = std::collections::BTreeSet::new();
+        consumed_unbonds.insert((3u64, 0u64));
+        consumed_unbonds.insert((3u64, 1u64));
+        consumed_unbonds.insert((9u64, 0u64));
+        s.bridge_sources.insert(
+            [0x5a; 32],
+            BridgeSource {
+                set,
+                head: [0x11; 32],
+                height: 9,
+                consumed,
+                consumed_unbonds,
+            },
+        );
+        s
+    }
+
+    #[test]
+    fn snapshot_round_trips_consumed_unbonds() {
+        // M176: the unbonding replay-dedup set survives a snapshot encode→decode
+        // (v1 silently dropped it, which — once the set became consensus-critical
+        // — would let a snapshot-synced node accept a replay a full node rejects).
+        let s = state_with_consumed_unbonds();
+        let bytes = encode_snapshot(&s);
+        let back = decode_snapshot(&bytes).expect("round-trips");
+        let src = back
+            .bridge_sources
+            .get(&[0x5a; 32])
+            .expect("source present");
+        let mut expected = std::collections::BTreeSet::new();
+        expected.insert((3u64, 0u64));
+        expected.insert((3u64, 1u64));
+        expected.insert((9u64, 0u64));
+        assert_eq!(src.consumed_unbonds, expected);
+        assert_eq!(encode_snapshot(&back), bytes, "re-encode stable");
+    }
+
+    #[test]
+    fn state_root_covers_consumed_unbonds() {
+        // M176: `consumed_unbonds` is folded into `state_root`, so two states
+        // differing only in that set produce different roots — the property that
+        // makes a replayed `BridgeUnbond` a consensus (not merely local) matter.
+        let base = state_with_consumed_unbonds();
+        let mut more = base.clone();
+        more.bridge_sources
+            .get_mut(&[0x5a; 32])
+            .unwrap()
+            .consumed_unbonds
+            .insert((12u64, 0u64));
+        assert_ne!(
+            base.state_root(),
+            more.state_root(),
+            "adding a consumed-unbond entry must change state_root"
+        );
     }
 }

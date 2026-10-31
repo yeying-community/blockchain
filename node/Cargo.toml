@@ -45,6 +45,18 @@ path = "src/main.rs"
 # SHA-256), so the head invariant and every persisted hash are unchanged — this
 # is a pure supply-chain hardening, not a protocol change. Node-crate only; the
 # engine does no hashing and stays zero-dep.
+#
+# M175 adds an encrypted validator keystore (Web3 Secret Storage v3 format):
+# `scrypt` (KDF) + `aes`/`ctr` (AES-128-CTR) + `sha3` (Keccak-256 MAC) — all
+# RustCrypto, all pinned to the same `digest 0.10` / `cipher 0.4` generation as
+# the existing `sha2`/`hmac`/`pbkdf2` so no second trait generation enters the
+# tree. `serde_json` (already present transitively via tracing-subscriber) is
+# promoted to a direct dep to parse/emit the keystore JSON — hand-rolling a JSON
+# *parser* for key material would be irresponsible. The UUID `id` field is
+# formatted by hand from `getrandom` bytes, so no `uuid` crate is pulled.
+# A no-echo password prompt (`rpassword`) reads the keystore password from the
+# terminal; the password is never written to disk or the config file.
+# Node-crate only; engine stays zero-dep.
 [dependencies]
 zhixing-engine = { path = "../engine" }
 ed25519-dalek = "2"
@@ -63,6 +75,17 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
+# M175: encrypted validator keystore (Web3 Secret Storage v3). All RustCrypto,
+# same digest/cipher generation as sha2/hmac/pbkdf2 above (no second trait gen).
+scrypt = { version = "0.11", default-features = false }
+aes = "0.8"
+ctr = "0.9"
+sha3 = "0.10"
+serde_json = "1"
+# M175: no-echo password prompt for the keystore (a password tool that echoes
+# to the terminal would itself be an audit finding). Tiny, widely used; its
+# transitive deps (libc / windows-sys) are already in the tree.
+rpassword = "7"
 
 [profile.release]
 lto = true
