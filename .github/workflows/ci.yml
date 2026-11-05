@@ -1,0 +1,122 @@
+name: CI
+
+# M189 (production-readiness #3): fmt / test gates + cross-arch determinism +
+# dependency audit. The `engine/` and `node/` crates are standalone (no workspace),
+# so each step runs in both directories.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings # deny compiler warnings (not clippy lints — see the clippy step)
+
+jobs:
+  test:
+    name: fmt + clippy + test (${{ matrix.os }})
+    # ubuntu-latest = x86_64, macos-latest = arm64. Running the full suite on both
+    # validates the M188 float-determinism bit-anchors across architectures: the
+    # `*_is_bit_deterministic` tests pin libm's exp/pow bit patterns, so a cross-arch
+    # divergence (the consensus-fork risk) would fail CI here.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + rustfmt + clippy)
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt clippy
+          rustup default stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/target
+            node/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: rustfmt --check (gate)
+        run: |
+          (cd engine && cargo fmt --check)
+          (cd node && cargo fmt --check)
+
+      - name: clippy (gate — denies warnings)
+        # M191 cleared the lint backlog (autofix + a few justified `#[allow]`s), so
+        # clippy is now a hard gate. Run with `--all-targets` so test code is linted too.
+        run: |
+          (cd engine && cargo clippy --release --all-targets -- -D warnings)
+          (cd node && cargo clippy --release --all-targets -- -D warnings)
+
+      - name: test (gate) — single-threaded to avoid RPC port collisions
+        run: |
+          (cd engine && cargo test --release)
+          (cd node && cargo test --release -- --test-threads=1)
+
+  audit:
+    name: cargo-audit (dependency advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: audit engine + node (gate)
+        # SEC-07: promoted from advisory to a hard gate after the P0 audit cleared the
+        # flagged RUSTSEC advisories (rustls >= 0.23.46, rustls-webpki >= 0.103.16,
+        # tokio 1.54.x). A newly-published advisory will now fail CI — triage it
+        # (upgrade, or document a reviewed mitigation) rather than re-adding
+        # `continue-on-error`.
+        run: |
+          (cd engine && cargo audit)
+          (cd node && cargo audit)
+
+  fuzz:
+    name: cargo-fuzz smoke (codec decoders)
+    runs-on: ubuntu-latest
+    # M213: a short, time-boxed libFuzzer run over the committed seed corpus — catches a
+    # decoder that panics/OOMs on adversarial bytes before it reaches `main`. Advisory
+    # (nightly + fuzzing are both less stable than the gates above); promote to a hard
+    # gate once the corpus + target have proven steady. A found crash still surfaces here.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (nightly — libFuzzer needs it)
+        run: |
+          rustup toolchain install nightly --profile minimal
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            node/fuzz/target
+          key: ${{ runner.os }}-fuzz-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-fuzz-
+      - name: fuzz decode_all (120s over the committed corpus)
+        # RUSTUP_TOOLCHAIN=nightly so cargo-fuzz's inner `cargo build` also uses nightly
+        # (the sanitizer `-Z` flags require it). `-max_total_time` time-boxes the run;
+        # the committed corpus (node/fuzz/corpus/decode_all) seeds it warm.
+        run: |
+          cd node
+          RUSTUP_TOOLCHAIN=nightly cargo fuzz run decode_all -- -max_total_time=120
+

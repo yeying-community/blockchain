@@ -31,11 +31,15 @@ pub mod crypto;
 pub mod daemon;
 pub mod driver;
 pub mod hash;
+pub mod keystore;
 pub mod light;
 pub mod mempool;
 pub mod merkle;
 pub mod net;
+#[cfg(unix)]
+pub mod remote_signer;
 pub mod round;
+pub mod signer;
 pub mod store;
 pub mod validator;
 
@@ -47,6 +51,7 @@ pub use consensus::{Vote, VoteType};
 pub use crypto::{Keypair, PubKey, Sig};
 pub use hash::{hex, sha256};
 pub use light::{LightError, ValidatorTracker};
+pub use signer::Signer;
 // M25: re-export the engine module so `crate::engine::GraphNode` works from
 // codec.rs / light.rs without a direct engine dependency in those modules.
 pub mod engine {
@@ -227,6 +232,258 @@ impl StakeOp {
     /// Content-addressed hash over the full signed encoding.
     pub fn hash(&self) -> Hash {
         sha256(&codec::encode_stakeop(self))
+    }
+}
+
+/// M179: rotate the ed25519 public key bound to an account. Self-authenticating —
+/// signed by the account's **current** key over [`codec::keyrotation_signing_bytes`]
+/// — and replay-protected by the account's `nonce` (same discipline as
+/// [`SubmissionTx`]). On apply, the account's `pubkey` becomes `new_pubkey` and
+/// its `nonce` advances, so every subsequent op must be signed by the new key.
+///
+/// Because a bonded validator's set entry is derived from its account pubkey,
+/// rotating an account key also rotates its validator identity. M180: this is
+/// now **allowed** for active validators — the set re-derives the validator's
+/// entry with the new pubkey at the next height (the rotation block is certified
+/// by the old set; the daemon hands its signing key over via
+/// `Actor::reconcile_signing_key` once the new set takes effect). M179 had
+/// temporarily rejected validator rotation to defer that handoff.
+#[derive(Clone, Debug)]
+pub struct KeyRotation {
+    pub account: u64,
+    pub new_pubkey: PubKey,
+    /// Must equal the account's current `nonce` (strict, like `SubmissionTx`).
+    pub nonce: u64,
+    /// ed25519 signature by the account's **current** key over
+    /// [`codec::keyrotation_signing_bytes`].
+    pub signature: Sig,
+}
+
+impl KeyRotation {
+    /// Sign this rotation's canonical fields with `kp` (the account's current key).
+    pub fn signed(mut self, kp: &Keypair) -> Self {
+        self.signature = kp.sign(&codec::keyrotation_signing_bytes(&self));
+        self
+    }
+
+    /// Content-addressed hash over the full signed encoding (gossip dedup key).
+    pub fn hash(&self) -> Hash {
+        sha256(&codec::encode_key_rotation(self))
+    }
+}
+
+/// M193: a governable on-chain parameter and the value a proposal would set it to.
+/// The economic/policy scalars currently fixed at genesis (see [`ChainState`]).
+/// Each variant carries its target's native type so [`ChainState::apply_gov_param`]
+/// is a total, exhaustive match. (M195 will extend this to the `DeltaKParams`
+/// fields; the enum is the single extension point.)
+#[derive(Clone, Debug, PartialEq)]
+pub enum GovParam {
+    /// Set [`ChainState::base_emission_micro`] (micro-$COG minted per unit ΔK).
+    BaseEmission(u64),
+    /// Set [`ChainState::slash_bps`] (reject-slash fraction, basis points).
+    SlashBps(u32),
+    /// Set [`ChainState::decay_half_life_blocks`] (M187 emission decay; 0 = off).
+    DecayHalfLife(u64),
+    /// M196: set one field of the ΔK engine parameters ([`ChainState::params`]).
+    /// Addressed per-field so each governable knob keeps its native type.
+    DeltaK(DeltaKParam),
+}
+
+/// M196: a single governable field of [`zhixing_engine::DeltaKParams`] and the value
+/// a proposal would set it to. Each variant carries the field's native type (the two
+/// `usize` counters travel as `u64` on the wire / in the digest). Completing the
+/// "all four param groups" governance target chosen in M193.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DeltaKParam {
+    TauDup(f32),
+    NReviewMin(u64),
+    CCap(f32),
+    NMin(u64),
+    Lam(f32),
+    BonusMax(f32),
+    Decay(f32),
+    FreshMin(f32),
+    DeltaKMin(f32),
+}
+
+/// SEC-04: safe-domain bounds for governable parameters. Governance (M193–198)
+/// decides *economics*, but these are hard *safety* bounds so a passed proposal can
+/// never drive overflow / broken supply conservation / platform-divergent state.
+pub const MAX_SLASH_BPS: u32 = 10_000; // 100%; `stake - stake*bps/10000` must not underflow
+pub const MAX_BASE_EMISSION_MICRO: u64 = 1_000 * MICRO; // ample vs the ~8*MICRO default
+pub const MAX_GOV_COUNT: u64 = 10_000; // bound for usize-typed ΔK counts (fits usize on 32/64-bit)
+/// SEC-04 (re-verify): upper bound for the unbounded ΔK float knobs (lam/bonus_max/
+/// decay/delta_k_min). Caps ΔK so one reward `≈ base_emission × ΔK` stays far below
+/// `u64::MAX` (≤ 1000*MICRO × ~1e3 ≈ 1e12 « 1.8e19). The unit knobs (tau_dup/c_cap/
+/// fresh_min) keep their own `[0,1]` bound.
+pub const MAX_DELTAK_PARAM: f32 = 1_000.0;
+
+/// SEC-01 (round 3): how far ahead of an account's current nonce a staged governance
+/// op may be. A pipelined submitter may legitimately be a few nonces ahead, but an
+/// op further ahead than this can never apply before the pool turns over, so it is
+/// refused at admission (`NonceTooFarAhead`) instead of occupying a pending slot.
+/// Mirrors the mempool's tx `nonce_lookahead` (M143) for the governance pools.
+pub const GOV_NONCE_LOOKAHEAD: u64 = 8;
+
+/// SEC-04: validate a single governable parameter value against its safe domain.
+/// Called at proposal **registration** (so only valid values ever enter the proposal
+/// set → only valid values ever execute) and at genesis load.
+pub fn validate_gov_param(param: &GovParam) -> Result<(), ChainError> {
+    let unit = |v: f32, name: &'static str| {
+        if v.is_finite() && (0.0..=1.0).contains(&v) {
+            Ok(())
+        } else {
+            Err(ChainError::GovParamOutOfRange(name))
+        }
+    };
+    let nonneg = |v: f32, name: &'static str| {
+        // SEC-04 (re-verify): a finite lower AND upper bound. An unbounded `lam`/`bonus_max`
+        // let governance drive ΔK (hence the mint) arbitrarily high → reward conversion
+        // saturates `u64` and supply/balance overflow. `MAX_DELTAK_PARAM` keeps ΔK (and
+        // thus any single reward) far below `u64::MAX` even at the max base emission.
+        if v.is_finite() && (0.0..=MAX_DELTAK_PARAM).contains(&v) {
+            Ok(())
+        } else {
+            Err(ChainError::GovParamOutOfRange(name))
+        }
+    };
+    match param {
+        GovParam::BaseEmission(v) => {
+            if *v <= MAX_BASE_EMISSION_MICRO {
+                Ok(())
+            } else {
+                Err(ChainError::GovParamOutOfRange("base_emission_micro"))
+            }
+        }
+        GovParam::SlashBps(v) => {
+            if *v <= MAX_SLASH_BPS {
+                Ok(())
+            } else {
+                Err(ChainError::GovParamOutOfRange("slash_bps"))
+            }
+        }
+        GovParam::DecayHalfLife(_) => Ok(()), // any u64 is valid (0 = disabled)
+        GovParam::DeltaK(d) => match d {
+            DeltaKParam::TauDup(v) => unit(*v, "tau_dup"),
+            DeltaKParam::CCap(v) => unit(*v, "c_cap"),
+            DeltaKParam::FreshMin(v) => unit(*v, "fresh_min"),
+            DeltaKParam::Lam(v) => nonneg(*v, "lam"),
+            DeltaKParam::BonusMax(v) => nonneg(*v, "bonus_max"),
+            DeltaKParam::Decay(v) => nonneg(*v, "decay"),
+            DeltaKParam::DeltaKMin(v) => nonneg(*v, "delta_k_min"),
+            DeltaKParam::NReviewMin(v) | DeltaKParam::NMin(v) => {
+                if *v <= MAX_GOV_COUNT {
+                    Ok(())
+                } else {
+                    Err(ChainError::GovParamOutOfRange("deltak_count"))
+                }
+            }
+        },
+    }
+}
+
+/// SEC-04: validate the full consensus-parameter set (genesis or post-apply). Checks
+/// every field through the same [`validate_gov_param`] domain the governance path uses.
+pub fn validate_consensus_params(
+    base_emission_micro: u64,
+    slash_bps: u32,
+    p: &DeltaKParams,
+) -> Result<(), ChainError> {
+    validate_gov_param(&GovParam::BaseEmission(base_emission_micro))?;
+    validate_gov_param(&GovParam::SlashBps(slash_bps))?;
+    for dp in [
+        DeltaKParam::TauDup(p.tau_dup),
+        DeltaKParam::CCap(p.c_cap),
+        DeltaKParam::FreshMin(p.fresh_min),
+        DeltaKParam::Lam(p.lam),
+        DeltaKParam::BonusMax(p.bonus_max),
+        DeltaKParam::Decay(p.decay),
+        DeltaKParam::DeltaKMin(p.delta_k_min),
+        DeltaKParam::NReviewMin(p.n_review_min as u64),
+        DeltaKParam::NMin(p.n_min as u64),
+    ] {
+        validate_gov_param(&GovParam::DeltaK(dp))?;
+    }
+    Ok(())
+}
+
+/// M193: a parameter-change proposal and the votes recorded against it. **Hybrid
+/// governance**: a proposal passes only if BOTH constituencies approve —
+/// stake-weighted validators (>2/3 of total bonded stake) AND reputation-weighted
+/// reviewers (>1/2 of total reviewer reputation). A single account can carry both
+/// weights (its `bonds` entry and its `reviewers` entry); an account in neither set
+/// has zero weight on both axes. Authentication (vote signatures) and block
+/// carriage land in M194 — M193 is the pure tally/execution core.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Proposal {
+    /// Monotonic id (assigned by the chain when the proposal is registered, M194).
+    pub id: u64,
+    /// The parameter and target value this proposal would apply if it passes.
+    pub param: GovParam,
+    /// Height at which the proposal was registered.
+    pub created_height: u64,
+    /// Voting window length in blocks; the proposal is tallied at
+    /// `created_height + voting_period`.
+    pub voting_period: u64,
+    /// Recorded votes: voter **account** id → approve. A later vote from the same
+    /// account overwrites an earlier one (last-write-wins up to the deadline).
+    pub votes: BTreeMap<u64, bool>,
+}
+
+/// M193: numerator/denominator of the stake-side quorum — strictly greater than
+/// two-thirds of total bonded stake must approve (mirrors the BFT >2/3 rule the
+/// consensus layer already uses, so the governing set == the securing set).
+pub const GOV_STAKE_QUORUM_NUM: u128 = 2;
+pub const GOV_STAKE_QUORUM_DEN: u128 = 3;
+
+/// M194: a block op that **registers** a governance proposal. The chain assigns the
+/// proposal's monotonic `id` on apply (from `next_proposal_id`); the proposer only
+/// states the target param and the voting window. `nonce` is strict against the
+/// proposer account's nonce (replay protection, like [`SubmissionTx`]/[`KeyRotation`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GovProposal {
+    pub proposer: u64,
+    pub param: GovParam,
+    pub voting_period: u64,
+    pub nonce: u64,
+    /// ed25519 signature by `proposer`'s key over [`codec::govproposal_signing_bytes`].
+    pub signature: Sig,
+}
+
+impl GovProposal {
+    pub fn signed(mut self, kp: &Keypair) -> Self {
+        self.signature = kp.sign(&codec::govproposal_signing_bytes(&self));
+        self
+    }
+    /// Content-addressed hash over the full signed encoding (gossip dedup key, M195).
+    pub fn hash(&self) -> Hash {
+        sha256(&codec::encode_gov_proposal(self))
+    }
+}
+
+/// M194: a block op that **records a vote** on an open proposal. `voter` is an
+/// account id; its stake weight (`bonds`) and reputation weight (`reviewers`) are
+/// read at tally time ([`ChainState::gov_tally`]). `nonce` is strict against the
+/// voter account's nonce, which both prevents replay and orders re-votes
+/// (last-write-wins by apply order).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GovVote {
+    pub proposal_id: u64,
+    pub voter: u64,
+    pub approve: bool,
+    pub nonce: u64,
+    /// ed25519 signature by `voter`'s key over [`codec::govvote_signing_bytes`].
+    pub signature: Sig,
+}
+
+impl GovVote {
+    pub fn signed(mut self, kp: &Keypair) -> Self {
+        self.signature = kp.sign(&codec::govvote_signing_bytes(&self));
+        self
+    }
+    pub fn hash(&self) -> Hash {
+        sha256(&codec::encode_gov_vote(self))
     }
 }
 
@@ -423,9 +680,10 @@ pub struct BridgeRedeem {
 /// distinction from [`BridgeRedeem`]).
 ///
 /// Self-authenticating via cert-binding + Merkle inclusion of an
-/// `unbonding_merkle_leaf(&entry)` against `source_header.state_root`
-/// (not `bridge_root` — the entry lives in the regular state trie, not
-/// the bridge-state trie). The Merkle proof key is the **index** in
+/// `unbonding_merkle_leaf(&entry)` against `source_header.unbonding_root`
+/// (SEC-05 B7: a dedicated cert-signed root over the source's unbonding queue —
+/// before the fix this used `bridge_root`, which an honest source could never
+/// satisfy). The Merkle proof key is the **index** in
 /// the source's `state.unbonding: Vec<UnbondingEntry>` at
 /// `source_header.height`; replay dedup tracks this index per source
 /// (see `BridgeSource::consumed_unbonds`).
@@ -435,7 +693,7 @@ pub struct BridgeUnbond {
     /// present in `ChainState::bridge_sources` — i.e. declared at our
     /// genesis or adopted by a prior `apply_bridge_header`.
     pub source_chain: Hash,
-    /// The source chain's cert-signed header carrying the `state_root`
+    /// The source chain's cert-signed header carrying the `unbonding_root`
     /// the unbonding leaf is opened against. Must have been followed
     /// (height ≤ the follower's frontier).
     pub source_header: codec::BlockHeader,
@@ -450,7 +708,7 @@ pub struct BridgeUnbond {
     /// truth) so the Merkle leaf = `sha256(encode_unbonding(entry))`.
     pub entry: UnbondingEntry,
     /// Merkle proof opening `unbonding_merkle_leaf(&entry)` against
-    /// `source_header.state_root`. Keyed by the **index** in the
+    /// `source_header.unbonding_root`. Keyed by the **index** in the
     /// source's `unbonding: Vec<UnbondingEntry>` at the header height.
     pub proof: merkle::Proof,
 }
@@ -519,6 +777,23 @@ pub struct Block {
     /// cert-signed header. Stamped by [`Chain::commit`]; mismatches on
     /// apply return [`ChainError::BridgeRootMismatch`].
     pub bridge_root: Hash,
+    /// M185: Merkle root of the post-apply cNFT directory (`contributions`),
+    /// sorted by `node_id` (see [`ChainState::contributions_merkle_root`]).
+    /// Cert-signed alongside `accounts_root` / `graph_root` / `bridge_root` —
+    /// a light client opens single-cNFT inclusion proofs against this root to
+    /// verify "this contribution certificate is on-chain" against a cert-signed
+    /// header, no replay, no bodies. A **distinct** commitment from
+    /// `accounts_root` (cNFTs are soulbound, not accounts-tree members).
+    /// Stamped by [`Chain::commit`]; mismatches on apply return
+    /// [`ChainError::ContributionsRootMismatch`]. (Wire B5: a new state root in
+    /// the header prefix, so all block hashes re-baseline from this height.)
+    pub contributions_root: Hash,
+    /// SEC-05 (B7 wire): Merkle root of the post-apply unbonding queue (see
+    /// [`ChainState::unbonding_merkle_root`]). Cert-signed alongside the other roots so
+    /// a destination chain opens a single unbonding-entry inclusion proof against a
+    /// normal source header. Stamped by [`Chain::commit`]; mismatches on apply return
+    /// [`ChainError::UnbondingRootMismatch`].
+    pub unbonding_root: Hash,
     pub txs: Vec<SubmissionTx>,
     /// On-chain validator-set changes carried by this block. Applied after the
     /// transactions and taking effect from the *next* height (this block is
@@ -578,6 +853,22 @@ pub struct Block {
     /// (via the header projection's `bridge_unbondings_commitment`,
     /// M171).
     pub bridge_unbondings: Vec<BridgeUnbond>,
+    /// M179 (B4 wire): account key-rotation ops carried by this block. Each is a
+    /// [`KeyRotation`] signed by an account's **current** key that swaps in a new
+    /// ed25519 pubkey (replay-protected by the account nonce). Applied after all
+    /// other ops so a same-block tx/stake-op (signed with the old key) verifies
+    /// against the pre-rotation key. Rejected for accounts that are current
+    /// validators (MVP). Usually empty. Bodies are part of the block hash via the
+    /// header projection's `key_rotations_commitment`.
+    pub key_rotations: Vec<KeyRotation>,
+    /// M194 (B6 wire): governance proposals registered by this block. Applied after
+    /// key rotations; each gets a chain-assigned id. Usually empty. Committed via the
+    /// header projection's `gov_proposals_commitment`.
+    pub gov_proposals: Vec<GovProposal>,
+    /// M194 (B6 wire): governance votes recorded by this block, against proposals
+    /// opened in an earlier (or the same) block. Committed via the header
+    /// projection's `gov_votes_commitment`.
+    pub gov_votes: Vec<GovVote>,
 }
 
 impl Block {
@@ -603,6 +894,63 @@ impl Block {
 }
 
 // --- State -------------------------------------------------------------------
+
+/// M183 (whitepaper §6.1): a **cNFT — cognitive contribution certificate**.
+/// Minted (one per accepted submission) alongside the $COG reward and the
+/// cognitive-graph node, binding the *contributor* to *that* contribution — the
+/// per-contribution record the account's aggregate `accepted`/`earned_total`
+/// counters don't give. Keyed in [`ChainState::contributions`] by the graph
+/// `node_id` the same accept produced (1 accept = 1 graph node = 1 cNFT), so a
+/// cNFT points at its cognitive-graph node. **Non-transferable (soulbound) by
+/// construction**: there is no op to move it — `contributor` is permanent.
+/// Append-only and folded into `state_root` so it is authenticated consensus
+/// state (a snapshot-synced node recovers the identical set).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cnft {
+    /// The account that authored the accepted submission.
+    pub contributor: u64,
+    /// The submission's cognitive domain.
+    pub domain: u32,
+    /// The $COG (micro) minted for this contribution (`base_emission × ΔK`).
+    pub reward_micro: u64,
+    /// The height at which this contribution was committed.
+    pub height: u64,
+}
+
+impl Cnft {
+    /// M185: canonical leaf bytes for this cNFT under `node_id` — the exact
+    /// preimage a light client hashes (via [`merkle::leaf_hash`]) to verify a
+    /// cNFT-inclusion proof against `ChainState::contributions_root`. Mirrors
+    /// `BridgeLock::merkle_leaf` / `Account::merkle_leaf` for the
+    /// contributions_root tree. Byte order matches the `state_root` fold
+    /// (node_id ‖ contributor ‖ domain ‖ reward_micro ‖ height).
+    pub fn merkle_leaf(&self, node_id: u64) -> Vec<u8> {
+        let mut e = codec::Enc(Vec::new());
+        e.u64(node_id);
+        e.u64(self.contributor);
+        e.u32(self.domain);
+        e.u64(self.reward_micro);
+        e.u64(self.height);
+        e.0
+    }
+}
+
+/// M187 (§6.2): the emission time-decay factor at `height` for a given
+/// `half_life` (in blocks). `time_decay = 0.5^(height / half_life)` — a
+/// contribution at height `half_life` earns half the base reward, at `2·half_life`
+/// a quarter, and so on, biasing emission toward early (bootstrap-era)
+/// contributions. `half_life == 0` disables decay and returns exactly `1.0`, so a
+/// chain that doesn't opt in mints unchanged. M188: uses `libm::pow` (pure-Rust
+/// MUSL port), not `f64::powf` — std's `powf` can delegate to the platform libm and
+/// differ by ULPs across targets, and this factor folds into `reward` →
+/// `state_root`, so a sub-ULP divergence between heterogeneous validators could
+/// fork the chain. Deterministic across nodes by construction.
+pub fn time_decay_factor(height: u64, half_life: u64) -> f64 {
+    if half_life == 0 {
+        return 1.0;
+    }
+    libm::pow(0.5, height as f64 / half_life as f64)
+}
 
 /// A withdrawal in flight: `amount` micro-$COG unbonded by `account`, returning
 /// to its balance once the chain reaches `mature_height`. Until then the funds
@@ -693,9 +1041,22 @@ pub struct ChainState {
     pub accounts: BTreeMap<u64, Account>,
     pub reviewers: BTreeMap<u64, f32>, // reviewer id -> reputation
     pub graph: CognitiveGraph,
+    /// M183: cNFT cognitive-contribution certificates, keyed by the cognitive
+    /// graph `node_id` each accepted submission produced (1 accept = 1 node = 1
+    /// cNFT). Append-only (like `bridge_locks`), so a certificate reference stays
+    /// valid at any later height. Folded into `state_root`; non-transferable.
+    pub contributions: BTreeMap<u64, Cnft>,
     pub params: DeltaKParams,
     /// micro-$COG minted per unit ΔK (governance knob, B.2.3 / §5.1).
     pub base_emission_micro: u64,
+    /// M187 (§6.2): emission time-decay half-life in blocks. The $COG mint
+    /// formula is `base_emission × impact(ΔK) × time_decay`, where
+    /// `time_decay = 0.5^(height / half_life)` rewards early contributions more
+    /// and tapers with chain age. **`0` disables decay** (factor `1.0`), which
+    /// is the default — so a chain that doesn't set it mints exactly as before
+    /// (no re-baseline). A governance constant like `base_emission_micro`; not
+    /// folded into `state_root` (same as the other params).
+    pub decay_half_life_blocks: u64,
     /// Fraction of stake slashed on reject, in basis points (10000 = 100%).
     pub slash_bps: u32,
     pub supply: u64,   // total $COG in existence (micro)
@@ -731,6 +1092,13 @@ pub struct ChainState {
     pub bridge_lock_heights: BTreeMap<u64, u64>,
     /// M30: next `lock_id` to assign. Monotonic; never reused.
     pub next_lock_id: u64,
+    /// M194: active governance proposals, keyed by monotonic id. A proposal is
+    /// registered by a `GovProposal` op, accumulates `GovVote`s, and is tallied +
+    /// removed at its deadline (`created_height + voting_period`) during block apply.
+    /// Folded into `state_root` so proposal state is authenticated consensus state.
+    pub proposals: BTreeMap<u64, Proposal>,
+    /// M194: monotonic id counter for the next registered proposal.
+    pub next_proposal_id: u64,
     /// M31: cumulative micro-$COG minted on this chain via
     /// [`BridgeRedeem`] ops. Like `bridge_locked`, an audit counter that
     /// mirrors the source-side pool; folds into `state_root` so a wallet
@@ -764,6 +1132,9 @@ pub struct Genesis {
     pub seed_nodes: Vec<(Embedding, u32)>, // pre-existing graph nodes
     pub params: DeltaKParams,
     pub base_emission_micro: u64,
+    /// M187 (§6.2): emission time-decay half-life in blocks (`0` = disabled).
+    /// See [`ChainState::decay_half_life_blocks`].
+    pub decay_half_life_blocks: u64,
     pub slash_bps: u32,
     pub timestamp_days: f32,
     /// The initial validator set (id, pubkey, voting power). Consensus over
@@ -802,6 +1173,37 @@ pub enum ChainError {
         expected: u64,
         got: u64,
     },
+    /// M194: a `GovVote` referenced a proposal id that is not (or no longer) in the
+    /// active proposal set.
+    UnknownProposal(u64),
+    /// M194: a `GovVote` arrived at/after the proposal's deadline
+    /// (`created_height + voting_period`) — the voting window is closed.
+    ProposalClosed {
+        id: u64,
+        height: u64,
+    },
+    /// SEC-04: a governance parameter value is outside its safe domain (e.g.
+    /// `slash_bps > 10000`, a non-finite ΔK float, or an out-of-range count). The
+    /// `&str` names the offending field. Enforced at proposal registration and
+    /// genesis so an unsafe value can never reach execution (where it would break
+    /// supply conservation / overflow).
+    GovParamOutOfRange(&'static str),
+    /// SEC-04: minting this block's reward would overflow a u64 balance/supply. Defense
+    /// in depth behind the governance param bounds — a block that cannot be applied
+    /// without breaking supply conservation is rejected rather than wrapping.
+    RewardOverflow,
+    /// SEC-01 (round 3): the governance pending pool is at `net::MAX_PENDING_GOV`; the
+    /// op was not staged. A pool-admission bound, not a consensus rule.
+    GovPoolFull,
+    /// SEC-01 (round 3): this account already has `net::MAX_PENDING_GOV_PER_ACCOUNT`
+    /// governance ops staged, so one account cannot monopolize the pool.
+    GovAccountQuotaExceeded {
+        account: u64,
+        limit: usize,
+    },
+    /// SEC-01 (round 3): the op's content hash is already in the dedup cache (it was
+    /// previously staged and flooded); it was not staged again.
+    GovAlreadySeen,
     /// M143: the tx's `nonce` is further ahead than the mempool's pipelining window
     /// allows (`got > acct.nonce + nonce_lookahead`). A mempool-admission bound, not
     /// a consensus rule — it keeps per-account buffering finite.
@@ -835,6 +1237,9 @@ pub enum ChainError {
     /// A block's validator updates would leave the set empty — consensus would
     /// become impossible, so the block is rejected.
     EmptyValidatorSet,
+    /// SEC-03: a block's validator updates would push total power past the protocol cap
+    /// (`validator::MAX_TOTAL_POWER`), making the set unsafely representable — rejected.
+    ValidatorPowerOverflow,
     /// A bond/unbond op with a zero amount (never meaningful).
     ZeroStake(u64),
     /// An unbond of more than the account currently has bonded.
@@ -842,6 +1247,11 @@ pub enum ChainError {
         account: u64,
         need: u64,
         have: u64,
+    },
+    /// M179: a `KeyRotation` whose `new_pubkey` equals the account's current key
+    /// (a no-op rotation — rejected to catch a mis-built op / wrong key file).
+    KeyRotationNoop {
+        account: u64,
     },
     /// Slashing evidence is malformed, against a non-validator, or carries an
     /// invalid signature. The block is rejected; the offending validator id is
@@ -882,6 +1292,20 @@ pub enum ChainError {
     /// destination chain's bridge endpoint opens a single lock against — same
     /// root-mismatch reasoning as `AccountsRootMismatch` / `GraphRootMismatch`.
     BridgeRootMismatch {
+        height: u64,
+    },
+    /// M185: the block's `contributions_root` does not equal the post-apply
+    /// Merkle root of the cNFT directory (`contributions`) sorted by `node_id`.
+    /// Cert-signed via `header.contributions_root`, this is the commitment a
+    /// wallet opens a single cNFT-inclusion proof against — same root-mismatch
+    /// reasoning as `AccountsRootMismatch` / `GraphRootMismatch` /
+    /// `BridgeRootMismatch`.
+    ContributionsRootMismatch {
+        height: u64,
+    },
+    /// SEC-05: the block's `unbonding_root` does not equal the post-apply Merkle root
+    /// of the unbonding queue. Cert-signed via `header.unbonding_root`.
+    UnbondingRootMismatch {
         height: u64,
     },
     /// M31: a `BridgeHeader` / `BridgeRedeem` op named a source chain
@@ -989,6 +1413,25 @@ impl std::fmt::Display for ChainError {
                 f,
                 "account {account} nonce mismatch: expected {expected}, got {got}"
             ),
+            ChainError::UnknownProposal(id) => write!(f, "unknown governance proposal {id}"),
+            ChainError::ProposalClosed { id, height } => write!(
+                f,
+                "governance proposal {id} voting window is closed at height {height}"
+            ),
+            ChainError::GovParamOutOfRange(field) => {
+                write!(f, "governance parameter out of safe range: {field}")
+            }
+            ChainError::RewardOverflow => {
+                write!(f, "minting this block's reward would overflow balance/supply")
+            }
+            ChainError::GovPoolFull => write!(f, "governance pending pool is full"),
+            ChainError::GovAccountQuotaExceeded { account, limit } => write!(
+                f,
+                "account {account} already has {limit} governance ops pending"
+            ),
+            ChainError::GovAlreadySeen => {
+                write!(f, "governance op already seen (staged or flooded before)")
+            }
             ChainError::NonceTooFarAhead { account, got, limit } => write!(
                 f,
                 "account {account} nonce {got} exceeds the mempool pipelining window (max {limit})"
@@ -1008,11 +1451,17 @@ impl std::fmt::Display for ChainError {
             ChainError::EmptyValidatorSet => {
                 write!(f, "validator updates would empty the validator set")
             }
+            ChainError::ValidatorPowerOverflow => {
+                write!(f, "validator updates would exceed the total-power cap")
+            }
             ChainError::ZeroStake(a) => write!(f, "account {a} bond/unbond amount is zero"),
             ChainError::InsufficientBond { account, need, have } => write!(
                 f,
                 "account {account} cannot unbond {need} (has {have} bonded)"
             ),
+            ChainError::KeyRotationNoop { account } => {
+                write!(f, "account {account} key rotation is a no-op (same key)")
+            }
             ChainError::BadEquivocationEvidence(v) => write!(
                 f,
                 "equivocation evidence against validator {v} is malformed, stale, or not signable by that validator"
@@ -1036,6 +1485,14 @@ impl std::fmt::Display for ChainError {
             ChainError::BridgeRootMismatch { height } => write!(
                 f,
                 "block {height} bridge_root does not match the post-apply bridge_locks (sorted-by-lock_id) Merkle root"
+            ),
+            ChainError::ContributionsRootMismatch { height } => write!(
+                f,
+                "block {height} contributions_root does not match the post-apply cNFT directory (sorted-by-node_id) Merkle root"
+            ),
+            ChainError::UnbondingRootMismatch { height } => write!(
+                f,
+                "block {height} unbonding_root does not match the post-apply unbonding-queue Merkle root"
             ),
             ChainError::UnknownBridgeSource(s) => write!(
                 f,
@@ -1271,8 +1728,10 @@ impl ChainState {
             accounts,
             reviewers,
             graph,
+            contributions: BTreeMap::new(),
             params: g.params,
             base_emission_micro: g.base_emission_micro,
+            decay_half_life_blocks: g.decay_half_life_blocks,
             slash_bps: g.slash_bps,
             supply,
             treasury: 0,
@@ -1286,6 +1745,8 @@ impl ChainState {
             bridge_locks: BTreeMap::new(),
             bridge_lock_heights: BTreeMap::new(),
             next_lock_id: 0,
+            proposals: BTreeMap::new(),
+            next_proposal_id: 0,
             // M31: bridge-redeem audit counter + follower registry.
             bridge_minted: 0,
             bridge_sources,
@@ -1323,6 +1784,12 @@ impl ChainState {
             // root) so a light client anchored on the genesis hash finds the
             // cert-signed bridge commitment already committed for height 0.
             bridge_root: state.bridge_merkle_root(),
+            // M185: stamp the genesis contributions_root (empty cNFT set →
+            // empty-tree root) so a light client anchored on the genesis hash
+            // finds the cert-signed cNFT commitment already committed at height 0.
+            contributions_root: state.contributions_merkle_root(),
+            // SEC-05: stamp the genesis unbonding_root (empty queue → empty-tree root).
+            unbonding_root: state.unbonding_merkle_root(),
             txs: Vec::new(),
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
@@ -1331,6 +1798,9 @@ impl ChainState {
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
             bridge_unbondings: Vec::new(),
+            key_rotations: Vec::new(),
+            gov_proposals: Vec::new(),
+            gov_votes: Vec::new(),
         }
         .hash();
         // M31: now that the genesis block hash is known, store it on
@@ -1480,6 +1950,32 @@ impl ChainState {
             self.apply_bridge_unbond(op)?;
         }
 
+        // M179/M180: account key rotations. Applied AFTER every other op so a
+        // same-block tx / stake-op (signed with the pre-rotation key) verifies
+        // against the old key; the new key takes effect for subsequent blocks.
+        // Validation fully precedes mutation inside `apply_key_rotation`, so a
+        // bad rotation rolls the whole block back. M180: a rotation whose account
+        // is a current validator must re-derive that validator's set entry with
+        // the new pubkey — add it to `touched` so the derivation below emits a
+        // `ValidatorUpdate` (power unchanged, pubkey = the new account key),
+        // effective next height (same cross-height rule as any set change).
+        for op in &block.key_rotations {
+            self.apply_key_rotation(op)?;
+            if self.validators.get(op.account).is_some() {
+                touched.insert(op.account);
+            }
+        }
+
+        // M194: governance ops — register proposals (chain assigns ids), then record
+        // votes against open proposals. Both strict-nonce + sig checked; a bad op
+        // rolls the whole block back. `new_height` is the height this block commits at.
+        for op in &block.gov_proposals {
+            self.apply_gov_proposal(op, new_height)?;
+        }
+        for op in &block.gov_votes {
+            self.apply_gov_vote(op, new_height)?;
+        }
+
         // on-chain validator-set transition: explicit updates PLUS the changes
         // implied by this block's staking ops (power == bonded stake). Both take
         // effect from the NEXT height — this block was certified by the set in
@@ -1498,6 +1994,12 @@ impl ChainState {
             if next.is_empty() {
                 return Err(ChainError::EmptyValidatorSet);
             }
+            // SEC-03: reject an update that pushes total power past the protocol cap,
+            // so `total_power()`/`quorum()` never saturate (which would let a minority
+            // certify). Applied on the trial clone → rolls the whole block back.
+            if !next.power_within_cap() {
+                return Err(ChainError::ValidatorPowerOverflow);
+            }
             self.validators = next;
         }
 
@@ -1512,6 +2014,11 @@ impl ChainState {
         // block's state_root from a trial that already advanced height. Keeping
         // the old height here would make the cross-check fail spuriously.
         self.height = new_height;
+        // M194: resolve proposals whose voting window closed at this height — tally
+        // (hybrid dual-threshold) and apply the param change for passers, then drop
+        // all matured proposals. Runs before the commitment checks so `state_root`
+        // reflects both the executed param change and the shrunken proposal set.
+        self.resolve_matured_proposals(new_height);
         if enforce_commitment && block.next_validators_root != self.validators.merkle_root() {
             return Err(ChainError::ValidatorRootMismatch { height: new_height });
         }
@@ -1544,6 +2051,15 @@ impl ChainState {
         if enforce_commitment && block.bridge_root != self.bridge_merkle_root() {
             return Err(ChainError::BridgeRootMismatch { height: new_height });
         }
+        // M185: same seal-then-enforce discipline for the cNFT directory root —
+        // a wallet opens a single cNFT-inclusion proof against this commitment.
+        if enforce_commitment && block.contributions_root != self.contributions_merkle_root() {
+            return Err(ChainError::ContributionsRootMismatch { height: new_height });
+        }
+        // SEC-05: same seal-then-enforce discipline for the unbonding-queue root.
+        if enforce_commitment && block.unbonding_root != self.unbonding_merkle_root() {
+            return Err(ChainError::UnbondingRootMismatch { height: new_height });
+        }
 
         Ok(BlockReceipt {
             height: block.height,
@@ -1558,6 +2074,294 @@ impl ChainState {
             slashed_to_treasury: slashed_to_treasury_total,
             txs: receipts,
         })
+    }
+
+    /// M193: total reviewer reputation (sum of all reviewers' reputations) — the
+    /// denominator of the reputation-side governance quorum. Deterministic: summed
+    /// in `BTreeMap` (id-sorted) order, and f32 addition is IEEE-754 (no
+    /// transcendental), so every node computes the identical value.
+    pub fn total_reputation(&self) -> f32 {
+        self.reviewers.values().copied().sum()
+    }
+
+    /// M193: evaluate the **hybrid** outcome of a proposal against the *current*
+    /// stake and reputation distributions. Passes iff BOTH:
+    ///   * stake-weighted validators: `yes_stake` strictly exceeds 2/3 of total
+    ///     bonded stake (`GOV_STAKE_QUORUM_*`), mirroring the BFT consensus rule, and
+    ///   * reputation-weighted reviewers: `yes_reputation` strictly exceeds 1/2 of
+    ///     total reviewer reputation.
+    ///
+    /// An account's stake weight is its `bonds` entry (0 if not a validator) and its
+    /// reputation weight is its `reviewers` entry (0 if not a reviewer); the same
+    /// account can contribute to both. An empty constituency (no bonded stake, or no
+    /// reviewers) can never exceed its threshold, so a proposal cannot pass without
+    /// genuine approval on *both* axes. Pure (reads state, mutates nothing).
+    pub fn gov_tally(&self, proposal: &Proposal) -> bool {
+        let mut yes_stake: u128 = 0;
+        let mut yes_rep: f32 = 0.0;
+        for (&voter, &approve) in &proposal.votes {
+            if !approve {
+                continue;
+            }
+            yes_stake += *self.bonds.get(&voter).unwrap_or(&0) as u128;
+            yes_rep += *self.reviewers.get(&voter).unwrap_or(&0.0);
+        }
+        let total_stake = self.bonded as u128;
+        let total_rep = self.total_reputation();
+        // Strict > 2/3 of stake: yes_stake * DEN > NUM * total_stake.
+        let stake_ok = yes_stake * GOV_STAKE_QUORUM_DEN > GOV_STAKE_QUORUM_NUM * total_stake
+            && total_stake > 0;
+        // Strict > 1/2 of reputation.
+        let rep_ok = yes_rep * 2.0 > total_rep && total_rep > 0.0;
+        stake_ok && rep_ok
+    }
+
+    /// M193: apply a passed proposal's parameter change to live state. Total
+    /// (exhaustive) match over [`GovParam`], so adding a governable parameter is a
+    /// compile-time-checked extension. Changes take effect immediately on the state
+    /// it mutates; the caller gates this on [`Self::gov_tally`] + expiry (M194).
+    pub fn apply_gov_param(&mut self, param: &GovParam) {
+        match param {
+            GovParam::BaseEmission(v) => self.base_emission_micro = *v,
+            GovParam::SlashBps(v) => self.slash_bps = *v,
+            GovParam::DecayHalfLife(v) => self.decay_half_life_blocks = *v,
+            // M196: one ΔK-engine field. `usize` knobs are carried as `u64`.
+            GovParam::DeltaK(dp) => match dp {
+                DeltaKParam::TauDup(v) => self.params.tau_dup = *v,
+                DeltaKParam::NReviewMin(v) => self.params.n_review_min = *v as usize,
+                DeltaKParam::CCap(v) => self.params.c_cap = *v,
+                DeltaKParam::NMin(v) => self.params.n_min = *v as usize,
+                DeltaKParam::Lam(v) => self.params.lam = *v,
+                DeltaKParam::BonusMax(v) => self.params.bonus_max = *v,
+                DeltaKParam::Decay(v) => self.params.decay = *v,
+                DeltaKParam::FreshMin(v) => self.params.fresh_min = *v,
+                DeltaKParam::DeltaKMin(v) => self.params.delta_k_min = *v,
+            },
+        }
+    }
+
+    /// M194: register a `GovProposal` (checks sig + strict nonce, assigns the next
+    /// monotonic id, opens the voting window at `height`). Validation fully precedes
+    /// mutation so a bad op rolls the whole block back.
+    fn apply_gov_proposal(&mut self, op: &GovProposal, height: u64) -> Result<(), ChainError> {
+        let acct = self
+            .accounts
+            .get(&op.proposer)
+            .ok_or(ChainError::UnknownAccount(op.proposer))?;
+        if !crypto::verify(
+            &acct.pubkey,
+            &codec::govproposal_signing_bytes(op),
+            &op.signature,
+        ) {
+            return Err(ChainError::BadSignature(op.proposer));
+        }
+        if op.nonce != acct.nonce {
+            return Err(ChainError::BadNonce {
+                account: op.proposer,
+                expected: acct.nonce,
+                got: op.nonce,
+            });
+        }
+        // SEC-04: reject an out-of-safe-range param at registration, so an unsafe
+        // value can never reach `resolve_matured_proposals` → `apply_gov_param`.
+        validate_gov_param(&op.param)?;
+        let id = self.next_proposal_id;
+        self.next_proposal_id += 1;
+        self.proposals.insert(
+            id,
+            Proposal {
+                id,
+                param: op.param.clone(),
+                created_height: height,
+                voting_period: op.voting_period,
+                votes: BTreeMap::new(),
+            },
+        );
+        self.accounts.get_mut(&op.proposer).unwrap().nonce += 1;
+        Ok(())
+    }
+
+    /// M194: record a `GovVote` on an open proposal (checks sig + strict nonce;
+    /// rejects an unknown or closed proposal). Last-write-wins per voter (keyed by
+    /// account id); the strict nonce both prevents replay and orders re-votes.
+    fn apply_gov_vote(&mut self, op: &GovVote, height: u64) -> Result<(), ChainError> {
+        let acct = self
+            .accounts
+            .get(&op.voter)
+            .ok_or(ChainError::UnknownAccount(op.voter))?;
+        if !crypto::verify(
+            &acct.pubkey,
+            &codec::govvote_signing_bytes(op),
+            &op.signature,
+        ) {
+            return Err(ChainError::BadSignature(op.voter));
+        }
+        if op.nonce != acct.nonce {
+            return Err(ChainError::BadNonce {
+                account: op.voter,
+                expected: acct.nonce,
+                got: op.nonce,
+            });
+        }
+        {
+            let p = self
+                .proposals
+                .get_mut(&op.proposal_id)
+                .ok_or(ChainError::UnknownProposal(op.proposal_id))?;
+            if height >= p.created_height + p.voting_period {
+                return Err(ChainError::ProposalClosed {
+                    id: op.proposal_id,
+                    height,
+                });
+            }
+            p.votes.insert(op.voter, op.approve);
+        }
+        self.accounts.get_mut(&op.voter).unwrap().nonce += 1;
+        Ok(())
+    }
+
+    /// M194: at `height`, tally every proposal that has reached its deadline
+    /// (`created_height + voting_period`), apply the parameter change for those that
+    /// pass [`Self::gov_tally`], and remove all matured proposals (passed or not).
+    /// Deterministic: matured ids are processed in sorted (BTreeMap) order.
+    fn resolve_matured_proposals(&mut self, height: u64) {
+        let matured: Vec<u64> = self
+            .proposals
+            .iter()
+            .filter(|(_, p)| height >= p.created_height + p.voting_period)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in matured {
+            let p = self.proposals.remove(&id).expect("id came from the map");
+            if self.gov_tally(&p) {
+                self.apply_gov_param(&p.param);
+            }
+        }
+    }
+
+    /// SEC-01 (round 3): shared nonce-window check for governance admission. A stale
+    /// op (`nonce < acct.nonce`) can never apply → `BadNonce`; one further ahead than
+    /// [`GOV_NONCE_LOOKAHEAD`] can't apply before the pool turns over → `NonceTooFarAhead`.
+    /// Anything inside the window is accepted as legitimate pipelining; strict
+    /// `nonce == acct.nonce` ordering is still enforced at block apply.
+    fn gov_nonce_window(&self, account: u64, nonce: u64) -> Result<(), ChainError> {
+        let acct = self
+            .accounts
+            .get(&account)
+            .ok_or(ChainError::UnknownAccount(account))?;
+        if nonce < acct.nonce {
+            return Err(ChainError::BadNonce {
+                account,
+                expected: acct.nonce,
+                got: nonce,
+            });
+        }
+        let limit = acct.nonce.saturating_add(GOV_NONCE_LOOKAHEAD);
+        if nonce > limit {
+            return Err(ChainError::NonceTooFarAhead {
+                account,
+                got: nonce,
+                limit,
+            });
+        }
+        Ok(())
+    }
+
+    /// SEC-01: admissibility check for a `GovProposal` shared by gossip ingress and
+    /// local/RPC submission — account exists, signature valid, param in safe range,
+    /// nonce inside the pipelining window ([`Self::gov_nonce_window`]). Strict nonce
+    /// ordering is enforced at block apply and at candidate-build filtering. Used at
+    /// every pool entrance so an invalid op is neither staged nor re-flooded (no pool
+    /// pollution, no amplification), and the caller gets a structured reason.
+    pub(crate) fn gov_proposal_admissible(&self, op: &GovProposal) -> Result<(), ChainError> {
+        let acct = self
+            .accounts
+            .get(&op.proposer)
+            .ok_or(ChainError::UnknownAccount(op.proposer))?;
+        if !crypto::verify(
+            &acct.pubkey,
+            &codec::govproposal_signing_bytes(op),
+            &op.signature,
+        ) {
+            return Err(ChainError::BadSignature(op.proposer));
+        }
+        validate_gov_param(&op.param)?;
+        self.gov_nonce_window(op.proposer, op.nonce)
+    }
+
+    /// SEC-01: admissibility check for a `GovVote` — account exists, signature valid,
+    /// the referenced proposal exists and is still open at the next commit height,
+    /// nonce inside the pipelining window (see [`Self::gov_proposal_admissible`]).
+    pub(crate) fn gov_vote_admissible(&self, op: &GovVote) -> Result<(), ChainError> {
+        let acct = self
+            .accounts
+            .get(&op.voter)
+            .ok_or(ChainError::UnknownAccount(op.voter))?;
+        if !crypto::verify(
+            &acct.pubkey,
+            &codec::govvote_signing_bytes(op),
+            &op.signature,
+        ) {
+            return Err(ChainError::BadSignature(op.voter));
+        }
+        self.gov_vote_proposal_open(op)?;
+        self.gov_nonce_window(op.voter, op.nonce)
+    }
+
+    /// The vote's proposal must exist and not yet be closed at the next commit height.
+    fn gov_vote_proposal_open(&self, op: &GovVote) -> Result<(), ChainError> {
+        let p = self
+            .proposals
+            .get(&op.proposal_id)
+            .ok_or(ChainError::UnknownProposal(op.proposal_id))?;
+        let next = self.height + 1;
+        if next >= p.created_height + p.voting_period {
+            return Err(ChainError::ProposalClosed {
+                id: op.proposal_id,
+                height: next,
+            });
+        }
+        Ok(())
+    }
+
+    /// SEC-01 (round 3): cheap (no signature work) "could this staged proposal still
+    /// apply?" predicate for pruning the pending pool after each commit — the nonce
+    /// window only, since an account's nonce can only move up and make an op stale.
+    pub(crate) fn gov_proposal_not_stale(&self, op: &GovProposal) -> bool {
+        self.gov_nonce_window(op.proposer, op.nonce).is_ok()
+    }
+
+    /// SEC-01 (round 3): as [`Self::gov_proposal_not_stale`], plus the vote's proposal
+    /// must still be open (a vote on a matured/removed proposal can never apply).
+    pub(crate) fn gov_vote_not_stale(&self, op: &GovVote) -> bool {
+        self.gov_vote_proposal_open(op).is_ok() && self.gov_nonce_window(op.voter, op.nonce).is_ok()
+    }
+
+    /// SEC-01: from staged governance pools, return the subset that applies cleanly
+    /// (in block order: proposals then votes) against a trial clone at `height`. A
+    /// stale/invalid op (consumed nonce, closed/duplicate proposal, out-of-range param)
+    /// is simply dropped from *this* candidate instead of making the whole sealed
+    /// block unproposable — so a poisoned pending pool can never stall production.
+    pub(crate) fn filter_applicable_gov(
+        &self,
+        height: u64,
+        proposals: &[GovProposal],
+        votes: &[GovVote],
+    ) -> (Vec<GovProposal>, Vec<GovVote>) {
+        let mut trial = self.clone();
+        let mut kept_props = Vec::new();
+        for op in proposals {
+            if trial.apply_gov_proposal(op, height).is_ok() {
+                kept_props.push(op.clone());
+            }
+        }
+        let mut kept_votes = Vec::new();
+        for op in votes {
+            if trial.apply_gov_vote(op, height).is_ok() {
+                kept_votes.push(op.clone());
+            }
+        }
+        (kept_props, kept_votes)
     }
 
     /// Apply one bond/unbond op at `height` (the height of the block carrying it).
@@ -1615,6 +2419,53 @@ impl ChainState {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// M179/M180: apply one [`KeyRotation`] — swap an account's ed25519 pubkey,
+    /// proven by a signature from its **current** key and gated by the account
+    /// nonce. All checks precede any mutation, so a bad rotation rolls the whole
+    /// block back (same discipline as `apply_stake_op`).
+    ///
+    /// M180: a **validator's** key may now be rotated too. The caller
+    /// (`apply_block_inner`) adds a rotated validator to `touched`, so the set
+    /// re-derives its entry with the new pubkey at the next height (power
+    /// unchanged, from `bonds`). The block carrying the rotation is still
+    /// certified by the *old* set; the daemon hands its signing key over to the
+    /// new one once the rotation takes effect (`Actor::reconcile_signing_key`).
+    fn apply_key_rotation(&mut self, op: &KeyRotation) -> Result<(), ChainError> {
+        let acct = self
+            .accounts
+            .get(&op.account)
+            .ok_or(ChainError::UnknownAccount(op.account))?;
+        // 1. authorize against the CURRENT key.
+        if !crypto::verify(
+            &acct.pubkey,
+            &codec::keyrotation_signing_bytes(op),
+            &op.signature,
+        ) {
+            return Err(ChainError::BadSignature(op.account));
+        }
+        // 2. strict nonce (replay protection), same as `SubmissionTx`.
+        if op.nonce != acct.nonce {
+            return Err(ChainError::BadNonce {
+                account: op.account,
+                expected: acct.nonce,
+                got: op.nonce,
+            });
+        }
+        // 3. reject a no-op rotation (new key == current key) — pointless, and
+        //    catches a mis-built op / wrong key file.
+        if op.new_pubkey == acct.pubkey {
+            return Err(ChainError::KeyRotationNoop {
+                account: op.account,
+            });
+        }
+        // 4. mutate: swap the key and advance the nonce so the old key can't be
+        //    reused and future ops must be signed by the new key.
+        let acct = self.accounts.get_mut(&op.account).unwrap();
+        acct.pubkey = op.new_pubkey;
+        acct.nonce += 1;
         Ok(())
     }
 
@@ -1914,12 +2765,13 @@ impl ChainState {
             height: op.source_header.height,
         })?;
         // 4. Merkle inclusion of the unbonding leaf against
-        //    `op.source_header.bridge_root` (M171 convention: the
-        //    `bridge_root` slot is reused for the unbonding sub-tree,
-        //    so the M168 B2 cert-signed commitment layout is preserved
-        //    byte-for-byte).
+        // 4. Merkle inclusion of the unbonding leaf against the source header's
+        //    dedicated `unbonding_root` (SEC-05: before the B7 fix this verified against
+        //    `bridge_root`, which commits the *locks* map — so a normal source chain
+        //    could never produce a valid proof; now a normal sealed source block commits
+        //    the unbonding-queue root directly, verified by the source's own apply).
         let leaf_hash = unbonding_merkle_leaf(&op.entry);
-        if !crate::merkle::verify(&op.source_header.bridge_root, &leaf_hash, &op.proof) {
+        if !crate::merkle::verify(&op.source_header.unbonding_root, &leaf_hash, &op.proof) {
             return Err(ChainError::BridgeInclusionInvalid {
                 source: op.source_chain,
                 // M173: the proof's authenticated leaf index stands in for the
@@ -2064,15 +2916,58 @@ impl ChainState {
         // -- finalize: mint or slash ----------------------------------------
         let (minted, slashed, accepted);
         if dk > 0.0 {
-            let reward = ((self.base_emission_micro as f64) * (dk as f64)).round() as u64;
+            // M187 (§6.2): mint = base_emission × impact(ΔK) × time_decay. The
+            // contribution commits at `self.height + 1` (height is bumped at the
+            // end of `apply_block_inner`), so decay is measured at that height —
+            // identical to the cNFT `height` field. `decay_half_life_blocks == 0`
+            // makes the factor exactly `1.0`, so a chain that doesn't opt in mints
+            // precisely as before (no re-baseline).
+            let decay = time_decay_factor(self.height + 1, self.decay_half_life_blocks);
+            // SEC-04: clamp the f64 product into u64 range before converting (an `as u64`
+            // cast saturates, but we then reject any addition that would overflow so
+            // balance/supply never wrap). Params are bounded (MAX_DELTAK_PARAM /
+            // MAX_BASE_EMISSION_MICRO), so an honest reward is tiny; this is defense in depth.
+            let reward_f = (self.base_emission_micro as f64) * (dk as f64) * decay;
+            let reward = if reward_f.is_finite() && reward_f >= 0.0 {
+                reward_f.round() as u64
+            } else {
+                return Err(ChainError::RewardOverflow);
+            };
             {
                 let acct = self.accounts.get_mut(&tx.author).unwrap();
-                acct.balance += tx.stake + reward; // escrow returned + reward
-                acct.earned_total += reward;
+                let returned = tx
+                    .stake
+                    .checked_add(reward)
+                    .ok_or(ChainError::RewardOverflow)?;
+                acct.balance = acct
+                    .balance
+                    .checked_add(returned)
+                    .ok_or(ChainError::RewardOverflow)?;
+                acct.earned_total = acct
+                    .earned_total
+                    .checked_add(reward)
+                    .ok_or(ChainError::RewardOverflow)?;
                 acct.accepted += 1;
             }
-            self.supply += reward;
-            self.graph.add(tx.embedding, tx.domain);
+            self.supply = self
+                .supply
+                .checked_add(reward)
+                .ok_or(ChainError::RewardOverflow)?;
+            // M183: minting the cognitive-graph node also mints a cNFT bound to
+            // the contributor. `graph.add` returns the new node_id (1 accept =
+            // 1 node = 1 cNFT). `self.height` is the pre-block height here (it is
+            // bumped only at the end of `apply_block_inner`), so `height + 1` is
+            // the height this block will commit at.
+            let node_id = self.graph.add(tx.embedding, tx.domain);
+            self.contributions.insert(
+                node_id,
+                Cnft {
+                    contributor: tx.author,
+                    domain: tx.domain,
+                    reward_micro: reward,
+                    height: self.height + 1,
+                },
+            );
             self.reward_reviewers(&tx.reviews, true);
             minted = reward;
             slashed = 0;
@@ -2154,6 +3049,17 @@ impl ChainState {
             e.emb(&n.embedding);
             e.u32(n.domain);
         }
+        // M183: cNFT contribution certificates are authenticated consensus state —
+        // fold them in so a snapshot-synced node can verify the identical set. Keyed
+        // by graph node_id; BTreeMap iterates sorted ⇒ canonical bytes.
+        e.u64(self.contributions.len() as u64);
+        for (node_id, c) in &self.contributions {
+            e.u64(*node_id);
+            e.u64(c.contributor);
+            e.u32(c.domain);
+            e.u64(c.reward_micro);
+            e.u64(c.height);
+        }
         // validator set is consensus state: fold it into the root so a divergent
         // set (e.g. a missed on-chain update) yields a different state_root.
         let vs = self.validators.validators();
@@ -2217,7 +3123,56 @@ impl ChainState {
             for id in &src.consumed {
                 e.u64(*id);
             }
+            // M176: fold the cross-chain unbonding replay-dedup set into the
+            // consensus digest. This is NOT mere local bookkeeping: a block
+            // carrying a replayed `BridgeUnbond` is rejected by a node that has
+            // the `(source_height, index)` pair in `consumed_unbonds` but
+            // ACCEPTED by one that doesn't (e.g. a snapshot-synced node). Before
+            // M176 the pair was absent from `state_root`, so those two nodes
+            // agreed on `state_root` yet disagreed on the block's validity — a
+            // latent fork. Folding it here (and persisting it in the snapshot,
+            // see `encode_snapshot`) makes the set consensus-critical and
+            // fork-safe. `BTreeSet` iterates sorted, so the bytes are canonical.
+            e.u64(src.consumed_unbonds.len() as u64);
+            for (height, index) in &src.consumed_unbonds {
+                e.u64(*height);
+                e.u64(*index);
+            }
         }
+        // M194: fold the governance proposal set + id counter into the digest so
+        // proposal/vote state is authenticated consensus state (a snapshot-synced
+        // node recovers the identical set and tallies identically). BTreeMaps iterate
+        // sorted, so the bytes are canonical. Param is tag-encoded via the codec.
+        e.u64(self.proposals.len() as u64);
+        for (id, p) in &self.proposals {
+            e.u64(*id);
+            e.raw(&codec::encode_gov_param(&p.param));
+            e.u64(p.created_height);
+            e.u64(p.voting_period);
+            e.u64(p.votes.len() as u64);
+            for (voter, approve) in &p.votes {
+                e.u64(*voter);
+                e.u8(*approve as u8);
+            }
+        }
+        e.u64(self.next_proposal_id);
+        // SEC-02: fold the execution parameters into the digest. These drive ΔK /
+        // emission / slashing and are governance-mutable, so a snapshot (or genesis)
+        // with tampered params must NOT match a cert-signed state_root — otherwise
+        // two nodes agree on the root yet execute the same block differently (fork).
+        e.u64(self.base_emission_micro);
+        e.u64(self.decay_half_life_blocks);
+        e.u32(self.slash_bps);
+        let p = &self.params;
+        e.f32(p.tau_dup);
+        e.u64(p.n_review_min as u64);
+        e.f32(p.c_cap);
+        e.u64(p.n_min as u64);
+        e.f32(p.lam);
+        e.f32(p.bonus_max);
+        e.f32(p.decay);
+        e.f32(p.fresh_min);
+        e.f32(p.delta_k_min);
         sha256(&e.0)
     }
 
@@ -2232,6 +3187,11 @@ impl ChainState {
     /// Merkle root only and break the proof.
     pub fn merkle_root(&self) -> Hash {
         merkle::MerkleTree::from_leaf_hashes(self.merkle_leaves()).root()
+    }
+
+    /// M183: look up a cNFT contribution certificate by its graph `node_id`.
+    pub fn cnft(&self, node_id: u64) -> Option<&Cnft> {
+        self.contributions.get(&node_id)
     }
 
     /// Build an inclusion proof for `account_id` against [`Self::merkle_root`].
@@ -2384,6 +3344,32 @@ impl ChainState {
         merkle::MerkleTree::from_leaf_hashes(leaves).root()
     }
 
+    /// SEC-05 (B7 wire): Merkle root over this chain's unbonding queue (insertion
+    /// order). Cert-signed in `header.unbonding_root` so a destination chain can open
+    /// a single `UnbondingEntry`-inclusion proof against a *normal* source-chain header
+    /// (before the fix, `apply_bridge_unbond` verified against `bridge_root`, which
+    /// commits the *locks* map — an honest source could never produce a valid proof).
+    pub fn unbonding_merkle_root(&self) -> Hash {
+        let leaves: Vec<Hash> = self.unbonding.iter().map(unbonding_merkle_leaf).collect();
+        merkle::MerkleTree::from_leaf_hashes(leaves).root()
+    }
+
+    /// SEC-05: inclusion proof for the unbonding-queue entry at `index` against
+    /// [`Self::unbonding_merkle_root`]. `None` if the index is out of range.
+    pub fn unbonding_proof(&self, index: usize) -> Option<merkle::Proof> {
+        if index >= self.unbonding.len() {
+            return None;
+        }
+        let leaves: Vec<Hash> = self.unbonding.iter().map(unbonding_merkle_leaf).collect();
+        merkle::MerkleTree::from_leaf_hashes(leaves).proof(index)
+    }
+
+    /// SEC-05: the genesis `unbonding_root` (empty queue → empty-tree root), mirroring
+    /// `bridge_merkle_root_for_genesis`.
+    pub fn unbonding_merkle_root_for_genesis(g: &Genesis) -> Hash {
+        Self::genesis_split(g.clone()).0.unbonding_merkle_root()
+    }
+
     /// M30: inclusion proof for the lock with the given `lock_id` against
     /// [`Self::bridge_merkle_root`]. Returns `None` if the id is unknown.
     /// Mirrors `account_proof` / `graph_node_proof`.
@@ -2405,6 +3391,45 @@ impl ChainState {
     /// `ChainState::genesis` stamps onto the genesis block.
     pub fn bridge_merkle_root_for_genesis(g: &Genesis) -> Hash {
         Self::genesis_split(g.clone()).0.bridge_merkle_root()
+    }
+
+    /// M185: Merkle root over the cNFT directory (`contributions`), sorted by
+    /// `node_id`. A cert-signed secondary index committed alongside
+    /// `accounts_root` / `graph_root` / `bridge_root`, distinct from all of them
+    /// because cNFTs are soulbound contribution certificates with their own
+    /// leaf shape and are **not** members of the accounts tree. Light clients
+    /// open single-cNFT inclusion proofs against `header.contributions_root`
+    /// without trusting the prover. Mirrors `bridge_merkle_root` (both are
+    /// append-only `BTreeMap<u64, _>` keyed by id).
+    pub fn contributions_merkle_root(&self) -> Hash {
+        let leaves: Vec<Hash> = self
+            .contributions
+            .iter()
+            .map(|(id, c)| merkle::leaf_hash(&c.merkle_leaf(*id)))
+            .collect();
+        merkle::MerkleTree::from_leaf_hashes(leaves).root()
+    }
+
+    /// M185: inclusion proof for the cNFT with the given `node_id` against
+    /// [`Self::contributions_merkle_root`]. Returns `None` if the id is unknown.
+    /// Mirrors `bridge_lock_proof`.
+    pub fn cnft_proof(&self, node_id: u64) -> Option<merkle::Proof> {
+        let ids: Vec<u64> = self.contributions.keys().copied().collect();
+        let index = ids.iter().position(|&k| k == node_id)?;
+        let leaves: Vec<Hash> = self
+            .contributions
+            .iter()
+            .map(|(id, c)| merkle::leaf_hash(&c.merkle_leaf(*id)))
+            .collect();
+        merkle::MerkleTree::from_leaf_hashes(leaves).proof(index)
+    }
+
+    /// M185: the genesis `contributions_root` (empty cNFT set → empty-tree
+    /// root), mirroring `bridge_merkle_root_for_genesis`. A light client
+    /// anchored on the genesis hash computes this without materialising a full
+    /// `ChainState`.
+    pub fn contributions_merkle_root_for_genesis(g: &Genesis) -> Hash {
+        Self::genesis_split(g.clone()).0.contributions_merkle_root()
     }
 
     /// M28: produce the producer-side graph diff between this state (the
@@ -2580,6 +3605,10 @@ impl Chain {
         // `graph_root` / `accounts_root`. Same trial, same idempotence
         // contract.
         block.bridge_root = trial.bridge_merkle_root();
+        // M185: stamp the cert-signed cNFT directory root alongside the others.
+        block.contributions_root = trial.contributions_merkle_root();
+        // SEC-05: stamp the cert-signed unbonding-queue root alongside the others.
+        block.unbonding_root = trial.unbonding_merkle_root();
         Ok(())
     }
 
@@ -2627,6 +3656,15 @@ impl Chain {
         // commitment.
         if block.bridge_root == [0u8; 32] {
             block.bridge_root = trial.bridge_merkle_root();
+        }
+        // M185: same auto-stamp fallback for the cert-signed cNFT directory
+        // commitment.
+        if block.contributions_root == [0u8; 32] {
+            block.contributions_root = trial.contributions_merkle_root();
+        }
+        // SEC-05: same auto-stamp fallback for the unbonding-queue root.
+        if block.unbonding_root == [0u8; 32] {
+            block.unbonding_root = trial.unbonding_merkle_root();
         }
         self.state = trial;
         self.head = receipt.hash;
@@ -2740,6 +3778,7 @@ mod tests {
             seed_nodes: vec![(unit(1.0, 0), 0)], // domain 0 already occupied
             params: DeltaKParams::default(),
             base_emission_micro: 8 * MICRO,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: vec![
@@ -2808,6 +3847,8 @@ mod tests {
             accounts_root: [0u8; 32],
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
+            contributions_root: [0u8; 32],
+            unbonding_root: [0u8; 32],
             txs,
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
@@ -2816,6 +3857,9 @@ mod tests {
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
             bridge_unbondings: Vec::new(),
+            key_rotations: Vec::new(),
+            gov_proposals: Vec::new(),
+            gov_votes: Vec::new(),
         };
         // best-effort seal: valid blocks get the correct commitments; blocks the
         // negative tests build to fail earlier keep [0;32] and still fail at
@@ -2834,6 +3878,576 @@ mod tests {
         assert!(r.minted > 0);
         assert!(chain.state.supply > start_supply); // reward minted
         assert!(chain.state.supply_conserved());
+    }
+
+    #[test]
+    fn accept_mints_a_cnft_and_reject_does_not() {
+        // M183: an accepted submission mints one cNFT bound to the contributor;
+        // a rejected (near-duplicate, ΔK=0) submission mints none.
+        let mut chain = Chain::new(base_genesis());
+        assert!(chain.state.contributions.is_empty());
+        let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]); // author 1, domain 1
+        let r = chain.commit(&mut b).unwrap();
+        assert_eq!(r.accepted, 1);
+        assert_eq!(chain.state.contributions.len(), 1, "one cNFT minted");
+        let (node_id, c) = chain.state.contributions.iter().next().unwrap();
+        assert_eq!(c.contributor, 1);
+        assert_eq!(c.domain, 1);
+        assert_eq!(c.reward_micro, r.minted, "cNFT records the minted reward");
+        assert_eq!(c.height, 1, "cNFT records the committing height");
+        // The cNFT is keyed by the graph node it accompanies.
+        assert!(chain.state.cnft(*node_id).is_some());
+
+        // A near-duplicate (same embedding in a seen domain ⇒ ΔK 0 ⇒ rejected)
+        // mints no new cNFT.
+        let dup = SubmissionTx {
+            author: 2,
+            embedding: unit(1.0, 0),
+            domain: 0, // domain 0 already seeded at genesis ⇒ novelty 0
+            stake: 2 * MICRO,
+            reviews: good_reviews(),
+            repl_success: 3,
+            repl_total: 3,
+            timestamp_days: 2.0,
+            signature: [0u8; 64],
+            fee: 0,
+            nonce: 0,
+        }
+        .signed(&kp(2));
+        let mut b2 = block(&chain, 2, vec![dup]);
+        let r2 = chain.commit(&mut b2).unwrap();
+        assert_eq!(r2.accepted, 0, "near-duplicate rejected");
+        assert_eq!(chain.state.contributions.len(), 1, "no cNFT for a reject");
+    }
+
+    #[test]
+    fn state_root_covers_contributions() {
+        // M183: cNFTs are folded into state_root, so two states differing only in
+        // their contribution set produce different roots (a snapshot-synced node
+        // can verify the set).
+        let base = Chain::new(base_genesis());
+        let r0 = base.state.state_root();
+        let mut more = base.state.clone();
+        more.contributions.insert(
+            7,
+            Cnft {
+                contributor: 1,
+                domain: 3,
+                reward_micro: 5 * MICRO,
+                height: 2,
+            },
+        );
+        assert_ne!(r0, more.state_root(), "a cNFT changes state_root");
+        // merkle_root (accounts_root) is unaffected — cNFTs are not in it.
+        assert_eq!(base.state.merkle_root(), more.merkle_root());
+    }
+
+    #[test]
+    fn time_decay_factor_halves_each_half_life() {
+        // M187 (§6.2): disabled (half_life 0) is always 1.0; otherwise it's
+        // 0.5^(height/half_life) — 1.0 at height 0, 0.5 at one half-life, 0.25 at two.
+        assert_eq!(time_decay_factor(0, 0), 1.0);
+        assert_eq!(time_decay_factor(100, 0), 1.0);
+        assert_eq!(time_decay_factor(0, 10), 1.0);
+        assert!((time_decay_factor(10, 10) - 0.5).abs() < 1e-12);
+        assert!((time_decay_factor(20, 10) - 0.25).abs() < 1e-12);
+        let mid = time_decay_factor(5, 10);
+        assert!(
+            mid < 1.0 && mid > 0.5,
+            "monotone decreasing within a half-life"
+        );
+    }
+
+    #[test]
+    fn time_decay_factor_is_bit_deterministic() {
+        // M188: a determinism anchor. The factor folds into `reward` → `state_root`,
+        // so its float bits must be identical on every target. `libm::pow` (pure
+        // Rust) guarantees that; these pinned bit patterns fail loudly if someone
+        // reverts to `f64::powf` (which may delegate to a platform libm that differs
+        // by ULPs). Integer-exponent cases stay exact; the risk is fractional ones.
+        assert_eq!(time_decay_factor(1, 4).to_bits(), 0x3feae89f995ad3ae);
+        assert_eq!(time_decay_factor(3, 7).to_bits(), 0x3fe7c6a1f29e2ce6);
+        assert_eq!(time_decay_factor(10, 10), 0.5);
+        assert_eq!(time_decay_factor(20, 10), 0.25);
+    }
+
+    #[test]
+    fn emission_time_decay_reduces_mint_with_chain_age() {
+        // M187 (§6.2): mint = base_emission × ΔK × time_decay. With decay disabled
+        // (half_life 0, the default) an accepted submission mints exactly base × ΔK;
+        // with decay enabled the SAME submission (same ΔK) mints strictly less,
+        // scaled by 0.5^(height/half_life).
+        let tx = novel_tx(1, 1, 1, 1.0);
+
+        let mut g0 = base_genesis();
+        g0.decay_half_life_blocks = 0;
+        let mut c0 = Chain::new(g0);
+        let mut b0 = block(&c0, 1, vec![tx.clone()]);
+        let r0 = c0.commit(&mut b0).unwrap();
+        assert_eq!(r0.accepted, 1);
+        assert!(r0.minted > 0);
+        let dk = r0.txs[0].delta_k;
+        // Disabled path mints exactly the un-decayed base × ΔK.
+        let base_x_dk = ((c0.state.base_emission_micro as f64) * (dk as f64)).round() as u64;
+        assert_eq!(r0.minted, base_x_dk);
+
+        let mut g1 = base_genesis();
+        g1.decay_half_life_blocks = 4;
+        let mut c1 = Chain::new(g1);
+        let mut b1 = block(&c1, 1, vec![tx]);
+        let r1 = c1.commit(&mut b1).unwrap();
+        assert_eq!(r1.accepted, 1);
+        assert_eq!(r1.txs[0].delta_k, dk, "decay does not touch the ΔK engine");
+        assert!(r1.minted < r0.minted, "decay reduces the mint");
+        let expected =
+            ((c1.state.base_emission_micro as f64) * (dk as f64) * time_decay_factor(1, 4)).round()
+                as u64;
+        assert_eq!(r1.minted, expected);
+        // Supply is still conserved under decay (mint credited to both sides).
+        assert!(c1.state.supply_conserved());
+    }
+
+    // ---- M193: hybrid governance core (tally + execution) ----
+
+    /// Build a bare state with explicit stake and reputation distributions so the
+    /// hybrid tally can be exercised in isolation.
+    fn gov_state(bonds: &[(u64, u64)], reviewers: &[(u64, f32)]) -> ChainState {
+        let mut s = Chain::new(base_genesis()).state;
+        s.bonds = bonds.iter().copied().collect();
+        s.bonded = bonds.iter().map(|&(_, a)| a).sum();
+        s.reviewers = reviewers.iter().copied().collect();
+        s
+    }
+
+    fn proposal_with(votes: &[(u64, bool)]) -> Proposal {
+        Proposal {
+            id: 1,
+            param: GovParam::BaseEmission(42),
+            created_height: 1,
+            voting_period: 10,
+            votes: votes.iter().copied().collect(),
+        }
+    }
+
+    #[test]
+    fn gov_tally_needs_both_stake_supermajority_and_reputation_majority() {
+        // Account 1 holds both stake and reputation; a lone yes from it clears both
+        // bars (stake 70/100 > 2/3, reputation 0.6/1.0 > 1/2) ⇒ passes.
+        let s = gov_state(&[(1, 70), (2, 30)], &[(1, 0.6), (2, 0.4)]);
+        assert!(s.gov_tally(&proposal_with(&[(1, true)])));
+        // A `no` (or absence) from account 1 fails both ⇒ rejected.
+        assert!(!s.gov_tally(&proposal_with(&[(1, false)])));
+        assert!(!s.gov_tally(&proposal_with(&[(2, true)]))); // 30/100 stake, 0.4 rep
+    }
+
+    #[test]
+    fn gov_tally_rejects_when_only_one_constituency_approves() {
+        // Voters 1,2 carry ALL the stake but NO reputation (reviewer is account 3).
+        let s = gov_state(&[(1, 70), (2, 30)], &[(3, 1.0)]);
+        // Full stake approval, zero reputation approval ⇒ reject (reputation bar unmet).
+        assert!(!s.gov_tally(&proposal_with(&[(1, true), (2, true)])));
+        // Full reputation approval, zero stake approval ⇒ reject (stake bar unmet).
+        assert!(!s.gov_tally(&proposal_with(&[(3, true)])));
+        // Both together ⇒ passes (stake 100/100, reputation 1.0/1.0).
+        assert!(s.gov_tally(&proposal_with(&[(1, true), (2, true), (3, true)])));
+    }
+
+    #[test]
+    fn gov_tally_is_strict_at_exactly_two_thirds() {
+        // Exactly 2/3 stake must NOT pass (strict `>`). bonds 2:1 ⇒ yes=2, total=3.
+        let s = gov_state(&[(1, 2), (2, 1)], &[(1, 1.0)]);
+        assert!(!s.gov_tally(&proposal_with(&[(1, true)]))); // 2/3 stake, not > 2/3
+                                                             // One more unit of yes-stake crosses it.
+        let s2 = gov_state(&[(1, 3), (2, 1)], &[(1, 1.0)]);
+        assert!(s2.gov_tally(&proposal_with(&[(1, true)]))); // 3/4 > 2/3, rep 1.0 > 1/2
+    }
+
+    #[test]
+    fn gov_tally_empty_constituency_never_passes() {
+        // No bonded stake at all ⇒ stake bar unreachable even with reputation.
+        let s = gov_state(&[], &[(1, 1.0)]);
+        assert!(!s.gov_tally(&proposal_with(&[(1, true)])));
+        // No reviewers at all ⇒ reputation bar unreachable even with full stake.
+        let s2 = gov_state(&[(1, 100)], &[]);
+        assert!(!s2.gov_tally(&proposal_with(&[(1, true)])));
+    }
+
+    #[test]
+    fn apply_gov_param_sets_each_scalar() {
+        let mut s = Chain::new(base_genesis()).state;
+        s.apply_gov_param(&GovParam::BaseEmission(123));
+        assert_eq!(s.base_emission_micro, 123);
+        s.apply_gov_param(&GovParam::SlashBps(777));
+        assert_eq!(s.slash_bps, 777);
+        s.apply_gov_param(&GovParam::DecayHalfLife(9));
+        assert_eq!(s.decay_half_life_blocks, 9);
+    }
+
+    #[test]
+    fn apply_gov_param_sets_each_deltak_field() {
+        // M196: every ΔK-engine knob is governable via GovParam::DeltaK(..).
+        let mut s = Chain::new(base_genesis()).state;
+        s.apply_gov_param(&GovParam::DeltaK(DeltaKParam::TauDup(0.11)));
+        assert_eq!(s.params.tau_dup, 0.11);
+        s.apply_gov_param(&GovParam::DeltaK(DeltaKParam::NReviewMin(4)));
+        assert_eq!(s.params.n_review_min, 4);
+        s.apply_gov_param(&GovParam::DeltaK(DeltaKParam::CCap(0.22)));
+        assert_eq!(s.params.c_cap, 0.22);
+        s.apply_gov_param(&GovParam::DeltaK(DeltaKParam::NMin(6)));
+        assert_eq!(s.params.n_min, 6);
+        s.apply_gov_param(&GovParam::DeltaK(DeltaKParam::Lam(0.33)));
+        assert_eq!(s.params.lam, 0.33);
+        s.apply_gov_param(&GovParam::DeltaK(DeltaKParam::BonusMax(2.5)));
+        assert_eq!(s.params.bonus_max, 2.5);
+        s.apply_gov_param(&GovParam::DeltaK(DeltaKParam::Decay(0.44)));
+        assert_eq!(s.params.decay, 0.44);
+        s.apply_gov_param(&GovParam::DeltaK(DeltaKParam::FreshMin(0.55)));
+        assert_eq!(s.params.fresh_min, 0.55);
+        s.apply_gov_param(&GovParam::DeltaK(DeltaKParam::DeltaKMin(0.66)));
+        assert_eq!(s.params.delta_k_min, 0.66);
+    }
+
+    #[test]
+    fn governance_executes_a_deltak_change_end_to_end() {
+        // M196: a DeltaK proposal passes both quorums and mutates ChainState.params.
+        let mut chain = gov_chain();
+        let prop = GovProposal {
+            proposer: 1,
+            param: GovParam::DeltaK(DeltaKParam::DeltaKMin(0.9)),
+            voting_period: 2,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b1 = block(&chain, 1, vec![]);
+        b1.gov_proposals = vec![prop];
+        chain.seal(&mut b1).unwrap();
+        chain.commit(&mut b1).unwrap();
+        let vote = GovVote {
+            proposal_id: 0,
+            voter: 1,
+            approve: true,
+            nonce: 1,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b2 = block(&chain, 2, vec![]);
+        b2.gov_votes = vec![vote];
+        chain.seal(&mut b2).unwrap();
+        chain.commit(&mut b2).unwrap();
+        let mut b3 = block(&chain, 3, vec![]);
+        chain.commit(&mut b3).unwrap();
+        assert_eq!(chain.state.params.delta_k_min, 0.9, "ΔK knob governed");
+    }
+
+    #[test]
+    fn gov_last_write_wins_within_the_vote_map() {
+        // The votes map is keyed by voter, so a changed vote overwrites (not stacks).
+        let s = gov_state(&[(1, 100)], &[(1, 1.0)]);
+        let mut p = proposal_with(&[(1, true)]);
+        assert!(s.gov_tally(&p));
+        p.votes.insert(1, false); // account 1 flips to no
+        assert!(!s.gov_tally(&p));
+    }
+
+    // ---- M194: governance wired into blocks (propose → vote → execute) ----
+
+    /// Give account 1 enough stake + reputation to pass both quorums alone, so a
+    /// single yes-vote decides a proposal. Returns a chain ready to carry gov ops.
+    fn gov_chain() -> Chain {
+        let mut chain = Chain::new(base_genesis());
+        chain.state.bonds = [(1u64, 100u64)].into_iter().collect();
+        chain.state.bonded = 100;
+        chain.state.reviewers = [(1u64, 1.0f32)].into_iter().collect();
+        chain
+    }
+
+    #[test]
+    fn governance_end_to_end_passes_and_executes() {
+        // M194: propose at h1, vote yes at h2, mature+execute at h3. Account 1 alone
+        // clears both bars (100/100 stake, 1.0/1.0 reputation).
+        let mut chain = gov_chain();
+        let before = chain.state.base_emission_micro;
+
+        let prop = GovProposal {
+            proposer: 1,
+            param: GovParam::BaseEmission(before + 999),
+            voting_period: 2, // created at h1 ⇒ matures at h3
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b1 = block(&chain, 1, vec![]);
+        b1.gov_proposals = vec![prop];
+        chain.seal(&mut b1).unwrap();
+        chain.commit(&mut b1).unwrap();
+        assert_eq!(chain.state.proposals.len(), 1, "proposal registered");
+        assert!(chain.state.proposals.contains_key(&0), "id 0 assigned");
+
+        let vote = GovVote {
+            proposal_id: 0,
+            voter: 1,
+            approve: true,
+            nonce: 1, // account 1's nonce advanced to 1 by the proposal
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b2 = block(&chain, 2, vec![]);
+        b2.gov_votes = vec![vote];
+        chain.seal(&mut b2).unwrap();
+        chain.commit(&mut b2).unwrap();
+        assert_eq!(
+            chain.state.base_emission_micro, before,
+            "not executed before deadline"
+        );
+
+        // h3: deadline reached ⇒ tally + execute + drop.
+        let mut b3 = block(&chain, 3, vec![]);
+        chain.commit(&mut b3).unwrap();
+        assert_eq!(
+            chain.state.base_emission_micro,
+            before + 999,
+            "executed at deadline"
+        );
+        assert!(chain.state.proposals.is_empty(), "matured proposal removed");
+    }
+
+    #[test]
+    fn governance_fails_without_both_quorums() {
+        // Zero votes ⇒ neither bar met ⇒ no change, but the proposal is still dropped
+        // at its deadline.
+        let mut chain = gov_chain();
+        let slash_before = chain.state.slash_bps;
+        let prop = GovProposal {
+            proposer: 1,
+            param: GovParam::SlashBps(1234),
+            voting_period: 1,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b1 = block(&chain, 1, vec![]);
+        b1.gov_proposals = vec![prop];
+        chain.seal(&mut b1).unwrap();
+        chain.commit(&mut b1).unwrap();
+        // h2: deadline (1+1) reached with zero votes ⇒ fails, dropped, slash_bps intact.
+        let mut b2 = block(&chain, 2, vec![]);
+        chain.commit(&mut b2).unwrap();
+        assert!(
+            chain.state.proposals.is_empty(),
+            "failed proposal still removed"
+        );
+        assert_eq!(chain.state.slash_bps, slash_before, "param not applied");
+        assert_ne!(chain.state.slash_bps, 1234);
+    }
+
+    #[test]
+    fn gov_vote_rejects_unknown_and_closed_proposal() {
+        let mut chain = gov_chain();
+        // Unknown proposal id ⇒ UnknownProposal (rolls the block back).
+        let vote = GovVote {
+            proposal_id: 999,
+            voter: 1,
+            approve: true,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b = block(&chain, 1, vec![]);
+        b.gov_votes = vec![vote];
+        assert!(matches!(
+            chain.commit(&mut b).unwrap_err(),
+            ChainError::UnknownProposal(999)
+        ));
+
+        // Register a proposal with voting_period 1 (created h1 ⇒ closed at h2).
+        let prop = GovProposal {
+            proposer: 1,
+            param: GovParam::DecayHalfLife(7),
+            voting_period: 1,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b1 = block(&chain, 1, vec![]);
+        b1.gov_proposals = vec![prop];
+        chain.seal(&mut b1).unwrap();
+        chain.commit(&mut b1).unwrap();
+        // The proposal matures at h2, so a vote AT h2 is both closed and (post-apply)
+        // gone — but the window check fires first: ProposalClosed... except the
+        // proposal is tallied+removed at h2's end. A vote in the SAME h2 block is
+        // applied BEFORE maturity resolution, and h2 >= created(1)+period(1) ⇒ closed.
+        let vote2 = GovVote {
+            proposal_id: 0,
+            voter: 1,
+            approve: true,
+            nonce: 1,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b2 = block(&chain, 2, vec![]);
+        b2.gov_votes = vec![vote2];
+        assert!(matches!(
+            chain.commit(&mut b2).unwrap_err(),
+            ChainError::ProposalClosed { id: 0, height: 2 }
+        ));
+    }
+
+    #[test]
+    fn governance_bad_nonce_and_signature_rejected() {
+        let mut chain = gov_chain();
+        // Wrong signer (kp(2) signing account 1's proposal) ⇒ BadSignature.
+        let bad_sig = GovProposal {
+            proposer: 1,
+            param: GovParam::BaseEmission(1),
+            voting_period: 1,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(2));
+        let mut b = block(&chain, 1, vec![]);
+        b.gov_proposals = vec![bad_sig];
+        assert!(matches!(
+            chain.commit(&mut b).unwrap_err(),
+            ChainError::BadSignature(1)
+        ));
+        // Wrong nonce ⇒ BadNonce.
+        let bad_nonce = GovProposal {
+            proposer: 1,
+            param: GovParam::BaseEmission(1),
+            voting_period: 1,
+            nonce: 5,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b2 = block(&chain, 1, vec![]);
+        b2.gov_proposals = vec![bad_nonce];
+        assert!(matches!(
+            chain.commit(&mut b2).unwrap_err(),
+            ChainError::BadNonce {
+                account: 1,
+                expected: 0,
+                got: 5
+            }
+        ));
+    }
+
+    #[test]
+    fn gov_param_validation_rejects_unsafe_values() {
+        // SEC-04: safe-domain bounds.
+        assert!(validate_gov_param(&GovParam::SlashBps(10_000)).is_ok());
+        assert!(matches!(
+            validate_gov_param(&GovParam::SlashBps(10_001)),
+            Err(ChainError::GovParamOutOfRange("slash_bps"))
+        ));
+        assert!(validate_gov_param(&GovParam::BaseEmission(MAX_BASE_EMISSION_MICRO)).is_ok());
+        assert!(matches!(
+            validate_gov_param(&GovParam::BaseEmission(MAX_BASE_EMISSION_MICRO + 1)),
+            Err(ChainError::GovParamOutOfRange("base_emission_micro"))
+        ));
+        assert!(validate_gov_param(&GovParam::DecayHalfLife(u64::MAX)).is_ok());
+        // ΔK floats: unit-range, finite, non-negative.
+        assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::TauDup(0.9))).is_ok());
+        assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::TauDup(1.5))).is_err());
+        assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::TauDup(f32::NAN))).is_err());
+        assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::Lam(2.0))).is_ok()); // within bound
+        assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::Lam(MAX_DELTAK_PARAM))).is_ok());
+        // SEC-04 re-verify: lam/bonus_max now have an UPPER bound (unbounded before →
+        // governance could drive ΔK, hence the mint, to overflow).
+        assert!(
+            validate_gov_param(&GovParam::DeltaK(DeltaKParam::Lam(MAX_DELTAK_PARAM + 1.0)))
+                .is_err()
+        );
+        assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::BonusMax(1e30))).is_err());
+        assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::Lam(-1.0))).is_err());
+        assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::Decay(f32::INFINITY))).is_err());
+        assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::NMin(MAX_GOV_COUNT))).is_ok());
+        assert!(
+            validate_gov_param(&GovParam::DeltaK(DeltaKParam::NMin(MAX_GOV_COUNT + 1))).is_err()
+        );
+    }
+
+    #[test]
+    fn gov_proposal_with_unsafe_param_is_rejected_at_registration() {
+        // SEC-04: a SlashBps(20000) proposal is rejected when the op applies, so the
+        // unsafe value never enters the proposal set / executes (which would make a
+        // reject slash exceed the stake and break supply conservation).
+        let mut chain = gov_chain();
+        let prop = GovProposal {
+            proposer: 1,
+            param: GovParam::SlashBps(20_000),
+            voting_period: 10,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b = block(&chain, 1, vec![]);
+        b.gov_proposals = vec![prop];
+        assert!(matches!(
+            chain.commit(&mut b).unwrap_err(),
+            ChainError::GovParamOutOfRange("slash_bps")
+        ));
+        assert!(
+            chain.state.proposals.is_empty(),
+            "unsafe proposal not registered"
+        );
+    }
+
+    #[test]
+    fn state_root_covers_proposals() {
+        // M194: proposals fold into state_root — two states differing only by a
+        // proposal produce different roots; merkle_root (accounts tree) is unaffected.
+        let base = gov_chain();
+        let r0 = base.state.state_root();
+        let mut more = base.state.clone();
+        more.proposals.insert(
+            0,
+            Proposal {
+                id: 0,
+                param: GovParam::BaseEmission(5),
+                created_height: 1,
+                voting_period: 3,
+                votes: BTreeMap::new(),
+            },
+        );
+        more.next_proposal_id = 1;
+        assert_ne!(r0, more.state_root(), "a proposal changes state_root");
+        assert_eq!(base.state.merkle_root(), more.merkle_root());
+    }
+
+    #[test]
+    fn state_root_covers_execution_params() {
+        // SEC-02: execution params fold into state_root, so a tampered snapshot/genesis
+        // param can't match a cert-signed root (which would fork execution). Each field
+        // independently moves the root; merkle_root (accounts tree) is unaffected.
+        let base = Chain::new(base_genesis());
+        let r0 = base.state.state_root();
+        let m0 = base.state.merkle_root();
+
+        let mut a = base.state.clone();
+        a.slash_bps += 1;
+        assert_ne!(r0, a.state_root(), "slash_bps changes state_root");
+
+        let mut b = base.state.clone();
+        b.base_emission_micro += 1;
+        assert_ne!(r0, b.state_root(), "base_emission_micro changes state_root");
+
+        let mut c = base.state.clone();
+        c.decay_half_life_blocks += 1;
+        assert_ne!(
+            r0,
+            c.state_root(),
+            "decay_half_life_blocks changes state_root"
+        );
+
+        let mut d = base.state.clone();
+        d.params.delta_k_min += 0.01;
+        assert_ne!(r0, d.state_root(), "a ΔK param changes state_root");
+
+        // None of these touch the accounts/reviewers Merkle tree.
+        for s in [&a, &b, &c, &d] {
+            assert_eq!(m0, s.merkle_root());
+        }
     }
 
     #[test]
@@ -3107,6 +4721,112 @@ mod tests {
         // handed-off set, so recompute the commitment over the final contents.
         let _ = chain.seal(&mut b);
         b
+    }
+
+    /// M179: build a block carrying one `KeyRotation`, signed by `signer`.
+    fn key_rotation_block(
+        chain: &Chain,
+        height: u64,
+        account: u64,
+        new_pubkey: PubKey,
+        nonce: u64,
+        signer: &Keypair,
+    ) -> Block {
+        let op = KeyRotation {
+            account,
+            new_pubkey,
+            nonce,
+            signature: [0u8; 64],
+        }
+        .signed(signer);
+        let mut b = block(chain, height, vec![]);
+        b.key_rotations = vec![op];
+        let _ = chain.seal(&mut b);
+        b
+    }
+
+    #[test]
+    fn key_rotation_swaps_the_account_key_and_retires_the_old() {
+        let mut chain = Chain::new(base_genesis());
+        let new_pub = kp(99).public();
+        let old_root = chain.state.state_root();
+        // Account 1 (a non-validator) rotates, signed by its CURRENT key.
+        let mut b = key_rotation_block(&chain, 1, 1, new_pub, 0, &kp(1));
+        chain.commit(&mut b).expect("rotation commits");
+        assert_eq!(chain.state.accounts[&1].pubkey, new_pub, "key swapped");
+        assert_eq!(chain.state.accounts[&1].nonce, 1, "nonce advanced");
+        assert_ne!(
+            chain.state.state_root(),
+            old_root,
+            "rotation changes state_root"
+        );
+
+        // The OLD key can no longer authorize a rotation (now BadSignature).
+        let mut bad = key_rotation_block(&chain, 2, 1, kp(7).public(), 1, &kp(1));
+        assert!(matches!(
+            chain.commit(&mut bad),
+            Err(ChainError::BadSignature(1))
+        ));
+
+        // The NEW key can (nonce 1).
+        let mut ok = key_rotation_block(&chain, 2, 1, kp(100).public(), 1, &kp(99));
+        chain.commit(&mut ok).expect("new key rotates again");
+        assert_eq!(chain.state.accounts[&1].pubkey, kp(100).public());
+    }
+
+    #[test]
+    fn key_rotation_rejects_bad_signature_and_nonce() {
+        let mut chain = Chain::new(base_genesis());
+        // Signed by the wrong key ⇒ BadSignature.
+        let mut b = key_rotation_block(&chain, 1, 1, kp(99).public(), 0, &kp(2));
+        assert!(matches!(
+            chain.commit(&mut b),
+            Err(ChainError::BadSignature(1))
+        ));
+        // Correct key but wrong nonce ⇒ BadNonce.
+        let mut b = key_rotation_block(&chain, 1, 1, kp(99).public(), 5, &kp(1));
+        assert!(matches!(
+            chain.commit(&mut b),
+            Err(ChainError::BadNonce { account: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn key_rotation_rejects_no_op() {
+        let mut chain = Chain::new(base_genesis());
+        let same = chain.state.accounts[&1].pubkey;
+        let mut b = key_rotation_block(&chain, 1, 1, same, 0, &kp(1));
+        assert!(matches!(
+            chain.commit(&mut b),
+            Err(ChainError::KeyRotationNoop { account: 1 })
+        ));
+    }
+
+    #[test]
+    fn key_rotation_of_a_validator_rederives_the_set() {
+        // M180: a bonded validator CAN rotate its key; the set re-derives its
+        // entry with the new pubkey at the next height, power unchanged.
+        let mut chain = Chain::new(base_genesis());
+        // Bond account 1 so it becomes a validator (set updated post-commit).
+        let mut bond = stake_block(&chain, 1, 1, BondKind::Bond, 5 * MICRO);
+        chain.commit(&mut bond).expect("bond commits");
+        let v = chain.state.validators.get(1).expect("now a validator");
+        assert_eq!(v.pubkey, kp(1).public(), "set holds the old key");
+        assert_eq!(v.power, 5 * MICRO);
+
+        // Account 1 (nonce 0 still — bonding doesn't touch account nonce) rotates
+        // its key, signed by the CURRENT key (kp(1)).
+        let new_pub = kp(99).public();
+        let mut b = key_rotation_block(&chain, 2, 1, new_pub, 0, &kp(1));
+        chain.commit(&mut b).expect("validator rotation commits");
+        assert_eq!(
+            chain.state.accounts[&1].pubkey, new_pub,
+            "account key swapped"
+        );
+        // The set re-derived: same id, same power, NEW pubkey.
+        let v = chain.state.validators.get(1).expect("still a validator");
+        assert_eq!(v.pubkey, new_pub, "set re-derived to the new key");
+        assert_eq!(v.power, 5 * MICRO, "power unchanged by a key rotation");
     }
 
     #[test]
@@ -3461,6 +5181,8 @@ mod tests {
             accounts_root: [0u8; 32],
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
+            contributions_root: [0u8; 32],
+            unbonding_root: [0u8; 32],
             txs: vec![novel_tx(2, 2, 2, 2.0)],
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
@@ -3469,6 +5191,9 @@ mod tests {
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
             bridge_unbondings: Vec::new(),
+            key_rotations: Vec::new(),
+            gov_proposals: Vec::new(),
+            gov_votes: Vec::new(),
             proposer: 0,
         };
         live.seal(&mut b2).unwrap();
@@ -4051,6 +5776,81 @@ mod tests {
         assert!(matches!(err, ChainError::BridgeRootMismatch { height: 1 }));
     }
 
+    #[test]
+    fn unbonding_root_mismatch_is_rejected_on_apply() {
+        // SEC-05: a normal block that populates the unbonding queue commits a real
+        // unbonding_root; tampering it is rejected on apply (the commitment honest
+        // source chains now produce, so dest-side unbond proofs are verifiable).
+        let mut chain = Chain::new(base_genesis());
+        let mut b = block(&chain, 1, Vec::new());
+        b.stake_ops = vec![
+            StakeOp {
+                account: 1,
+                kind: BondKind::Bond,
+                amount: MICRO,
+                signature: [0u8; 64],
+            }
+            .signed(&kp(1)),
+            StakeOp {
+                account: 1,
+                kind: BondKind::Unbond,
+                amount: MICRO,
+                signature: [0u8; 64],
+            }
+            .signed(&kp(1)),
+        ];
+        chain.seal(&mut b).unwrap();
+        assert_ne!(
+            b.unbonding_root, [0u8; 32],
+            "a populated queue has a non-trivial root"
+        );
+        b.unbonding_root = [0xFFu8; 32];
+        let err = chain.commit(&mut b).unwrap_err();
+        assert!(matches!(
+            err,
+            ChainError::UnbondingRootMismatch { height: 1 }
+        ));
+    }
+
+    /// M185: an accepted submission mints a cNFT whose inclusion proof verifies
+    /// against the cert-signed `contributions_root` — same SPV shape as
+    /// `bridge_lock_proof`, on cNFT's own dedicated commitment.
+    #[test]
+    fn cnft_proof_verifies_against_header_contributions_root() {
+        let mut chain = Chain::new(base_genesis());
+        let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        let r = chain.commit(&mut b).unwrap();
+        assert_eq!(r.accepted, 1);
+        let (node_id, c) = {
+            let (id, cnft) = chain.state.contributions.iter().next().unwrap();
+            (*id, cnft.clone())
+        };
+
+        // Producer side: pull the inclusion proof and verify against the
+        // cert-signed `contributions_root`.
+        let proof = chain.state.cnft_proof(node_id).expect("cNFT exists");
+        let leaf = merkle::leaf_hash(&c.merkle_leaf(node_id));
+        assert!(merkle::verify(&b.contributions_root, &leaf, &proof));
+        // A proof for an unknown node_id is None.
+        assert!(chain.state.cnft_proof(node_id + 999).is_none());
+    }
+
+    /// M185: tampered `contributions_root` on apply → ContributionsRootMismatch.
+    #[test]
+    fn contributions_root_mismatch_is_rejected_on_apply() {
+        let mut chain = Chain::new(base_genesis());
+        let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        // Seal so every other root reflects the post-apply shape; THEN tamper
+        // only `contributions_root` to exercise its mismatch path specifically.
+        chain.seal(&mut b).unwrap();
+        b.contributions_root = [0xFFu8; 32];
+        let err = chain.commit(&mut b).unwrap_err();
+        assert!(matches!(
+            err,
+            ChainError::ContributionsRootMismatch { height: 1 }
+        ));
+    }
+
     // ---- M31: on-chain follow + redeem ----
 
     /// M31 helper: the source-chain identity a destination chain's genesis
@@ -4615,6 +6415,8 @@ mod tests {
             accounts_root: [0u8; 32],
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
+            contributions_root: [0u8; 32],
+            unbonding_root: [0u8; 32],
             txs: vec![tx2],
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
@@ -4623,6 +6425,9 @@ mod tests {
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
             bridge_unbondings: Vec::new(),
+            key_rotations: Vec::new(),
+            gov_proposals: Vec::new(),
+            gov_votes: Vec::new(),
         };
         match chain.commit(&mut b2) {
             Err(ChainError::BadNonce {
@@ -4803,7 +6608,6 @@ mod tests {
         amount: u64,
     ) -> (codec::BlockHeader, Commit, merkle::Proof, UnbondingEntry) {
         let mut chain_a = Chain::new(base_genesis());
-        let a_genesis_set = chain_a.state.validators.clone();
         let mut ab1 = block(&chain_a, 1, Vec::new());
         ab1.stake_ops = vec![
             StakeOp {
@@ -4823,33 +6627,16 @@ mod tests {
         ];
         // Seal + certify + commit the honest block first (this applies the
         // stake ops into `chain_a.state.unbonding`).
-        let _cert0 = seal_certify_commit(&mut chain_a, &mut ab1);
-        // Compute the unbonding sub-tree root from the now-populated queue.
-        let leaves: Vec<_> = chain_a
+        let cert0 = seal_certify_commit(&mut chain_a, &mut ab1);
+        // SEC-05: the committed block's header ALREADY commits the unbonding-queue root
+        // (no more patching `bridge_root`). Generate the inclusion proof from the real
+        // post-apply queue and use the real sealed header + its cert verbatim.
+        let proof = chain_a
             .state
-            .unbonding
-            .iter()
-            .map(unbonding_merkle_leaf)
-            .collect();
-        let tree = merkle::MerkleTree::from_leaf_hashes(leaves);
-        let unbonding_root = tree.root();
-        // M173: real proof from the tree (exercises the authenticated `key`/
-        // `leaf_count` path end to end, rather than a hand-built literal).
-        let proof = tree.proof(0).expect("entry 0 exists");
-        // Patch the block's `bridge_root` slot to the unbonding sub-tree
-        // root and re-certify over the patched header (the genesis set is
-        // unchanged — bond+full-unbond nets to zero bonded power).
-        ab1.bridge_root = unbonding_root;
-        let kps: BTreeMap<u64, Keypair> = a_genesis_set
-            .validators()
-            .iter()
-            .map(|v| (v.id, kp(v.id)))
-            .collect();
-        let voters: Vec<u64> = a_genesis_set.validators().iter().map(|v| v.id).collect();
-        let cert =
-            consensus::commit_block(&a_genesis_set, &kps, &ab1, 0, &voters).expect("re-certify");
+            .unbonding_proof(0)
+            .expect("entry 0 exists in the unbonding queue");
         let entry = chain_a.state.unbonding[0].clone();
-        (ab1.header(), cert, proof, entry)
+        (ab1.header(), cert0, proof, entry)
     }
 
     /// End-to-end: chain A produces a real `Unbond` → chain B follows A's

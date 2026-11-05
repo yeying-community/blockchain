@@ -58,7 +58,7 @@ use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::{rustls, TlsAcceptor, TlsConnector};
 use tracing::{debug, error, info, warn};
 
@@ -69,8 +69,12 @@ use crate::crypto::verify;
 use crate::light::{BatchItem, BatchResponseEnvelope, ProofEntry, ProofKind};
 use crate::net::{decode_gossip, encode_gossip, GossipMsg, GossipNode};
 use crate::round::{Action, Msg, RoundState, Step};
+use crate::signer::{SignDomain, Signer};
 use crate::store::{BlockLog, CertLog};
-use crate::{Account, Block, Genesis, Hash, Keypair, PubKey, SlashEvidence, SubmissionTx};
+use crate::{
+    Account, Block, Cnft, Genesis, GovParam, Hash, Keypair, Proposal, PubKey, SlashEvidence,
+    SubmissionTx,
+};
 
 /// Hard cap on a single wire frame (16 MiB). The blocking `read_msg` has no cap
 /// (a hostile `u32` length would allocate up to 4 GiB); a real transport must.
@@ -149,6 +153,78 @@ async fn read_hello<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<u64> {
     let mut b = [0u8; 8];
     r.read_exact(&mut b).await?;
     Ok(u64::from_be_bytes(b))
+}
+
+/// M192: the P2P protocol version, exchanged as the **first 4 bytes** on every peer
+/// connection (before the id/auth handshake). It must increment on **any** wire-format
+/// break — block/header/gossip/snapshot encoding, handshake layout, etc. (the "B2…B5"
+/// generations that previously shipped as uncoordinated hard breaks). Before M192 a
+/// version-mismatched peer silently mis-parsed each other's frames (garbage →
+/// disconnect with no diagnosis); now the mismatch is detected and logged up front.
+///
+/// Why strict equality (not min/max range negotiation): the codec speaks exactly one
+/// wire generation at a time — it cannot decode an older/newer peer's frames — so
+/// "negotiating" a common version would be theater. The honest contract is: same
+/// version ⇒ proceed, different ⇒ reject cleanly. Range negotiation becomes meaningful
+/// only once the node maintains multiple simultaneous wire decoders (not today).
+///
+/// SEC-05 (re-verify): bumped to **3** — the B6 (M194 governance ops) and B7 (SEC-05
+/// `unbonding_root`) wire breaks landed while this constant was still `1`, so a B5/B6
+/// node and a B7 node would have passed the handshake and only failed later on
+/// incompatible frames. Every future wire break MUST bump this (CI/review gate).
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// M221 (rolling-upgrade S1): the LOWEST wire version this build still speaks. Together
+/// with [`PROTOCOL_VERSION`] (the highest) this build advertises the supported range
+/// `[MIN_WIRE_VERSION, PROTOCOL_VERSION]` at handshake; two peers agree on their highest
+/// common version. A build that wants to interop with the previous generation during a
+/// rolling upgrade keeps the old version in this range (then drops it a release later —
+/// a sliding window). Equal to `PROTOCOL_VERSION` today ⇒ single-version behavior, but
+/// now negotiated as a range so future upgrades need no coordinated full-network stop.
+pub const MIN_WIRE_VERSION: u32 = 3;
+
+/// M192 / M221: exchange supported wire-version *ranges* at connection open and agree on
+/// the highest common version (returned). Writes our `[MIN_WIRE_VERSION, PROTOCOL_VERSION]`,
+/// reads the peer's, and errors if the ranges do not overlap. The 8-byte write fits the
+/// socket/TLS buffer so write-then-read can't deadlock. Runs over the already-TLS-wrapped
+/// stream when `[network] enable_tls` is on.
+///
+/// M221 note: moving from a single-u32 exchange (M192) to an 8-byte range is itself a
+/// one-time handshake break (a pre-M221 node sends 4 bytes) — the bootstrap break that
+/// enables all *subsequent* upgrades to roll without a coordinated stop. See
+/// [`docs/design/rolling-upgrade.md`](../../docs/design/rolling-upgrade.md).
+///
+/// Security note: when `require_peer_auth` is on this runs *before* the authenticated
+/// handshake, so a MITM could tamper the version bytes — but a tampered value only
+/// forces a *reject* (disconnect), never a downgrade to weaker crypto, so the worst
+/// case is a DoS equivalent to cutting the wire. Folding the negotiated version into
+/// the auth transcript (to detect tampering when authed) is a follow-up hardening.
+async fn negotiate_version<R, W>(rd: &mut R, wr: &mut W) -> io::Result<u32>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let mut ours = [0u8; 8];
+    ours[0..4].copy_from_slice(&MIN_WIRE_VERSION.to_be_bytes());
+    ours[4..8].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    wr.write_all(&ours).await?;
+    wr.flush().await?;
+    let mut b = [0u8; 8];
+    rd.read_exact(&mut b).await?;
+    let peer_min = u32::from_be_bytes(b[0..4].try_into().unwrap());
+    let peer_max = u32::from_be_bytes(b[4..8].try_into().unwrap());
+    // Agree on the highest version both sides speak; reject if the ranges don't overlap.
+    let common_min = MIN_WIRE_VERSION.max(peer_min);
+    let common_max = PROTOCOL_VERSION.min(peer_max);
+    if common_max < common_min {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "no common wire version: local [{MIN_WIRE_VERSION},{PROTOCOL_VERSION}] peer [{peer_min},{peer_max}]"
+            ),
+        ));
+    }
+    Ok(common_max)
 }
 
 // ----------------------------------------------------------------------------
@@ -232,7 +308,7 @@ fn auth_transcript(
 /// daemon fails fast at boot otherwise.
 struct AuthContext {
     my_id: u64,
-    kp: Option<Keypair>,
+    signer: Option<Arc<dyn Signer>>,
     validators: HashMap<u64, PubKey>,
     require: bool,
     tls: Option<TlsSetup>,
@@ -290,7 +366,7 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    let kp = ctx.kp.as_ref().ok_or_else(|| {
+    let signer = ctx.signer.as_ref().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "peer auth required but this node has no signing key",
@@ -304,7 +380,7 @@ where
     }
     // Only fold the binding in when the policy is on (byte-identical to M40 otherwise).
     let cb = if ctx.bind_channel { binding } else { None };
-    let my_pk = kp.public();
+    let my_pk = signer.public();
     let mut my_nonce = [0u8; 32];
     getrandom::getrandom(&mut my_nonce)
         .map_err(|e| io::Error::other(format!("handshake nonce rng failed: {e}")))?;
@@ -327,13 +403,12 @@ where
     peer_nonce.copy_from_slice(&pi[40..72]);
 
     // sign our transcript and send the signature
-    let sig = kp.sign(&auth_transcript(
-        ctx.my_id,
-        &my_nonce,
-        peer_id,
-        &peer_nonce,
-        cb,
-    ));
+    let sig = signer
+        .sign(
+            SignDomain::Handshake,
+            &auth_transcript(ctx.my_id, &my_nonce, peer_id, &peer_nonce, cb),
+        )
+        .map_err(|e| io::Error::other(format!("handshake signer unavailable: {e}")))?;
     wr.write_all(&sig).await?;
     wr.flush().await?;
 
@@ -392,6 +467,18 @@ enum Cmd {
     /// (with the tx hash) or reject (with the `ChainError`).
     SubmitTx {
         tx: Box<SubmissionTx>,
+        reply: oneshot::Sender<Result<Hash, crate::ChainError>>,
+    },
+    /// M198: a governance proposal / vote submitted via the external ingress RPC.
+    /// Signature + account existence are checked here (cheap, rejects garbage before
+    /// flooding); nonce / window / quorum are enforced at block apply. On success the
+    /// op is staged + flooded and the op hash is returned.
+    SubmitGovProposal {
+        op: Box<crate::GovProposal>,
+        reply: oneshot::Sender<Result<Hash, crate::ChainError>>,
+    },
+    SubmitGovVote {
+        op: Box<crate::GovVote>,
         reply: oneshot::Sender<Result<Hash, crate::ChainError>>,
     },
     /// M115: a pre-flight validation — run `validate_tx` against current committed state
@@ -483,6 +570,16 @@ enum Cmd {
     /// empty) list.
     QueryReviewers {
         reply: oneshot::Sender<Vec<(u64, f32)>>,
+    },
+    /// M184: list every cNFT (node_id + the `Cnft` record) for the plain read-class RPC
+    /// directory — the read sibling that surfaces the soulbound cognitive-contribution
+    /// certificates. Always a (possibly empty) node_id-sorted list.
+    QueryCnfts {
+        reply: oneshot::Sender<Vec<(u64, Cnft)>>,
+    },
+    /// M197: list every active governance proposal (id-sorted) for the directory read.
+    QueryProposals {
+        reply: oneshot::Sender<Vec<Proposal>>,
     },
     /// M86: list all cognitive-graph nodes (node_id + domain + embedding) for the plain
     /// read-class RPC directory — the list sibling of the single `/graph/{id}` plain read.
@@ -709,6 +806,14 @@ pub struct Metrics {
     pub tx_submit_buckets: [u64; N_TX_BUCKETS],
     pub tx_submit_sum_micros: u64,
     pub tx_submit_count: u64,
+    /// M212: committed heights in this node's local liveness-observability window (the
+    /// miss-rate denominator). Observability only — see `net::LivenessTracker`.
+    pub liveness_samples: u64,
+    /// M212: `(validator_id, missed_commits)` for every current validator within the
+    /// liveness window, from THIS node's cert view (non-consensus observability, sorted
+    /// by id). An operator watches this to spot a persistently-absent validator and
+    /// remove it via a normal validator-set change (there is no automatic jailing).
+    pub validator_missed: Vec<(u64, u64)>,
 }
 
 /// A handle to a running node (for the in-process `localnet` demo and tests).
@@ -748,7 +853,7 @@ fn load_snapshot_boot(
             "snapshot header_hex is not valid hex",
         )
     })?;
-    let header = crate::codec::decode_header(&header_bytes).map_err(|e| {
+    let header = crate::codec::decode_header_any(&header_bytes).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("decode snapshot header: {e:?}"),
@@ -825,7 +930,7 @@ fn snapshot_trusted_set(
 
 /// M140: lowercase/uppercase hex → bytes; `None` on odd length or a non-hex char.
 fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let nib = |b: u8| match b {
@@ -935,6 +1040,47 @@ impl Node {
         rx.await.ok()
     }
 
+    /// M198: submit a governance proposal / vote through the external-ingress path.
+    /// `Ok(hash)` once staged + flooded; `Err` with the structured admission reason
+    /// when the op was NOT staged (bad sig / unknown account / param out of range /
+    /// nonce outside the window / pool full / account quota / already seen — see
+    /// `GossipNode::submit_local_gov_proposal`). `None` if the actor has stopped.
+    pub async fn submit_gov_proposal(
+        &self,
+        op: crate::GovProposal,
+    ) -> Option<Result<Hash, crate::ChainError>> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd
+            .send(Cmd::SubmitGovProposal {
+                op: Box::new(op),
+                reply,
+            })
+            .ok()?;
+        rx.await.ok()
+    }
+
+    pub async fn submit_gov_vote(
+        &self,
+        op: crate::GovVote,
+    ) -> Option<Result<Hash, crate::ChainError>> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd
+            .send(Cmd::SubmitGovVote {
+                op: Box::new(op),
+                reply,
+            })
+            .ok()?;
+        rx.await.ok()
+    }
+
+    /// M198: snapshot the id-sorted active governance proposals (read handle for the
+    /// `GET /proposals` directory + tests). `None` if the actor has stopped.
+    pub async fn proposals(&self) -> Option<Vec<crate::Proposal>> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd.send(Cmd::QueryProposals { reply }).ok()?;
+        rx.await.ok()
+    }
+
     /// M58: read one account snapshot via the read-class query path. The outer
     /// `None` means the actor has stopped; the inner `None` means no such account.
     pub async fn account(&self, id: u64) -> Option<Option<Account>> {
@@ -1025,7 +1171,12 @@ struct Actor {
     /// One outbound queue per connected peer id.
     outbound: HashMap<u64, mpsc::UnboundedSender<GossipMsg>>,
     /// This process's signing key, or `None` for a pure follower (never votes).
-    kp: Option<Keypair>,
+    signer: Option<Arc<dyn Signer>>,
+    /// M180: a staged **pending** signing key for an in-flight key rotation. When
+    /// this validator's own `KeyRotation` takes effect (the active set's pubkey
+    /// for our id changes to this key), `reconcile_signing_key` swaps it into
+    /// `kp`. `None` when no rotation is staged.
+    pending_kp: Option<Keypair>,
     /// Self-scheduling channel (consensus timeouts + next-height starts).
     self_tx: mpsc::UnboundedSender<Cmd>,
     /// Live consensus for `node.height()+1`, if this validator is running one.
@@ -1290,7 +1441,7 @@ impl Actor {
     fn on_start_tick(&mut self, height: u64) {
         if self.timing.create_empty_blocks || self.node.has_pending_work() {
             self.start_height(height);
-        } else if self.kp.is_some() && self.node.height() + 1 == height {
+        } else if self.signer.is_some() && self.node.height() + 1 == height {
             // Nothing to propose yet: hold the height and check again later.
             self.schedule_start(height, self.timing.block_interval_ms);
         }
@@ -1303,7 +1454,7 @@ impl Actor {
     /// gate before calling here, while `on_consensus` calls here directly (a peer's
     /// proposal already implies work).
     fn start_height(&mut self, height: u64) {
-        if self.kp.is_none() {
+        if self.signer.is_none() {
             return; // pure follower
         }
         if self.node.height() + 1 != height {
@@ -1326,7 +1477,7 @@ impl Actor {
             }
         };
         let mut round = RoundState::new(active, val_id, height, candidate);
-        let actions = match self.kp.as_ref() {
+        let actions = match self.signer.as_deref() {
             Some(kp) => round.start(kp),
             None => return,
         };
@@ -1346,7 +1497,7 @@ impl Actor {
             Msg::Proposal(p) => p.height,
             Msg::Vote(v) => v.height,
         };
-        if self.kp.is_some()
+        if self.signer.is_some()
             && mh == self.node.height() + 1
             && self.cons.as_ref().is_none_or(|c| c.height != mh)
         {
@@ -1360,7 +1511,7 @@ impl Actor {
                 return;
             }
         }
-        let (height, actions) = match (self.kp.as_ref(), self.cons.as_mut()) {
+        let (height, actions) = match (self.signer.as_deref(), self.cons.as_mut()) {
             (Some(kp), Some(cons)) => (cons.height, cons.round.on_message(kp, m)),
             _ => return,
         };
@@ -1369,7 +1520,7 @@ impl Actor {
 
     /// M33: a consensus timeout fired — advance the round if it is still current.
     fn on_timeout(&mut self, height: u64, step: Step, round: u32) {
-        let (h, actions) = match (self.kp.as_ref(), self.cons.as_mut()) {
+        let (h, actions) = match (self.signer.as_deref(), self.cons.as_mut()) {
             (Some(kp), Some(cons)) if cons.height == height => {
                 (cons.height, cons.round.on_timeout(kp, step, round))
             }
@@ -1410,6 +1561,9 @@ impl Actor {
             self.blocks_committed += 1; // M52
             self.persist();
             self.broadcast_status();
+            // M180: our own key rotation may have just taken effect — align the
+            // signing key with the set before starting the next height.
+            self.reconcile_signing_key();
         }
         self.cons = None;
         self.schedule_start(self.node.height() + 1, self.timing.block_interval_ms);
@@ -1441,7 +1595,7 @@ impl Actor {
     /// round we were running for a now-committed height is obsolete, so drop it
     /// and (re)arm consensus for the new next height.
     fn reconcile_after_sync(&mut self) {
-        if self.kp.is_none() {
+        if self.signer.is_none() {
             return; // pure follower never runs consensus
         }
         let stale = self
@@ -1451,6 +1605,87 @@ impl Actor {
         if stale {
             self.cons = None;
             self.schedule_start(self.node.height() + 1, self.timing.block_interval_ms);
+        }
+    }
+
+    /// M180: after a block commits (self-decided OR synced), keep this node's
+    /// signing key aligned with the active validator set. If our own key rotation
+    /// has taken effect — the set's pubkey for our id no longer matches the key we
+    /// hold — adopt the staged pending key when it matches, so the next height is
+    /// signed with the key the set now expects. If no pending key matches, keep
+    /// the old one and warn: this validator will miss votes until restarted with
+    /// the new key (a local liveness gap, never a safety or whole-mesh problem).
+    /// A stateless invariant ("signing key == set pubkey for our id") rather than
+    /// height tracking, so it covers both commit paths uniformly.
+    fn reconcile_signing_key(&mut self) {
+        let Some(kp) = self.signer.as_deref() else {
+            return; // pure follower
+        };
+        let expected = self
+            .node
+            .chain
+            .state
+            .validators
+            .get(self.node.id)
+            .map(|v| v.pubkey);
+        let decision = resolve_signing_key(
+            kp.public(),
+            self.pending_kp.as_ref().map(|k| k.public()),
+            expected,
+        );
+        match decision {
+            SigningKeyDecision::Keep => {}
+            SigningKeyDecision::Adopt => {
+                self.signer = self
+                    .pending_kp
+                    .take()
+                    .map(|k| Arc::new(k) as Arc<dyn Signer>);
+                info!(
+                    node = self.node.id,
+                    "adopted rotated signing key (own KeyRotation took effect)"
+                );
+            }
+            SigningKeyDecision::Stale => {
+                warn!(
+                    node = self.node.id,
+                    "active set expects a signing key this node does not hold \
+                     (no matching pending key staged) — this validator will miss \
+                     votes until restarted with the new key"
+                );
+            }
+        }
+    }
+}
+
+/// M180: what to do with this node's signing key after a commit, given the key it
+/// currently holds, an optionally-staged pending key, and the pubkey the active
+/// set now expects for this node's id (`None` ⇒ not in the set). Pure so it is
+/// unit-testable without constructing an `Actor`.
+#[derive(Debug, PartialEq, Eq)]
+enum SigningKeyDecision {
+    /// Current key still matches the set (or we're not in the set) — no change.
+    Keep,
+    /// Current key no longer matches, but the pending key does — swap it in.
+    Adopt,
+    /// Current key no longer matches and no pending key matches — degraded.
+    Stale,
+}
+
+fn resolve_signing_key(
+    current: PubKey,
+    pending: Option<PubKey>,
+    expected: Option<PubKey>,
+) -> SigningKeyDecision {
+    match expected {
+        // Not in the active set, or the set still expects our current key.
+        None => SigningKeyDecision::Keep,
+        Some(exp) if exp == current => SigningKeyDecision::Keep,
+        Some(exp) => {
+            if pending == Some(exp) {
+                SigningKeyDecision::Adopt
+            } else {
+                SigningKeyDecision::Stale
+            }
         }
     }
 }
@@ -1504,6 +1739,7 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 actor.persist();
                 if actor.node.height() > before {
                     actor.broadcast_status();
+                    actor.reconcile_signing_key(); // M180: rotation may have landed via sync
                     actor.reconcile_after_sync();
                 }
             }
@@ -1532,6 +1768,32 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                         let _ = reply.send(Err(e));
                     }
                 }
+            }
+            Cmd::SubmitGovProposal { op, reply } => {
+                // M198 / SEC-01 (round 3): admission (sig / param / nonce window / pool
+                // caps / dedup) is the GossipNode's shared helper — the same path gossip
+                // ingress uses — so the RPC caller gets the structured reason when the
+                // op was NOT staged instead of a misleading `Ok(hash)`.
+                let h = op.hash();
+                let res = match actor.node.submit_local_gov_proposal(*op) {
+                    Ok(out) => {
+                        actor.route(out);
+                        Ok(h)
+                    }
+                    Err(e) => Err(e),
+                };
+                let _ = reply.send(res);
+            }
+            Cmd::SubmitGovVote { op, reply } => {
+                let h = op.hash();
+                let res = match actor.node.submit_local_gov_vote(*op) {
+                    Ok(out) => {
+                        actor.route(out);
+                        Ok(h)
+                    }
+                    Err(e) => Err(e),
+                };
+                let _ = reply.send(res);
             }
             Cmd::ValidateTx { tx, reply } => {
                 // M115: read-only pre-flight — static validation against current state, no
@@ -1581,6 +1843,9 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     }
                     // Account has its own plain read (QueryAccount); never routed here.
                     ProofKind::Account => None,
+                    // M185: cNFTs use the `/cnfts` directory (M184) and the typed SPV
+                    // proof (M185); no single-entity plain read is routed here.
+                    ProofKind::Cnft => None,
                 };
                 let _ = reply.send(view);
             }
@@ -1637,6 +1902,25 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     .map(|(&id, &r)| (id, r))
                     .collect();
                 let _ = reply.send(reviewers);
+            }
+            Cmd::QueryCnfts { reply } => {
+                // M184: snapshot the node_id-sorted cNFT map for the list directory. Keyed by
+                // the cognitive-graph node_id (one accepted submission = one graph node = one
+                // cNFT), so the keys are a stable, monotonic cursor space.
+                let cnfts = actor
+                    .node
+                    .chain
+                    .state
+                    .contributions
+                    .iter()
+                    .map(|(&id, c)| (id, c.clone()))
+                    .collect();
+                let _ = reply.send(cnfts);
+            }
+            Cmd::QueryProposals { reply } => {
+                // M197: snapshot the id-sorted governance proposals for the directory.
+                let proposals = actor.node.chain.state.proposals.values().cloned().collect();
+                let _ = reply.send(proposals);
             }
             Cmd::QueryGraphNodes { reply } => {
                 // M86: snapshot the insertion-ordered graph node vector (node_id == index).
@@ -1741,6 +2025,7 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 let s = &actor.node.chain.state;
                 let _ = reply.send(ParamsView {
                     base_emission_micro: s.base_emission_micro,
+                    decay_half_life_blocks: s.decay_half_life_blocks,
                     slash_bps: s.slash_bps,
                     tau_dup: s.params.tau_dup,
                     n_review_min: s.params.n_review_min,
@@ -1756,7 +2041,7 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             Cmd::QueryConfig { reply } => {
                 // M119: operational config from the actor's resolved timing + mempool bounds.
                 let _ = reply.send(ConfigView {
-                    role: if actor.kp.is_some() {
+                    role: if actor.signer.is_some() {
                         "validator"
                     } else {
                         "follower"
@@ -1777,7 +2062,7 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             }
             Cmd::QueryNode { reply } => {
                 // M120: this node's own id + whether it holds a voting key.
-                let _ = reply.send((actor.node.id, actor.kp.is_some()));
+                let _ = reply.send((actor.node.id, actor.signer.is_some()));
             }
             Cmd::QueryGenesisHash { reply } => {
                 // M106: this node's chain identity, stamped into state at genesis_split.
@@ -1799,11 +2084,12 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 let _ = reply.send(actor.node.base_height());
             }
             Cmd::Metrics(reply) => {
+                let (liveness_samples, validator_missed) = actor.node.liveness_report();
                 let _ = reply.send(Metrics {
                     height: actor.node.height(),
                     head: actor.node.head(),
                     peers: actor.outbound.len(),
-                    is_validator: actor.kp.is_some(),
+                    is_validator: actor.signer.is_some(),
                     consensus_active: actor.cons.is_some(),
                     mempool: actor.node.mempool.len(),
                     mempool_capacity: actor.node.mempool.capacity(),
@@ -1831,6 +2117,11 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     tx_submit_buckets: actor.tx_submit_buckets,
                     tx_submit_sum_micros: actor.tx_submit_sum_micros,
                     tx_submit_count: actor.tx_submit_count,
+                    liveness_samples: liveness_samples as u64,
+                    validator_missed: validator_missed
+                        .into_iter()
+                        .map(|(id, m)| (id, m as u64))
+                        .collect(),
                 });
             }
         }
@@ -1870,6 +2161,13 @@ async fn handle_conn<C: TransportCmd>(
 ) {
     let my_id = ctx.my_id;
     let (mut rd, mut wr) = tokio::io::split(stream);
+
+    // M192: negotiate the protocol version first, on both the plain and authenticated
+    // paths — a wire-gen mismatch now rejects explicitly instead of mis-parsing frames.
+    if let Err(e) = negotiate_version(&mut rd, &mut wr).await {
+        warn!(node = my_id, error = %e, "protocol version negotiation failed — dropping peer");
+        return;
+    }
 
     let peer_id = if ctx.require {
         match auth_handshake(&mut rd, &mut wr, &ctx, binding.as_ref()).await {
@@ -1914,20 +2212,45 @@ async fn handle_conn<C: TransportCmd>(
     writer.abort();
 }
 
+/// M177: try to reserve one inbound-connection slot from `limiter`, returning a
+/// permit to hold for the connection's lifetime (released on drop) or `None` if
+/// the concurrency cap is already reached. Non-blocking: at the cap we drop the
+/// new connection rather than queue it, so a flood of inbound sockets can never
+/// grow the task count or memory without bound. Each accept loop
+/// ([`run_listener`], [`run_metrics`], [`run_rpc`]) previously spawned one task
+/// per accepted connection with no ceiling — the pre-M177 DoS surface.
+fn admit_inbound(limiter: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    limiter.clone().try_acquire_owned().ok()
+}
+
 async fn run_listener<C: TransportCmd + Send + 'static>(
     listener: TcpListener,
     ctx: Arc<AuthContext>,
     cmd: mpsc::UnboundedSender<C>,
+    max_conns: usize,
 ) {
     let my_id = ctx.my_id;
+    let limiter = Arc::new(Semaphore::new(max_conns));
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((stream, addr)) => {
+                // M177: refuse past the concurrency cap instead of spawning an
+                // unbounded task. The permit lives inside the spawned task and
+                // frees the slot when the connection ends.
+                let permit = match admit_inbound(&limiter) {
+                    Some(p) => p,
+                    None => {
+                        warn!(node = my_id, %addr, "inbound connection cap reached; dropping");
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let ctx = ctx.clone();
                 let cmd = cmd.clone();
                 // Wrap (TLS accept) inside the spawned task so a slow or hostile
                 // TLS handshake never blocks the accept loop.
                 tokio::spawn(async move {
+                    let _permit = permit; // held for the connection's lifetime
                     let _ = stream.set_nodelay(true);
                     match server_wrap(&ctx, stream).await {
                         Ok((s, binding)) => handle_conn(s, binding, ctx, cmd).await,
@@ -2111,13 +2434,79 @@ fn build_encrypt_only_tls_setup() -> io::Result<TlsSetup> {
     // Fresh self-signed cert + key for this process (SAN "zhixing-node").
     let cert = rcgen::generate_simple_self_signed(vec!["zhixing-node".to_string()])
         .map_err(|e| io::Error::other(format!("self-signed cert generation failed: {e}")))?;
-    let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
-    let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der())
+    let cert_der = cert.cert.der().to_vec();
+    let key_der = cert.key_pair.serialize_der();
+    encrypt_only_setup_from_der(cert_der, key_der)
+}
+
+/// M178: an encryption-only TLS setup whose self-signed cert+key **persist** at
+/// `cert_path` / `key_path` (DER). If both files exist they are loaded; otherwise
+/// a fresh pair is generated and written (the key `0600`). A stable cert means a
+/// stable fingerprint operators can pin — trust-on-first-use survives restarts,
+/// unlike the ephemeral [`build_encrypt_only_tls_setup`] that regenerates every
+/// boot. The DER bytes are exactly what rustls consumes and what a fingerprint is
+/// computed over, so no PEM parsing (and no extra dependency) is needed.
+fn load_or_create_encrypt_only_tls_setup(cert_path: &str, key_path: &str) -> io::Result<TlsSetup> {
+    let (cert_der, key_der) = if std::path::Path::new(cert_path).exists()
+        && std::path::Path::new(key_path).exists()
+    {
+        (std::fs::read(cert_path)?, std::fs::read(key_path)?)
+    } else {
+        let cert = rcgen::generate_simple_self_signed(vec!["zhixing-node".to_string()])
+            .map_err(|e| io::Error::other(format!("self-signed cert generation failed: {e}")))?;
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.key_pair.serialize_der();
+        if let Some(parent) = std::path::Path::new(cert_path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(cert_path, &cert_der)?;
+        write_private_der(key_path, &key_der)?;
+        (cert_der, key_der)
+    };
+    encrypt_only_setup_from_der(cert_der, key_der)
+}
+
+/// M178: write a private-key DER with owner-only (`0600`) permissions on Unix (no
+/// world-readable window: created with mode `0600`, re-asserted after). On other
+/// platforms a plain write (no POSIX mode). Mirrors the `cmd_keygen` key-file
+/// discipline, kept here so the daemon has no cross-module dependency.
+fn write_private_der(path: &str, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
+/// M178: build the encryption-only [`TlsSetup`] (accept-any client verifier) from
+/// already-materialized cert+key DER — the shared tail of the ephemeral
+/// [`build_encrypt_only_tls_setup`] and the persistent
+/// [`load_or_create_encrypt_only_tls_setup`].
+fn encrypt_only_setup_from_der(cert_der: Vec<u8>, key_der: Vec<u8>) -> io::Result<TlsSetup> {
+    // Install the ring crypto provider process-wide (idempotent) so this path is
+    // self-sufficient even when `[network] enable_tls` is off and no P2P TLS
+    // setup ran first (a metrics/RPC-only TLS node).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let cert = rustls::pki_types::CertificateDer::from(cert_der);
+    let key = rustls::pki_types::PrivateKeyDer::try_from(key_der)
         .map_err(|e| io::Error::other(format!("private key encoding failed: {e}")))?;
 
     let server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)
+        .with_single_cert(vec![cert], key)
         .map_err(|e| io::Error::other(format!("TLS server config failed: {e}")))?;
 
     let client_config = rustls::ClientConfig::builder()
@@ -2571,6 +2960,24 @@ fn render_prometheus(m: &Metrics) -> String {
         "zhixing_tx_submit_to_commit_seconds_count {}\n",
         m.tx_submit_count,
     ));
+    // M212: local liveness observability. `zhixing_liveness_window_samples` is how many
+    // recently-committed heights this node remembers; `zhixing_validator_missed_commits`
+    // is, per current validator, how many of those it did NOT see sign (this node's cert
+    // view — non-consensus). A validator whose missed count tracks the window size has
+    // likely gone offline; remove it via a validator-set change (no automatic jailing).
+    gauge(
+        &mut s,
+        "zhixing_liveness_window_samples",
+        "Committed heights in this node's local liveness window (miss-rate denominator).",
+        m.liveness_samples,
+    );
+    s.push_str("# HELP zhixing_validator_missed_commits Missed commits per current validator within the local liveness window (this node's cert view).\n");
+    s.push_str("# TYPE zhixing_validator_missed_commits gauge\n");
+    for (id, missed) in &m.validator_missed {
+        s.push_str(&format!(
+            "zhixing_validator_missed_commits{{validator=\"{id}\"}} {missed}\n"
+        ));
+    }
     s
 }
 
@@ -2600,15 +3007,26 @@ async fn run_metrics(
     auth_failures: Arc<AtomicU64>,
     tls: Option<TlsAcceptor>,
     cmd: mpsc::UnboundedSender<Cmd>,
+    max_conns: usize,
 ) {
+    let limiter = Arc::new(Semaphore::new(max_conns));
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((stream, addr)) => {
+                let permit = match admit_inbound(&limiter) {
+                    Some(p) => p,
+                    None => {
+                        warn!(node = my_id, %addr, "metrics connection cap reached; dropping");
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let tls = tls.clone();
                 let auth_token = auth_token.clone();
                 let auth_failures = auth_failures.clone();
                 let cmd = cmd.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let _ = stream.set_nodelay(true);
                     match wrap_optional_tls(stream, tls).await {
                         Ok(s) => serve_metrics_conn(s, auth_token, auth_failures, cmd).await,
@@ -2804,6 +3222,21 @@ fn unauthorized_bearer_response() -> String {
 
 /// Build a fixed-shape `HTTP/1.1` response with a plain-text body. `status_line`
 /// is e.g. `"200 OK"`; the connection is closed after the response.
+/// SEC-01 (round 3): HTTP status for a governance op the actor did NOT stage. Every
+/// case is a client-visible 4xx (never a 200 with a hash): load-shedding bounds
+/// (pool full / per-account quota) → 429 so the client backs off and retries; a
+/// content-hash the node already has → 409; everything else (bad sig, unknown
+/// account, param out of range, nonce stale / too far ahead, closed proposal) → 422.
+fn gov_reject_status(e: &crate::ChainError) -> &'static str {
+    match e {
+        crate::ChainError::GovPoolFull | crate::ChainError::GovAccountQuotaExceeded { .. } => {
+            "429 Too Many Requests"
+        }
+        crate::ChainError::GovAlreadySeen => "409 Conflict",
+        _ => "422 Unprocessable Entity",
+    }
+}
+
 fn http_response(status_line: &str, body: &str) -> String {
     // M66: delegate to the Content-Type-aware builder with the historic plaintext type,
     // so every pre-M66 caller's output stays byte-identical.
@@ -2980,15 +3413,26 @@ async fn run_rpc(
     auth_failures: Arc<AtomicU64>,
     tls: Option<TlsAcceptor>,
     cmd: mpsc::UnboundedSender<Cmd>,
+    max_conns: usize,
 ) {
+    let limiter = Arc::new(Semaphore::new(max_conns));
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((stream, addr)) => {
+                let permit = match admit_inbound(&limiter) {
+                    Some(p) => p,
+                    None => {
+                        warn!(node = my_id, %addr, "rpc connection cap reached; dropping");
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let token = auth_token.clone();
                 let tls = tls.clone();
                 let auth_failures = auth_failures.clone();
                 let cmd = cmd.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let _ = stream.set_nodelay(true);
                     match wrap_optional_tls(stream, tls).await {
                         Ok(s) => serve_rpc_conn(s, token, auth_failures, cmd).await,
@@ -3048,6 +3492,15 @@ enum GetRoute {
     /// M85: `GET /reviewers` — the plain (unverified) reviewer directory (id + reputation),
     /// the list sibling of `Plain(Reviewer, id)`.
     Reviewers,
+    /// M184: `GET /cnfts` — the plain (unverified) cNFT directory (node_id + contributor +
+    /// domain + reward_micro + height), the read sibling that exposes the soulbound
+    /// cognitive-contribution certificate bound to each accepted submission. No single-read
+    /// sibling yet.
+    Cnfts,
+    /// M197: `GET /proposals` — the governance directory (active proposals: id + param +
+    /// target value + created_height + voting_period + vote tally). The read sibling of
+    /// the M194 on-chain governance state. No single-read sibling yet.
+    Proposals,
     /// M86: `GET /graph` — the plain (unverified) cognitive-graph directory (node_id +
     /// domain + embedding), the list sibling of `Plain(GraphNode, id)`.
     GraphNodes,
@@ -3059,8 +3512,8 @@ enum GetRoute {
     /// height), the withdrawals awaiting return to balances after `UNBONDING_PERIOD`.
     /// A read sibling of `/bonds` on the stake lifecycle; no single-read sibling.
     Unbonding,
-    /// M89: `GET /stake-ops` — the pending stake-op pool (account + bond/unbond + amount
-    /// + signature) staged for the next proposed block. The first *pending-pool* read
+    /// M89: `GET /stake-ops` — the pending stake-op pool (account, bond/unbond, amount,
+    /// signature) staged for the next proposed block. The first *pending-pool* read
     /// (mempool-side, not committed state); no single-read sibling.
     StakeOps,
     /// M90: `GET /evidence` — the pending slashing-evidence pool (pairs of conflicting
@@ -3460,6 +3913,12 @@ fn route_get(path: &str) -> GetRoute {
         // M85: the plain reviewer directory. Exact-match here, so it never collides with
         // the M60/M65 `/reviewer/` prefix below (`…reviewer` + `s`, not `…reviewer` + `/`).
         "/reviewers" => GetRoute::Reviewers,
+        // M184: the plain cNFT directory. Exact-match; there is no `/cnft/` single-read
+        // prefix, so `/cnfts/` simply falls through to `Health`.
+        "/cnfts" => GetRoute::Cnfts,
+        // M197: the governance proposal directory. Exact-match; no `/proposal/` single-read
+        // prefix, so `/proposals/` simply falls through to `Health`.
+        "/proposals" => GetRoute::Proposals,
         // M86: the plain cognitive-graph directory. Exact-match; the `/graph/` prefix
         // (single reads/proofs) is handled in the fallthrough arm below, where `/graph/`
         // with an empty id already resolves to `NotFound`.
@@ -3521,6 +3980,20 @@ fn route_get(path: &str) -> GetRoute {
                 entity_route(rest, ProofKind::Validator)
             } else if let Some(rest) = p.strip_prefix("/graph/") {
                 entity_route(rest, ProofKind::GraphNode)
+            } else if let Some(rest) = p.strip_prefix("/cnft/") {
+                // M186: `/cnft/{id}/proof` is the only form — a cNFT has no plain
+                // single read (the `/cnfts` directory, M184, is the plain view), so
+                // a bare id (no `/proof`) or a non-numeric id ⇒ 404. Reuses the
+                // kind-agnostic `GetRoute::Proof` machinery with `ProofKind::Cnft`,
+                // which verifies against `header.contributions_root` (M185). Same
+                // proof-only shape as `/bridge/lock/{id}/proof`.
+                match rest.strip_suffix("/proof") {
+                    Some(idp) => idp
+                        .parse::<u64>()
+                        .map(|id| GetRoute::Proof(ProofKind::Cnft, id))
+                        .unwrap_or(GetRoute::NotFound),
+                    None => GetRoute::NotFound,
+                }
             } else if let Some(rest) = p.strip_prefix("/leaf/") {
                 // M124: `/leaf/{kind}/{id}` — the entity's canonical Merkle leaf bytes. `{kind}`
                 // is one of account|reviewer|validator|graph; a bad kind or non-numeric id ⇒ 404.
@@ -3635,6 +4108,7 @@ fn proof_kind_label(k: ProofKind) -> &'static str {
         ProofKind::Reviewer => "reviewer",
         ProofKind::Validator => "validator",
         ProofKind::GraphNode => "graph node",
+        ProofKind::Cnft => "cnft",
     }
 }
 
@@ -4049,6 +4523,8 @@ const READ_ROUTES: &[&str] = &[
     "/validators",
     "/accounts",
     "/reviewers",
+    "/cnfts",
+    "/proposals",
     "/graph",
     "/bonds",
     "/unbonding",
@@ -4067,6 +4543,7 @@ const READ_ROUTES: &[&str] = &[
     "/validator/{id}/proof",
     "/graph/{id}",
     "/graph/{id}/proof",
+    "/cnft/{id}/proof",
     "/leaf/account/{id}",
     "/leaf/reviewer/{id}",
     "/leaf/validator/{id}",
@@ -4250,6 +4727,114 @@ fn json_reviewer_listing(reviewers: &[(u64, f32)]) -> String {
     format!("[{items}]")
 }
 
+/// M184: render the cNFT directory as grep-friendly `key=value` lines, one per certificate
+/// (empty string when there are none). `node_id` is the cognitive-graph node the accept
+/// produced; `contributor`/`domain`/`reward_micro`/`height` are the soulbound record.
+fn format_cnft_listing(cnfts: &[(u64, Cnft)]) -> String {
+    cnfts
+        .iter()
+        .map(|(node_id, c)| {
+            format!(
+                "node_id={node_id} contributor={} domain={} reward_micro={} height={}",
+                c.contributor, c.domain, c.reward_micro, c.height
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// M184: `GET /cnfts?format=json` — the JSON sibling of [`format_cnft_listing`]. A JSON
+/// **array** of objects (`[]` when empty); u64 fields are strings per the house style.
+fn json_cnft_listing(cnfts: &[(u64, Cnft)]) -> String {
+    let items = cnfts
+        .iter()
+        .map(|(node_id, c)| {
+            format!(
+                "{{\"node_id\":{},\"contributor\":{},\"domain\":{},\"reward_micro\":{},\"height\":{}}}",
+                json_u64(*node_id),
+                json_u64(c.contributor),
+                json_u64(c.domain as u64),
+                json_u64(c.reward_micro),
+                json_u64(c.height),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+/// M197: describe a [`GovParam`] as `(param_name, value_string)` for the proposal
+/// directory. `DeltaK` knobs are namespaced `deltak.<field>`. Floats render via the
+/// house `json_f32` so text and JSON agree byte-for-byte.
+fn gov_param_describe(p: &GovParam) -> (String, String) {
+    use crate::DeltaKParam as D;
+    match p {
+        GovParam::BaseEmission(v) => ("base_emission_micro".into(), v.to_string()),
+        GovParam::SlashBps(v) => ("slash_bps".into(), v.to_string()),
+        GovParam::DecayHalfLife(v) => ("decay_half_life_blocks".into(), v.to_string()),
+        GovParam::DeltaK(d) => {
+            let (f, val) = match d {
+                D::TauDup(v) => ("tau_dup", json_f32(*v)),
+                D::NReviewMin(v) => ("n_review_min", v.to_string()),
+                D::CCap(v) => ("c_cap", json_f32(*v)),
+                D::NMin(v) => ("n_min", v.to_string()),
+                D::Lam(v) => ("lam", json_f32(*v)),
+                D::BonusMax(v) => ("bonus_max", json_f32(*v)),
+                D::Decay(v) => ("decay", json_f32(*v)),
+                D::FreshMin(v) => ("fresh_min", json_f32(*v)),
+                D::DeltaKMin(v) => ("delta_k_min", json_f32(*v)),
+            };
+            (format!("deltak.{f}"), val)
+        }
+    }
+}
+
+/// M197: render the governance proposal directory as grep-friendly `key=value` lines,
+/// one per active proposal (empty string when there are none). `yes`/`votes` give the
+/// current approve-count / total-vote-count (raw tallies; the weighted dual-threshold
+/// is computed at the deadline, see [`crate::ChainState::gov_tally`]).
+fn format_proposal_listing(proposals: &[Proposal]) -> String {
+    proposals
+        .iter()
+        .map(|p| {
+            let (param, value) = gov_param_describe(&p.param);
+            let yes = p.votes.values().filter(|&&a| a).count();
+            format!(
+                "id={} param={param} value={value} created_height={} voting_period={} votes={} yes={}",
+                p.id,
+                p.created_height,
+                p.voting_period,
+                p.votes.len(),
+                yes,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// M197: `GET /proposals?format=json` — the JSON sibling of [`format_proposal_listing`].
+fn json_proposal_listing(proposals: &[Proposal]) -> String {
+    let items = proposals
+        .iter()
+        .map(|p| {
+            let (param, value) = gov_param_describe(&p.param);
+            let yes = p.votes.values().filter(|&&a| a).count();
+            format!(
+                "{{\"id\":{},\"param\":{},\"value\":{},\"created_height\":{},\"voting_period\":{},\"votes\":{},\"yes\":{}}}",
+                json_u64(p.id),
+                json_str(&param),
+                json_str(&value),
+                json_u64(p.created_height),
+                json_u64(p.voting_period),
+                json_u64(p.votes.len() as u64),
+                json_u64(yes as u64),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
 /// M86: render the cognitive-graph directory as grep-friendly `key=value` lines, one per
 /// node (empty string when there are none). Reuses `format_entity` per item — same line
 /// shape as the single `/graph/{id}` plain read; nodes are in insertion order (node_id).
@@ -4365,8 +4950,8 @@ fn json_unbonding_listing(queue: &[crate::UnbondingEntry]) -> String {
 }
 
 /// M89: render one pending stake op as a grep-friendly `key=value` line, mirroring the
-/// fields of [`json_stake_op`] (`account` + `kind` bond/unbond discriminator + `amount`
-/// + `signature` hex). Standalone (a stake op is a pending-pool value, not a merkle-proof
+/// fields of [`json_stake_op`] (`account`, `kind` bond/unbond discriminator, `amount`,
+/// `signature` hex). Standalone (a stake op is a pending-pool value, not a merkle-proof
 /// entity). Pure for direct unit testing.
 fn format_stake_op(op: &crate::StakeOp) -> String {
     let kind = match op.kind {
@@ -4622,6 +5207,7 @@ fn json_supply(s: &SupplyView) -> String {
 /// policy produced a given chain without diffing the genesis.
 struct ParamsView {
     base_emission_micro: u64,
+    decay_half_life_blocks: u64,
     slash_bps: u32,
     tau_dup: f32,
     n_review_min: usize,
@@ -4638,8 +5224,8 @@ struct ParamsView {
 /// the integer ones lossless and the f32 ones via `json_f32` so NaN/inf can't leak).
 fn format_params(p: &ParamsView) -> String {
     let mut out = format!(
-        "base_emission_micro={}\nslash_bps={}",
-        p.base_emission_micro, p.slash_bps,
+        "base_emission_micro={}\ndecay_half_life_blocks={}\nslash_bps={}",
+        p.base_emission_micro, p.decay_half_life_blocks, p.slash_bps,
     );
     out.push_str(&format!(
         "\ntau_dup={}\nn_review_min={}\nc_cap={}\nn_min={}\nlam={}\nbonus_max={}\ndecay={}\nfresh_min={}\ndelta_k_min={}",
@@ -4660,8 +5246,9 @@ fn format_params(p: &ParamsView) -> String {
 /// object, mirroring the field names of [`ParamsView`].
 fn json_params(p: &ParamsView) -> String {
     format!(
-        "{{\"base_emission_micro\":{},\"slash_bps\":{},\"tau_dup\":{},\"n_review_min\":{},\"c_cap\":{},\"n_min\":{},\"lam\":{},\"bonus_max\":{},\"decay\":{},\"fresh_min\":{},\"delta_k_min\":{}}}",
+        "{{\"base_emission_micro\":{},\"decay_half_life_blocks\":{},\"slash_bps\":{},\"tau_dup\":{},\"n_review_min\":{},\"c_cap\":{},\"n_min\":{},\"lam\":{},\"bonus_max\":{},\"decay\":{},\"fresh_min\":{},\"delta_k_min\":{}}}",
         json_u64(p.base_emission_micro),
+        json_u64(p.decay_half_life_blocks),
         json_u64(p.slash_bps as u64),
         json_f32(p.tau_dup),
         json_u64(p.n_review_min as u64),
@@ -5105,6 +5692,20 @@ fn json_proof_entry(e: &ProofEntry) -> String {
                 json_merkle_proof(proof),
             )
         }
+        ProofEntry::Cnft {
+            node_id,
+            cnft,
+            proof,
+        } => format!(
+            "{{\"kind\":\"cnft\",\"node_id\":{},\"contributor\":{},\"domain\":{},\
+             \"reward_micro\":{},\"height\":{},\"proof\":{}}}",
+            json_u64(*node_id),
+            json_u64(cnft.contributor),
+            json_u64(cnft.domain as u64),
+            json_u64(cnft.reward_micro),
+            json_u64(cnft.height),
+            json_merkle_proof(proof),
+        ),
     }
 }
 
@@ -6034,6 +6635,85 @@ async fn serve_rpc_conn(
                     }
                 }
             }
+            GetRoute::Cnfts => {
+                // M184: plain cNFT directory — always a (possibly empty) `200`. Reuses the
+                // pagination stack keyed by node_id (a stable `?cursor=<node_id>` cursor),
+                // mirroring `/reviewers`, with the dedicated cNFT renderers.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryCnfts { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let keys: Vec<u64> = listing.iter().map(|(id, _)| *id).collect();
+                            let cursor = usize_param(query, "cursor")
+                                .filter(|&c| c <= u64::MAX as usize)
+                                .map(|c| c as u64);
+                            let start = if cursor.is_some() {
+                                key_after(&keys, cursor.as_ref())
+                            } else {
+                                usize_param(query, "offset").unwrap_or(0)
+                            };
+                            let limit = effective_limit(usize_param(query, "limit"));
+                            let total = listing.len();
+                            let page = &listing[start..(start + limit).min(total)];
+                            let cur =
+                                last_key(&keys[start..(start + page.len())]).map(|k| k.to_string());
+                            ok_body(
+                                fmt,
+                                &format_page_cursor(
+                                    &format_cnft_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
+                                &json_page_cursor(&json_cnft_listing(page), total, cur.as_deref()),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Proposals => {
+                // M197: governance proposal directory — always a (possibly empty) `200`.
+                // Same pagination stack, cursor keyed by proposal id.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryProposals { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let keys: Vec<u64> = listing.iter().map(|p| p.id).collect();
+                            let cursor = usize_param(query, "cursor")
+                                .filter(|&c| c <= u64::MAX as usize)
+                                .map(|c| c as u64);
+                            let start = if cursor.is_some() {
+                                key_after(&keys, cursor.as_ref())
+                            } else {
+                                usize_param(query, "offset").unwrap_or(0)
+                            };
+                            let limit = effective_limit(usize_param(query, "limit"));
+                            let total = listing.len();
+                            let page = &listing[start..(start + limit).min(total)];
+                            let cur =
+                                last_key(&keys[start..(start + page.len())]).map(|k| k.to_string());
+                            ok_body(
+                                fmt,
+                                &format_page_cursor(
+                                    &format_proposal_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
+                                &json_page_cursor(
+                                    &json_proposal_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
             GetRoute::GraphNodes => {
                 // M86: plain cognitive-graph directory — always a (possibly empty) `200`.
                 // Fifth consumer of the pagination stack (after `/bridge/locks`,
@@ -6772,6 +7452,82 @@ async fn serve_rpc_conn(
     }
     body.truncate(len);
 
+    // M198: governance op submission (writes; already behind the bearer-auth gate above).
+    // `POST /gov/proposal` / `POST /gov/vote` carry a raw codec-encoded op; the actor
+    // verifies the signature, stages, and floods, replying the op hash.
+    if path == "/gov/proposal" {
+        let op = match crate::codec::decode_gov_proposal(&body) {
+            Ok(op) => op,
+            Err(e) => {
+                let _ = stream
+                    .write_all(error_body(fmt, "400 Bad Request", &e.to_string()).as_bytes())
+                    .await;
+                let _ = stream.flush().await;
+                return;
+            }
+        };
+        let (reply, rx) = oneshot::channel();
+        if cmd
+            .send(Cmd::SubmitGovProposal {
+                op: Box::new(op),
+                reply,
+            })
+            .is_err()
+        {
+            let _ = stream
+                .write_all(http_response("503 Service Unavailable", "node stopped").as_bytes())
+                .await;
+            return;
+        }
+        let resp = match rx.await {
+            Ok(Ok(h)) => {
+                let hex = crate::hash::hex(&h);
+                ok_body(fmt, &hex, &format!("{{\"hash\":{}}}", json_str(&hex)))
+            }
+            Ok(Err(e)) => error_body(fmt, gov_reject_status(&e), &e.to_string()),
+            Err(_) => http_response("503 Service Unavailable", "node stopped"),
+        };
+        let _ = stream.write_all(resp.as_bytes()).await;
+        let _ = stream.flush().await;
+        return;
+    }
+    if path == "/gov/vote" {
+        let op = match crate::codec::decode_gov_vote(&body) {
+            Ok(op) => op,
+            Err(e) => {
+                let _ = stream
+                    .write_all(error_body(fmt, "400 Bad Request", &e.to_string()).as_bytes())
+                    .await;
+                let _ = stream.flush().await;
+                return;
+            }
+        };
+        let (reply, rx) = oneshot::channel();
+        if cmd
+            .send(Cmd::SubmitGovVote {
+                op: Box::new(op),
+                reply,
+            })
+            .is_err()
+        {
+            let _ = stream
+                .write_all(http_response("503 Service Unavailable", "node stopped").as_bytes())
+                .await;
+            return;
+        }
+        let resp = match rx.await {
+            Ok(Ok(h)) => {
+                let hex = crate::hash::hex(&h);
+                ok_body(fmt, &hex, &format!("{{\"hash\":{}}}", json_str(&hex)))
+            }
+            Ok(Err(e)) => error_body(fmt, gov_reject_status(&e), &e.to_string()),
+            Err(_) => http_response("503 Service Unavailable", "node stopped"),
+        };
+        let _ = stream.write_all(resp.as_bytes()).await;
+        let _ = stream.flush().await;
+        return;
+    }
+
     // Decode raw codec bytes into a SubmissionTx.
     let tx = match crate::codec::decode_tx(&body) {
         Ok(tx) => tx,
@@ -6842,6 +7598,7 @@ impl Node {
         cfg: NodeConfig,
         genesis: Genesis,
         validator_key: Option<Keypair>,
+        pending_key: Option<Keypair>,
     ) -> io::Result<Node> {
         let my_id = cfg.node.id;
         let listen = cfg.listen_addr().map_err(cfg_io)?;
@@ -6868,11 +7625,59 @@ impl Node {
             }
         }
 
+        // M218 (remote-signer S3): resolve the active signer. A `[validator.signer]`
+        // sub-table means the key lives in an out-of-process `node signer`; the node holds
+        // no key and signs over the socket. Otherwise the in-process key (if any) signs —
+        // cloned via its seed into the trait object so `validator_key` stays owned for the
+        // genesis-pinned mTLS path below (which needs the raw seed). Startup fails fast if a
+        // remote signer's pubkey is not this node's genesis validator key.
+        let signer: Option<Arc<dyn Signer>> = match cfg.validator.as_ref() {
+            Some(v) if v.enabled && v.signer.is_some() => {
+                #[cfg(unix)]
+                {
+                    let sc = v.signer.as_ref().expect("guarded by is_some");
+                    let rs = crate::remote_signer::RemoteSigner::connect(
+                        sc.socket.as_str(),
+                        std::time::Duration::from_millis(sc.timeout_ms),
+                    )
+                    .map_err(|e| {
+                        io::Error::other(format!("connect remote signer at {}: {e}", sc.socket))
+                    })?;
+                    match genesis.validators.iter().find(|(id, _, _)| *id == my_id) {
+                        Some((_, pk, _)) if *pk == rs.public() => {}
+                        Some(_) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("remote signer pubkey for node {my_id} does not match its genesis pubkey"),
+                            ));
+                        }
+                        None => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("node {my_id} configures a signer but is not in genesis.validators"),
+                            ));
+                        }
+                    }
+                    Some(Arc::new(rs) as Arc<dyn Signer>)
+                }
+                #[cfg(not(unix))]
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "a remote signer requires a Unix domain socket (Unix only)",
+                    ));
+                }
+            }
+            _ => validator_key
+                .as_ref()
+                .map(|kp| Arc::new(Keypair::from_seed(kp.secret_seed())) as Arc<dyn Signer>),
+        };
+
         // M40: strict peer auth requires this node to prove its own identity in the
-        // handshake, which it can only do with a signing key. A keyless follower
-        // could never complete an authenticated handshake, so refuse to start
-        // rather than silently fail every dial (fail-fast, mirrors the check above).
-        if cfg.network.require_peer_auth && validator_key.is_none() {
+        // handshake, which it can only do with a signing key (in-process or remote). A
+        // keyless follower could never complete an authenticated handshake, so refuse to
+        // start rather than silently fail every dial (fail-fast, mirrors the check above).
+        if cfg.network.require_peer_auth && signer.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("node {my_id} sets require_peer_auth but has no validator signing key"),
@@ -7014,7 +7819,7 @@ impl Node {
         // follow + serve but never propose (its `start_height` membership guard never
         // opens). Surface that loudly rather than letting the node idle silently.
         if snapshot_boot.is_some()
-            && validator_key.is_some()
+            && signer.is_some()
             && node.chain.state.validators.get(my_id).is_none()
         {
             eprintln!(
@@ -7040,7 +7845,7 @@ impl Node {
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
 
-        let is_validator = validator_key.is_some();
+        let is_validator = signer.is_some();
         let timing = Timing {
             propose_ms: cfg.consensus.propose_timeout_ms,
             prevote_ms: cfg.consensus.prevote_timeout_ms,
@@ -7090,29 +7895,43 @@ impl Node {
             } else {
                 None
             };
-            Some(build_tls_setup(mtls)?)
+            // M178: in encryption-only mode (no mTLS), persist the self-signed
+            // cert when `[network] tls_cert_path`/`tls_key_path` are set, so the
+            // fingerprint is stable across restarts. mTLS ignores this (its cert
+            // is derived from the genesis seed, already deterministic).
+            match (mtls, cfg.network.tls_persist_paths()) {
+                (None, Some((cert, key))) => {
+                    Some(load_or_create_encrypt_only_tls_setup(cert, key)?)
+                }
+                (mtls, _) => Some(build_tls_setup(mtls)?),
+            }
         } else {
             None
         };
         // M164: per-endpoint encryption-only TLS for `[metrics]` and `[rpc]`.
         // Independent acceptors (not the P2P `tls`) — these endpoints don't need
         // mTLS, just channel encryption so bearer tokens and metrics bodies are
-        // not sniffable. Ephemeral self-signed cert via the same primitive the
-        // P2P "encryption-only" mode uses; `enable_tls = false` ⇒ `None` and
-        // the accept loop falls straight through to plaintext.
+        // not sniffable. M178: share the persistent cert when configured (one
+        // fingerprint to pin), else an ephemeral self-signed cert per boot.
+        let encrypt_only_acceptor = || -> io::Result<TlsAcceptor> {
+            Ok(match cfg.network.tls_persist_paths() {
+                Some((cert, key)) => load_or_create_encrypt_only_tls_setup(cert, key)?.acceptor,
+                None => build_encrypt_only_tls_setup()?.acceptor,
+            })
+        };
         let metrics_tls = if cfg.metrics.as_ref().map(|m| m.enable_tls).unwrap_or(false) {
-            Some(build_encrypt_only_tls_setup()?.acceptor)
+            Some(encrypt_only_acceptor()?)
         } else {
             None
         };
         let rpc_tls = if cfg.rpc.as_ref().map(|r| r.enable_tls).unwrap_or(false) {
-            Some(build_encrypt_only_tls_setup()?.acceptor)
+            Some(encrypt_only_acceptor()?)
         } else {
             None
         };
         let auth = Arc::new(AuthContext {
             my_id,
-            kp: validator_key.clone(),
+            signer: signer.clone(),
             validators,
             require: cfg.network.require_peer_auth,
             tls,
@@ -7134,7 +7953,8 @@ impl Node {
         let actor = Actor {
             node,
             outbound: HashMap::new(),
-            kp: validator_key,
+            signer,
+            pending_kp: pending_key,
             self_tx: cmd_tx.clone(),
             cons: None,
             blog,
@@ -7177,7 +7997,12 @@ impl Node {
             role = if is_validator { "validator" } else { "follower" },
             "listening",
         );
-        tokio::spawn(run_listener(listener, auth.clone(), cmd_tx.clone()));
+        tokio::spawn(run_listener(
+            listener,
+            auth.clone(),
+            cmd_tx.clone(),
+            cfg.network.max_inbound_connections,
+        ));
 
         // outbound connectors (dial higher ids only → one link per pair)
         for p in &cfg.peers {
@@ -7217,6 +8042,7 @@ impl Node {
                 metrics_auth_failures.clone(),
                 metrics_tls.clone(),
                 cmd_tx.clone(),
+                cfg.network.max_inbound_connections,
             ));
         }
 
@@ -7235,6 +8061,7 @@ impl Node {
                 rpc_auth_failures.clone(),
                 rpc_tls.clone(),
                 cmd_tx.clone(),
+                cfg.network.max_inbound_connections,
             ));
         }
 
@@ -7255,15 +8082,41 @@ impl Node {
     }
 }
 
-/// CLI entry point for `node run`: start the daemon and block until Ctrl-C.
+/// M190: block until a shutdown signal, returning its name for the log line. On
+/// Unix this waits on **both** `SIGTERM` (what Docker/Kubernetes/systemd send to
+/// stop a container/service) and `SIGINT` (Ctrl-C) — before M190 only Ctrl-C was
+/// handled, so an orchestrator's `SIGTERM` was ignored and the process was later
+/// `SIGKILL`ed (ungraceful). Teardown is trivial (logs fsync per append, no
+/// in-memory write buffer), so a clean return from the run loop is all that's
+/// needed. On non-Unix, falls back to Ctrl-C only (`SIGTERM` doesn't exist).
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> io::Result<&'static str> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+    tokio::select! {
+        _ = sigterm.recv() => Ok("SIGTERM"),
+        _ = sigint.recv() => Ok("SIGINT"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> io::Result<&'static str> {
+    tokio::signal::ctrl_c().await?;
+    Ok("Ctrl-C")
+}
+
+/// CLI entry point for `node run`: start the daemon and block until a shutdown
+/// signal (`SIGTERM`/`SIGINT` on Unix, Ctrl-C elsewhere).
 pub async fn run(
     cfg: NodeConfig,
     genesis: Genesis,
     validator_key: Option<Keypair>,
+    pending_key: Option<Keypair>,
 ) -> io::Result<()> {
-    let _node = Node::start(cfg, genesis, validator_key).await?;
-    tokio::signal::ctrl_c().await?;
-    info!("shutdown requested — exiting (logs are fsync'd per append)");
+    let _node = Node::start(cfg, genesis, validator_key, pending_key).await?;
+    let sig = wait_for_shutdown_signal().await?;
+    info!("{sig} received — shutting down (logs are fsync'd per append)");
     Ok(())
 }
 
@@ -7473,7 +8326,7 @@ fn load_light_snapshot_seed(
         )
     })?;
     let header =
-        crate::codec::decode_header(&hex_to_bytes(&s.header_hex).ok_or_else(|| {
+        crate::codec::decode_header_any(&hex_to_bytes(&s.header_hex).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "header_hex not valid hex")
         })?)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode header: {e:?}")))?;
@@ -7596,13 +8449,18 @@ impl LightNode {
             .map(|(id, pk, _)| (*id, *pk))
             .collect();
         let tls = if cfg.network.enable_tls {
-            Some(build_tls_setup(None)?)
+            // M178: a light node is always encryption-only (no validator key, so
+            // never mTLS); persist the cert when configured, mirroring the full node.
+            Some(match cfg.network.tls_persist_paths() {
+                Some((cert, key)) => load_or_create_encrypt_only_tls_setup(cert, key)?,
+                None => build_tls_setup(None)?,
+            })
         } else {
             None
         };
         let auth = Arc::new(AuthContext {
             my_id,
-            kp: None,
+            signer: None,
             validators,
             require: cfg.network.require_peer_auth, // false (guarded above)
             tls,
@@ -7643,7 +8501,12 @@ impl LightNode {
 
         let listener = TcpListener::bind(listen).await?;
         info!(node = my_id, addr = %listener.local_addr()?, peers = peer_ids.len(), role = "light", "listening");
-        tokio::spawn(run_listener(listener, auth.clone(), cmd_tx.clone()));
+        tokio::spawn(run_listener(
+            listener,
+            auth.clone(),
+            cmd_tx.clone(),
+            cfg.network.max_inbound_connections,
+        ));
 
         // dial higher ids only → one link per pair (same rule as the full node)
         for p in &cfg.peers {
@@ -7696,11 +8559,12 @@ impl LightNode {
     }
 }
 
-/// CLI entry point for `node light-run`: start the light daemon and block until Ctrl-C.
+/// CLI entry point for `node light-run`: start the light daemon and block until a
+/// shutdown signal (`SIGTERM`/`SIGINT` on Unix, Ctrl-C elsewhere).
 pub async fn light_run(cfg: NodeConfig, genesis: Genesis) -> io::Result<()> {
     let _node = LightNode::start(cfg, genesis).await?;
-    tokio::signal::ctrl_c().await?;
-    info!("shutdown requested — exiting (light node holds no on-disk state)");
+    let sig = wait_for_shutdown_signal().await?;
+    info!("{sig} received — shutting down (light node holds no on-disk state)");
     Ok(())
 }
 
@@ -8142,6 +9006,104 @@ mod tests {
     use super::*;
 
     #[test]
+    fn persistent_tls_cert_is_generated_then_reused() {
+        // M178: first call (files absent) generates + writes the cert/key DER; a
+        // second call loads them unchanged (byte-identical), so the fingerprint is
+        // stable across restarts. `load_or_create` creates the parent dir itself.
+        let dir = tmp_dir("tls-persist");
+        let cp = format!("{dir}/tls/cert.der");
+        let kp = format!("{dir}/tls/key.der");
+
+        assert!(!std::path::Path::new(&cp).exists());
+        load_or_create_encrypt_only_tls_setup(&cp, &kp).expect("generate");
+        assert!(std::path::Path::new(&cp).exists() && std::path::Path::new(&kp).exists());
+        let cert1 = std::fs::read(&cp).unwrap();
+        let key1 = std::fs::read(&kp).unwrap();
+        assert!(!cert1.is_empty() && !key1.is_empty());
+
+        // Second call: files present ⇒ load, not regenerate (bytes unchanged).
+        load_or_create_encrypt_only_tls_setup(&cp, &kp).expect("reload");
+        assert_eq!(
+            std::fs::read(&cp).unwrap(),
+            cert1,
+            "cert reused across restart"
+        );
+        assert_eq!(
+            std::fs::read(&kp).unwrap(),
+            key1,
+            "key reused across restart"
+        );
+
+        // The key file is owner-only on Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&kp).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "key file must be 0600");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_signing_key_three_way_decision() {
+        // M180: the pure handoff decision. `expected` is the set's pubkey for this
+        // node's id; `None` = not in the set.
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let c = [3u8; 32];
+        // Not in the set → keep (nothing to vote with anyway).
+        assert_eq!(resolve_signing_key(a, None, None), SigningKeyDecision::Keep);
+        assert_eq!(
+            resolve_signing_key(a, Some(b), None),
+            SigningKeyDecision::Keep
+        );
+        // Set still expects our current key → keep.
+        assert_eq!(
+            resolve_signing_key(a, None, Some(a)),
+            SigningKeyDecision::Keep
+        );
+        assert_eq!(
+            resolve_signing_key(a, Some(b), Some(a)),
+            SigningKeyDecision::Keep
+        );
+        // Our key no longer matches, pending matches the new expected → adopt.
+        assert_eq!(
+            resolve_signing_key(a, Some(b), Some(b)),
+            SigningKeyDecision::Adopt
+        );
+        // Our key no longer matches and no/other pending → stale (degraded).
+        assert_eq!(
+            resolve_signing_key(a, None, Some(b)),
+            SigningKeyDecision::Stale
+        );
+        assert_eq!(
+            resolve_signing_key(a, Some(c), Some(b)),
+            SigningKeyDecision::Stale
+        );
+    }
+
+    #[test]
+    fn admit_inbound_enforces_the_concurrency_cap() {
+        // M177: the admission gate hands out exactly `cap` permits; past that it
+        // returns None (the accept loop then drops the new connection). Freeing a
+        // permit (connection ends) reopens a slot. This is the core of the
+        // per-listener DoS bound; the three accept loops wire it in identically.
+        let limiter = Arc::new(Semaphore::new(2));
+        let p1 = admit_inbound(&limiter).expect("slot 1");
+        let p2 = admit_inbound(&limiter).expect("slot 2");
+        assert!(admit_inbound(&limiter).is_none(), "cap reached ⇒ refused");
+        drop(p1); // a connection ends
+        let p3 = admit_inbound(&limiter).expect("slot freed by drop");
+        // Two live permits again ⇒ full.
+        assert!(admit_inbound(&limiter).is_none());
+        drop(p2);
+        drop(p3);
+        // All freed ⇒ cap available again.
+        assert!(admit_inbound(&limiter).is_some());
+    }
+
+    #[test]
     fn self_advertise_addr_prefers_override() {
         // M51: empty advertise ⇒ the bind `listen`, verbatim (byte-identical M39
         // seed). A non-empty advertise wins (the public/dialable NAT address).
@@ -8371,6 +9333,78 @@ mod tests {
         writer.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn version_negotiation_accepts_matching_peers() {
+        // M192/M221: two nodes advertising overlapping wire ranges agree (here both
+        // [MIN_WIRE_VERSION, PROTOCOL_VERSION]); each sees Ok with the highest common version.
+        let (a, b) = tokio::io::duplex(64);
+        let (mut ar, mut aw) = tokio::io::split(a);
+        let (mut br, mut bw) = tokio::io::split(b);
+        let left = tokio::spawn(async move { negotiate_version(&mut ar, &mut aw).await });
+        let right = tokio::spawn(async move { negotiate_version(&mut br, &mut bw).await });
+        assert_eq!(left.await.unwrap().unwrap(), PROTOCOL_VERSION);
+        assert_eq!(right.await.unwrap().unwrap(), PROTOCOL_VERSION);
+    }
+
+    // M221: play the "peer" by writing a forged [min,max] range and reading our side's.
+    async fn negotiate_against_peer_range(
+        peer_min: u32,
+        peer_max: u32,
+    ) -> (io::Result<u32>, [u32; 2]) {
+        let (a, b) = tokio::io::duplex(64);
+        let (mut ar, mut aw) = tokio::io::split(a);
+        let (mut br, mut bw) = tokio::io::split(b);
+        let peer = tokio::spawn(async move {
+            let mut buf = [0u8; 8];
+            buf[0..4].copy_from_slice(&peer_min.to_be_bytes());
+            buf[4..8].copy_from_slice(&peer_max.to_be_bytes());
+            bw.write_all(&buf).await.unwrap();
+            bw.flush().await.unwrap();
+            let mut got = [0u8; 8];
+            br.read_exact(&mut got).await.unwrap();
+            [
+                u32::from_be_bytes(got[0..4].try_into().unwrap()),
+                u32::from_be_bytes(got[4..8].try_into().unwrap()),
+            ]
+        });
+        let res = negotiate_version(&mut ar, &mut aw).await;
+        (res, peer.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn version_negotiation_rejects_disjoint_ranges() {
+        // M192/M221: a peer whose range is entirely above ours (e.g. [v+1, v+1]) shares no
+        // common version ⇒ rejected with InvalidData, not a silent mis-parse. We still
+        // announced our real range to the peer.
+        let (res, peer_saw) =
+            negotiate_against_peer_range(PROTOCOL_VERSION + 1, PROTOCOL_VERSION + 1).await;
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(peer_saw, [MIN_WIRE_VERSION, PROTOCOL_VERSION]);
+    }
+
+    #[tokio::test]
+    async fn version_negotiation_rejects_older_wire_gen() {
+        // SEC-05/M221: a peer entirely on an OLDER generation ([v-1, v-1], outside our
+        // supported range) is rejected at the handshake rather than after mis-parsing frames.
+        let (res, _) =
+            negotiate_against_peer_range(PROTOCOL_VERSION - 1, PROTOCOL_VERSION - 1).await;
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn version_negotiation_agrees_on_highest_common() {
+        // M221: overlapping ranges agree on the highest common version. A peer that also
+        // speaks one generation above us ([MIN, PROTOCOL+1]) still agrees on PROTOCOL_VERSION
+        // (our max) — the core of rolling upgrade: a newer peer talks down to our generation.
+        let (res, _) = negotiate_against_peer_range(MIN_WIRE_VERSION, PROTOCOL_VERSION + 1).await;
+        assert_eq!(res.unwrap(), PROTOCOL_VERSION);
+        // A peer that also speaks one generation below us ([MIN-… , PROTOCOL]) likewise agrees
+        // on PROTOCOL_VERSION.
+        let lo = MIN_WIRE_VERSION.saturating_sub(1);
+        let (res2, _) = negotiate_against_peer_range(lo, PROTOCOL_VERSION).await;
+        assert_eq!(res2.unwrap(), PROTOCOL_VERSION);
+    }
+
     // --- M40: authenticated handshake (pure core) -------------------------------
 
     #[test]
@@ -8486,6 +9520,7 @@ mod tests {
             seed_nodes: vec![(unit(0), 0)],
             params: DeltaKParams::default(),
             base_emission_micro: 8 * MICRO,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: [21u64, 22, 23, 24]
@@ -8651,7 +9686,7 @@ mod tests {
             let dir = tmp_dir(&format!("conv-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = node_config(id, port_base, &ids, dir);
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -8698,7 +9733,7 @@ mod tests {
             let dir = tmp_dir(&format!("crash1-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = node_config(id, port_base, &ids, dir); // peers still list 24
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -8737,7 +9772,7 @@ mod tests {
             let dir = tmp_dir(&format!("crash2-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = node_config(id, port_base, &ids, dir);
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -8767,7 +9802,7 @@ mod tests {
             let dir = tmp_dir(&format!("late-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = node_config(id, port_base, &ids, dir);
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -8781,7 +9816,7 @@ mod tests {
         let dir = tmp_dir("late-n24");
         data_dirs.insert(24, dir.clone());
         let cfg = node_config(24, port_base, &ids, dir);
-        let node24 = Node::start(cfg, genesis.clone(), Some(kp(24)))
+        let node24 = Node::start(cfg, genesis.clone(), Some(kp(24)), None)
             .await
             .expect("start late node");
         nodes.push((24, node24));
@@ -8818,7 +9853,7 @@ mod tests {
             let cfg = node_config(id, port_base, &all, dir);
             // id 25 has no key ⇒ pure follower.
             let key = vids.contains(&id).then(|| kp(id));
-            let node = Node::start(cfg, genesis.clone(), key)
+            let node = Node::start(cfg, genesis.clone(), key, None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -8860,7 +9895,7 @@ mod tests {
             let dir = tmp_dir(&format!("equiv-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = node_config(id, port_base, &live, dir);
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -8874,6 +9909,10 @@ mod tests {
             let stream = TcpStream::connect(&addr).await.expect("byzantine connect");
             let _ = stream.set_nodelay(true);
             let (mut rd, mut wr) = stream.into_split();
+            // M192: speak the protocol-version handshake first, like a real peer.
+            negotiate_version(&mut rd, &mut wr)
+                .await
+                .expect("version negotiation");
             write_hello(&mut wr, 21).await.expect("hello");
             let _ = read_hello(&mut rd).await;
             // Drain (and discard) everything the honest node sends us.
@@ -8986,7 +10025,7 @@ mod tests {
             data_dirs.insert(id, dir.clone());
             let mut cfg = node_config(id, port_base, &ids, dir);
             cfg.consensus.create_empty_blocks = false;
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -9060,6 +10099,8 @@ mod tests {
             tx_submit_buckets: [0, 1, 2, 1, 0, 0, 0, 0, 0, 0, 0],
             tx_submit_sum_micros: 7_500_000,
             tx_submit_count: 5,
+            liveness_samples: 6,
+            validator_missed: vec![(21, 0), (22, 2)],
         }
     }
 
@@ -9079,6 +10120,7 @@ mod tests {
             ("zhixing_seen_tx_capacity", 1024),
             ("zhixing_pending_stake_ops", 2),
             ("zhixing_pending_evidence", 1),
+            ("zhixing_liveness_window_samples", 6),
         ] {
             assert!(
                 out.contains(&format!("# TYPE {name} gauge")),
@@ -9089,6 +10131,10 @@ mod tests {
                 "missing `{name} {value}`"
             );
         }
+        // M212: the per-validator liveness gauge is labeled, so assert its lines directly.
+        assert!(out.contains("# TYPE zhixing_validator_missed_commits gauge"));
+        assert!(out.contains("zhixing_validator_missed_commits{validator=\"21\"} 0\n"));
+        assert!(out.contains("zhixing_validator_missed_commits{validator=\"22\"} 2\n"));
     }
 
     #[test]
@@ -9250,7 +10296,7 @@ mod tests {
         // A single fresh validator: genesis height 0, no peers dialed, has a key.
         let dir = tmp_dir("metrics-handle");
         let cfg = node_config(21, 19671, &[21], dir.clone());
-        let node = Node::start(cfg, test_genesis(), Some(kp(21)))
+        let node = Node::start(cfg, test_genesis(), Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -9273,7 +10319,7 @@ mod tests {
         let cfg = node_config(21, 19681, &[21], dir.clone());
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -9308,7 +10354,7 @@ mod tests {
             auth_token: String::new(),
             enable_tls: false,
         });
-        let _node = Node::start(cfg, test_genesis(), Some(kp(21)))
+        let _node = Node::start(cfg, test_genesis(), Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -9353,7 +10399,7 @@ mod tests {
             auth_token: "scrape-key".into(),
             enable_tls: false,
         });
-        let _node = Node::start(cfg, test_genesis(), Some(kp(21)))
+        let _node = Node::start(cfg, test_genesis(), Some(kp(21)), None)
             .await
             .expect("start node");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -9423,7 +10469,7 @@ mod tests {
             auth_token: String::new(),
             enable_tls: true,
         });
-        let _node = Node::start(cfg, test_genesis(), Some(kp(21)))
+        let _node = Node::start(cfg, test_genesis(), Some(kp(21)), None)
             .await
             .expect("start node");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -9509,7 +10555,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let _node = Node::start(cfg, genesis, Some(kp(21)))
+        let _node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -9586,10 +10632,10 @@ mod tests {
         // surfaces the admission result. A single-validator genesis (quorum 1)
         // keeps the node live; we assert on the mempool, not on a committed block.
         let dir = tmp_dir("submit-tx-handle");
-        let cfg = node_config(21, 19701, &[21], dir.clone());
+        let cfg = node_config(21, 21361, &[21], dir.clone());
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -9614,12 +10660,220 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submit_gov_proposal_stages_registers_and_rejects_bad_sig() {
+        // M198: the Node::submit_gov_proposal handle verifies the sig, stages + floods,
+        // and the single validator commits it into `state.proposals` (observable via the
+        // `proposals()` handle). A wrong-signer submit is rejected with BadSignature.
+        let dir = tmp_dir("submit-gov-proposal");
+        let cfg = node_config(21, 21391, &[21], dir.clone());
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
+            .await
+            .expect("start node");
+
+        // Proposer 1 is a genesis account (same one the tx tests use); long voting
+        // window so the proposal stays registered for the poll.
+        let prop = crate::GovProposal {
+            proposer: 1,
+            param: crate::GovParam::BaseEmission(777),
+            voting_period: 100,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let h = prop.hash();
+        let res = node.submit_gov_proposal(prop).await.expect("actor alive");
+        assert_eq!(res.expect("valid sig admitted"), h);
+
+        // The single validator produces blocks; the proposal gets registered.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let ps = node.proposals().await.expect("actor alive");
+            if ps
+                .iter()
+                .any(|p| matches!(p.param, crate::GovParam::BaseEmission(777)))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "proposal never registered"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Wrong signer (kp(2) signing proposer 1's op) ⇒ BadSignature, not flooded.
+        let bad = crate::GovProposal {
+            proposer: 1,
+            param: crate::GovParam::SlashBps(1),
+            voting_period: 100,
+            nonce: 1,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(2));
+        let rej = node.submit_gov_proposal(bad).await.expect("actor alive");
+        assert!(
+            matches!(rej, Err(crate::ChainError::BadSignature(1))),
+            "got {rej:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn remote_signer_backed_validator_produces_blocks() {
+        // M218 (remote-signer S3): a validator whose key lives in an out-of-process
+        // `node signer` drives real consensus — proves the config → RemoteSigner →
+        // RoundState wiring end to end (the node holds NO key; every vote/proposal is
+        // signed over the Unix socket).
+        let dir = tmp_dir("remote-signer-run");
+        let _ = std::fs::create_dir_all(&dir);
+        let signing_kp = kp(21);
+        // Short /tmp socket (sun_path length limit).
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let socket = format!("/tmp/zxrs{}{}.sock", std::process::id(), nanos % 1_000_000);
+        let hwm = format!("{dir}/hwm");
+        {
+            let (s, h) = (socket.clone(), hwm.clone());
+            std::thread::spawn(move || {
+                let _ = crate::remote_signer::serve(
+                    std::path::Path::new(&s),
+                    signing_kp,
+                    std::path::Path::new(&h),
+                );
+            });
+        }
+        for _ in 0..200 {
+            if std::path::Path::new(&socket).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let mut cfg = node_config(21, 21441, &[21], dir.clone());
+        cfg.consensus.create_empty_blocks = true; // heartbeat so height advances with no load
+        cfg.validator = Some(crate::config::ValidatorKeyConfig {
+            enabled: true,
+            signer: Some(crate::config::SignerConfig {
+                socket: socket.clone(),
+                timeout_ms: 1000,
+            }),
+            ..Default::default()
+        });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+
+        // No in-process key: Node::start builds the RemoteSigner from the config and
+        // verifies its pubkey == genesis.
+        let node = Node::start(cfg, genesis, None, None)
+            .await
+            .expect("start validator backed by the remote signer");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let h = node.metrics().await.expect("metrics").height;
+            if h >= 2 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "remote-signer-backed validator did not produce blocks (height {h})"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_gov_submit_returns_4xx_when_not_staged() {
+        // SEC-01 (round 3): `POST /gov/proposal` answers 200 + hash ONLY when the op was
+        // actually staged; every admission rejection is a 4xx carrying the reason —
+        // 422 (nonce outside the window), 409 (already seen), 429 (per-account quota).
+        // A pure follower (no signing key) so no block production races the pool.
+        let dir = tmp_dir("rpc-gov-4xx");
+        let mut cfg = node_config(21, 21401, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:19899";
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
+        });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let _node = Node::start(cfg, genesis, None, None)
+            .await
+            .expect("start node");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        async fn post(addr: &str, body: &[u8]) -> String {
+            let mut req = format!(
+                "POST /gov/proposal HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(body);
+            let mut stream = TcpStream::connect(addr).await.expect("connect rpc");
+            stream.write_all(&req).await.expect("send request");
+            let mut resp = Vec::new();
+            stream.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        let prop = |nonce: u64, period: u64| {
+            crate::GovProposal {
+                proposer: 1,
+                param: crate::GovParam::BaseEmission(1),
+                voting_period: period,
+                nonce,
+                signature: [0u8; 64],
+            }
+            .signed(&kp(1))
+        };
+        let enc = |p: &crate::GovProposal| crate::codec::encode_gov_proposal(p);
+
+        // Nonce past the pipelining window → 422, not staged.
+        let t = post(rpc_addr, &enc(&prop(crate::GOV_NONCE_LOOKAHEAD + 1, 100))).await;
+        assert!(t.starts_with("HTTP/1.1 422"), "expected 422, got: {t}");
+
+        // A valid op → 200 + its hash; the same op again → 409.
+        let first = prop(0, 100);
+        let t = post(rpc_addr, &enc(&first)).await;
+        assert!(t.starts_with("HTTP/1.1 200 OK"), "expected 200, got: {t}");
+        assert!(
+            t.contains(&crate::hash::hex(&first.hash())),
+            "hash in body: {t}"
+        );
+        let t = post(rpc_addr, &enc(&first)).await;
+        assert!(t.starts_with("HTTP/1.1 409"), "expected 409, got: {t}");
+
+        // Fill the rest of account 1's quota (distinct hashes) → 200 each; one more → 429.
+        let quota = crate::net::MAX_PENDING_GOV_PER_ACCOUNT as u64;
+        for i in 1..quota {
+            let t = post(rpc_addr, &enc(&prop(0, 100 + i))).await;
+            assert!(
+                t.starts_with("HTTP/1.1 200 OK"),
+                "op {i}: expected 200, got: {t}"
+            );
+        }
+        let t = post(rpc_addr, &enc(&prop(1, 999))).await;
+        assert!(t.starts_with("HTTP/1.1 429"), "expected 429, got: {t}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_endpoint_accepts_tx_over_tcp() {
         // M53: enable the ingress RPC, POST a codec-encoded tx over TCP, and
         // assert 200 + hash in the body; then confirm it entered the mempool.
         // A malformed body gets a 400.
         let dir = tmp_dir("rpc-endpoint");
-        let mut cfg = node_config(21, 19721, &[21], dir.clone());
+        let mut cfg = node_config(21, 21371, &[21], dir.clone());
         let rpc_addr = "127.0.0.1:19821";
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
@@ -9629,7 +10883,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -9696,7 +10950,7 @@ mod tests {
         // Reads (GET) stay public regardless of the token.
         let dir = tmp_dir("rpc-auth");
         let mut cfg = node_config(21, 20760, &[21], dir.clone());
-        let rpc_addr = "127.0.0.1:20771";
+        let rpc_addr = "127.0.0.1:21381";
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
@@ -9705,7 +10959,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -9882,7 +11136,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let _node = Node::start(cfg, genesis, Some(kp(21)))
+        let _node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -9966,7 +11220,7 @@ mod tests {
         let cfg = node_config(21, 19781, &[21], dir.clone());
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ node self-commits
-        let node = Node::start(cfg, genesis.clone(), Some(kp(21)))
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -10027,7 +11281,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -10092,7 +11346,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -10176,7 +11430,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -10253,7 +11507,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -10340,6 +11594,7 @@ mod tests {
             seed_nodes: vec![],
             params: DeltaKParams::default(),
             base_emission_micro: 0,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
@@ -10412,7 +11667,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -10467,7 +11722,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -10559,7 +11814,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(24, kp(24).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(24)))
+        let node = Node::start(cfg, genesis, Some(kp(24)), None)
             .await
             .expect("start node");
 
@@ -10671,7 +11926,7 @@ mod tests {
         genesis.validators = vec![(25, kp(25).public(), 1)]; // quorum 1 ⇒ self-commit
         genesis.accounts = vec![(1, 50 * crate::MICRO, kp(1).public())];
         genesis.reviewers = vec![];
-        let node = Node::start(cfg, genesis, Some(kp(25)))
+        let node = Node::start(cfg, genesis, Some(kp(25)), None)
             .await
             .expect("start node");
 
@@ -10788,7 +12043,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(26, kp(26).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(26)))
+        let node = Node::start(cfg, genesis, Some(kp(26)), None)
             .await
             .expect("start node");
 
@@ -10908,7 +12163,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(27, kp(27).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(27)))
+        let node = Node::start(cfg, genesis, Some(kp(27)), None)
             .await
             .expect("start node");
 
@@ -11006,7 +12261,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(28, kp(28).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(28)))
+        let node = Node::start(cfg, genesis, Some(kp(28)), None)
             .await
             .expect("start node");
 
@@ -11085,7 +12340,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(29, kp(29).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(29)))
+        let node = Node::start(cfg, genesis, Some(kp(29)), None)
             .await
             .expect("start node");
 
@@ -11167,7 +12422,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(30, kp(30).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(30)))
+        let node = Node::start(cfg, genesis, Some(kp(30)), None)
             .await
             .expect("start node");
 
@@ -11249,7 +12504,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(31, kp(31).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(31)))
+        let node = Node::start(cfg, genesis, Some(kp(31)), None)
             .await
             .expect("start node");
 
@@ -11332,7 +12587,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(32, kp(32).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(32)))
+        let node = Node::start(cfg, genesis, Some(kp(32)), None)
             .await
             .expect("start node");
 
@@ -11402,7 +12657,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(36, kp(36).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(36)))
+        let node = Node::start(cfg, genesis, Some(kp(36)), None)
             .await
             .expect("start node");
 
@@ -11473,7 +12728,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(44, kp(44).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(44)))
+        let node = Node::start(cfg, genesis, Some(kp(44)), None)
             .await
             .expect("start node");
 
@@ -11546,7 +12801,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(45, kp(45).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(45)))
+        let node = Node::start(cfg, genesis, Some(kp(45)), None)
             .await
             .expect("start node");
 
@@ -11632,7 +12887,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(46, kp(46).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(46)))
+        let node = Node::start(cfg, genesis, Some(kp(46)), None)
             .await
             .expect("start node");
 
@@ -11717,7 +12972,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(47, kp(47).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(47)))
+        let node = Node::start(cfg, genesis, Some(kp(47)), None)
             .await
             .expect("start node");
 
@@ -11803,7 +13058,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(48, kp(48).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(48)))
+        let _node = Node::start(cfg, genesis, Some(kp(48)), None)
             .await
             .expect("start node");
 
@@ -11875,7 +13130,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(49, kp(49).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(49)))
+        let _node = Node::start(cfg, genesis, Some(kp(49)), None)
             .await
             .expect("start node");
 
@@ -11919,7 +13174,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(50, kp(50).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(50)))
+        let _node = Node::start(cfg, genesis, Some(kp(50)), None)
             .await
             .expect("start node");
 
@@ -11960,7 +13215,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(37, kp(37).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(37)))
+        let node = Node::start(cfg, genesis, Some(kp(37)), None)
             .await
             .expect("start node");
 
@@ -12039,7 +13294,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(38, kp(38).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(38)))
+        let node = Node::start(cfg, genesis, Some(kp(38)), None)
             .await
             .expect("start node");
 
@@ -12134,7 +13389,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(51, kp(51).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(51)))
+        let _node = Node::start(cfg, genesis, Some(kp(51)), None)
             .await
             .expect("start node");
 
@@ -12195,7 +13450,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(52, kp(52).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(52)))
+        let _node = Node::start(cfg, genesis, Some(kp(52)), None)
             .await
             .expect("start node");
 
@@ -12249,7 +13504,7 @@ mod tests {
         genesis.validators = vec![(39, kp(39).public(), 1)]; // quorum 1 ⇒ self-commit
                                                              // Independently stamp the same genesis to know the expected identity.
         let (_state, expected_gh) = crate::ChainState::genesis(genesis.clone());
-        let node = Node::start(cfg, genesis, Some(kp(39)))
+        let node = Node::start(cfg, genesis, Some(kp(39)), None)
             .await
             .expect("start node");
 
@@ -12322,7 +13577,7 @@ mod tests {
         let mut genesis = test_genesis();
         genesis.validators = vec![(40, kp(40).public(), 1)]; // quorum 1 ⇒ self-commit
         let (_state, expected_gh) = crate::ChainState::genesis(genesis.clone());
-        let node = Node::start(cfg, genesis, Some(kp(40)))
+        let node = Node::start(cfg, genesis, Some(kp(40)), None)
             .await
             .expect("start node");
 
@@ -12402,7 +13657,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(43, kp(43).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(43)))
+        let _node = Node::start(cfg, genesis, Some(kp(43)), None)
             .await
             .expect("start node");
 
@@ -12457,7 +13712,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(41, kp(41).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(41)))
+        let _node = Node::start(cfg, genesis, Some(kp(41)), None)
             .await
             .expect("start node");
 
@@ -12544,7 +13799,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(33, kp(33).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(33)))
+        let node = Node::start(cfg, genesis, Some(kp(33)), None)
             .await
             .expect("start node");
 
@@ -12621,7 +13876,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(34, kp(34).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(34)))
+        let node = Node::start(cfg, genesis, Some(kp(34)), None)
             .await
             .expect("start node");
 
@@ -12703,7 +13958,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(35, kp(35).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(35)))
+        let node = Node::start(cfg, genesis, Some(kp(35)), None)
             .await
             .expect("start node");
 
@@ -12759,7 +14014,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -12858,6 +14113,21 @@ mod tests {
         ));
         assert!(matches!(route_get("/account/7"), GetRoute::Account(7)));
         assert!(matches!(route_get("/"), GetRoute::Health));
+    }
+
+    #[test]
+    fn route_get_parses_cnft_proof() {
+        // M186: `/cnft/{id}/proof` is the only cNFT single-read form (proof-only,
+        // like `/bridge/lock/{id}/proof`) — it reuses the kind-agnostic
+        // `Proof(ProofKind::Cnft, id)` machinery. A bare `{id}` (no `/proof`) or a
+        // non-numeric id ⇒ 404, since cNFTs have no plain single read.
+        assert!(matches!(
+            route_get("/cnft/5/proof"),
+            GetRoute::Proof(ProofKind::Cnft, 5)
+        ));
+        assert!(matches!(route_get("/cnft/5"), GetRoute::NotFound));
+        assert!(matches!(route_get("/cnft/x/proof"), GetRoute::NotFound));
+        assert!(matches!(route_get("/cnft//proof"), GetRoute::NotFound));
     }
 
     #[test]
@@ -13621,6 +14891,47 @@ mod tests {
     }
 
     #[test]
+    fn cnft_listing_renders() {
+        // M184: the empty directory renders `""` (text) / `[]` (json); two cNFTs render one
+        // `key=value` line each (text) and a two-object array (json) with the soulbound
+        // record fields (node_id + contributor + domain + reward_micro + height).
+        assert_eq!(format_cnft_listing(&[]), "");
+        assert_eq!(json_cnft_listing(&[]), "[]");
+
+        let cnfts = vec![
+            (
+                0u64,
+                Cnft {
+                    contributor: 7,
+                    domain: 3,
+                    reward_micro: 500,
+                    height: 2,
+                },
+            ),
+            (
+                1u64,
+                Cnft {
+                    contributor: 7,
+                    domain: 4,
+                    reward_micro: 250,
+                    height: 5,
+                },
+            ),
+        ];
+
+        assert_eq!(
+            format_cnft_listing(&cnfts),
+            "node_id=0 contributor=7 domain=3 reward_micro=500 height=2\n\
+             node_id=1 contributor=7 domain=4 reward_micro=250 height=5",
+        );
+        assert_eq!(
+            json_cnft_listing(&cnfts),
+            "[{\"node_id\":\"0\",\"contributor\":\"7\",\"domain\":\"3\",\"reward_micro\":\"500\",\"height\":\"2\"},\
+             {\"node_id\":\"1\",\"contributor\":\"7\",\"domain\":\"4\",\"reward_micro\":\"250\",\"height\":\"5\"}]",
+        );
+    }
+
+    #[test]
     fn graph_listing_renders() {
         // M86: the empty directory renders `""` (text) / `[]` (json); two graph nodes render
         // one `format_entity`-shaped line each (text) and a two-object array (json), reusing
@@ -13716,6 +15027,7 @@ mod tests {
             seed_nodes: vec![(unit(0), 0)],
             params: DeltaKParams::default(),
             base_emission_micro: 0,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
@@ -13878,6 +15190,67 @@ mod tests {
             route_get("/reviewer/10/proof"),
             GetRoute::Proof(ProofKind::Reviewer, 10)
         ));
+    }
+
+    #[test]
+    fn route_get_parses_cnfts() {
+        // M184: `/cnfts` is a plain directory read — an exact match. There is no `/cnft/`
+        // single-read prefix, so a trailing slash falls through to the health fallback.
+        assert!(matches!(route_get("/cnfts"), GetRoute::Cnfts));
+        assert!(matches!(route_get("/cnfts/"), GetRoute::Health));
+    }
+
+    #[test]
+    fn route_get_parses_proposals() {
+        // M197: `/proposals` is a plain directory read — exact match; trailing slash → health.
+        assert!(matches!(route_get("/proposals"), GetRoute::Proposals));
+        assert!(matches!(route_get("/proposals/"), GetRoute::Health));
+    }
+
+    #[test]
+    fn proposal_listing_renders() {
+        // M197: empty ⇒ ""/[]; a proposal renders its param label + value + tally. Covers a
+        // scalar param and a DeltaK (namespaced `deltak.<field>`) param.
+        use crate::{DeltaKParam, GovParam};
+        assert_eq!(format_proposal_listing(&[]), "");
+        assert_eq!(json_proposal_listing(&[]), "[]");
+
+        let mut votes = std::collections::BTreeMap::new();
+        votes.insert(1u64, true);
+        votes.insert(2u64, false);
+        votes.insert(3u64, true);
+        let ps = vec![
+            Proposal {
+                id: 0,
+                param: GovParam::BaseEmission(500),
+                created_height: 1,
+                voting_period: 10,
+                votes: votes.clone(),
+            },
+            Proposal {
+                id: 1,
+                param: GovParam::DeltaK(DeltaKParam::Lam(0.5)),
+                created_height: 2,
+                voting_period: 5,
+                votes: std::collections::BTreeMap::new(),
+            },
+        ];
+        let text = format_proposal_listing(&ps);
+        assert_eq!(
+            text,
+            "id=0 param=base_emission_micro value=500 created_height=1 voting_period=10 votes=3 yes=2\n\
+             id=1 param=deltak.lam value=0.5 created_height=2 voting_period=5 votes=0 yes=0",
+        );
+        let json = json_proposal_listing(&ps);
+        assert!(
+            json.contains("\"param\":\"base_emission_micro\",\"value\":\"500\""),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"param\":\"deltak.lam\",\"value\":\"0.5\""),
+            "{json}"
+        );
+        assert!(json.contains("\"votes\":\"3\",\"yes\":\"2\""), "{json}");
     }
 
     #[test]
@@ -14361,6 +15734,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // field names as a quoted-u64 / JSON-number object.
         let p = ParamsView {
             base_emission_micro: 1_000,
+            decay_half_life_blocks: 0,
             slash_bps: 500,
             tau_dup: 0.95,
             n_review_min: 3,
@@ -14374,7 +15748,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         };
         let text = format_params(&p);
         assert!(
-            text.starts_with("base_emission_micro=1000\nslash_bps=500\n"),
+            text.starts_with("base_emission_micro=1000\ndecay_half_life_blocks=0\nslash_bps=500\n"),
             "{text}"
         );
         assert!(text.contains("tau_dup=0.95\n"), "{text}");
@@ -14384,6 +15758,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
 
         let json = json_params(&p);
         assert!(json.contains("\"base_emission_micro\":\"1000\""), "{json}");
+        assert!(json.contains("\"decay_half_life_blocks\":\"0\""), "{json}");
         assert!(json.contains("\"slash_bps\":\"500\""), "{json}");
         assert!(json.contains("\"tau_dup\":0.95"), "{json}");
         assert!(json.contains("\"n_review_min\":\"3\""), "{json}");
@@ -14816,6 +16191,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             seed_nodes: vec![],
             params: DeltaKParams::default(),
             base_emission_micro: 0,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
@@ -14886,7 +16262,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let cfg = node_config(21, 20011, &[21], dir.clone());
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ node self-commits
-        let node = Node::start(cfg, genesis.clone(), Some(kp(21)))
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -14964,7 +16340,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -15038,7 +16414,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -15163,7 +16539,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -15268,7 +16644,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -15399,7 +16775,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(23, kp(23).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(23)))
+        let node = Node::start(cfg, genesis, Some(kp(23)), None)
             .await
             .expect("start node");
 
@@ -15500,7 +16876,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(42, kp(42).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(42)))
+        let node = Node::start(cfg, genesis, Some(kp(42)), None)
             .await
             .expect("start node");
 
@@ -15588,7 +16964,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -15738,7 +17114,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let cfg = node_config(21, 20012, &[21], dir.clone());
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ node self-commits
-        let node = Node::start(cfg, genesis.clone(), Some(kp(21)))
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -15846,7 +17222,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -15933,7 +17309,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -16040,7 +17416,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let dir = tmp_dir("submit-tx-full");
         let mut cfg = node_config(21, 19741, &[21], dir.clone());
         cfg.mempool.capacity = 1;
-        let node = Node::start(cfg, test_genesis(), None)
+        let node = Node::start(cfg, test_genesis(), None, None)
             .await
             .expect("start node");
 
@@ -16113,7 +17489,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             let dir = tmp_dir(&format!("disc-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = discovery_config(id, port_base, &peers, dir, true);
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -16155,7 +17531,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             let dir = tmp_dir(&format!("noexch-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = discovery_config(id, port_base, &peers, dir, false);
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -16192,7 +17568,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             data_dirs.insert(id, dir.clone());
             let mut cfg = node_config(id, port_base, &ids, dir);
             cfg.network.require_peer_auth = true;
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -16223,7 +17599,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
 
         let mut cfg = node_config(21, port_base, &[21], dir);
         cfg.network.require_peer_auth = true;
-        let node = Node::start(cfg, genesis.clone(), Some(kp(21)))
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -16233,6 +17609,12 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let stream = TcpStream::connect(&addr).await.expect("connect");
         let _ = stream.set_nodelay(true);
         let (mut rd, mut wr) = stream.into_split();
+
+        // M192: exchange the protocol version first (as a real peer would) so we reach
+        // the authenticated handshake we're actually testing, not the version gate.
+        negotiate_version(&mut rd, &mut wr)
+            .await
+            .expect("version negotiation");
 
         // HelloInit: claim id 22, but present kp(99) — not 22's genesis key.
         let claimed_id = 22u64;
@@ -16281,7 +17663,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             data_dirs.insert(id, dir.clone());
             let mut cfg = node_config(id, port_base, &ids, dir);
             cfg.network.enable_tls = true;
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -16313,7 +17695,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             let mut cfg = node_config(id, port_base, &ids, dir);
             cfg.network.enable_tls = true;
             cfg.network.require_peer_auth = true;
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -16342,7 +17724,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
 
         let mut cfg = node_config(21, port_base, &[21], dir);
         cfg.network.enable_tls = true;
-        let node = Node::start(cfg, genesis.clone(), Some(kp(21)))
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -16383,7 +17765,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             cfg.network.enable_tls = true;
             cfg.network.require_peer_auth = true;
             cfg.network.bind_channel = true;
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -16412,7 +17794,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // bind_channel on, but enable_tls left off (require_peer_auth also off).
         let mut cfg = node_config(21, 19931, &[21], dir);
         cfg.network.bind_channel = true;
-        let err = Node::start(cfg, genesis.clone(), Some(kp(21))).await;
+        let err = Node::start(cfg, genesis.clone(), Some(kp(21)), None).await;
         assert!(
             err.is_err(),
             "bind_channel without enable_tls must fail fast"
@@ -16503,7 +17885,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             cfg.network.enable_tls = true;
             cfg.network.require_peer_certs = true;
             cfg.network.require_peer_auth = true;
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -16537,13 +17919,13 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let mut cfg22 = node_config(22, port_base, &[22, 23], dir22);
         cfg22.network.enable_tls = true;
         cfg22.network.require_peer_certs = true;
-        let node22 = Node::start(cfg22, genesis.clone(), Some(kp(22)))
+        let node22 = Node::start(cfg22, genesis.clone(), Some(kp(22)), None)
             .await
             .expect("start mtls node");
 
         let mut cfg23 = node_config(23, port_base, &[22, 23], dir23);
         cfg23.network.enable_tls = true; // encryption-only, no mTLS
-        let _node23 = Node::start(cfg23, genesis.clone(), Some(kp(23)))
+        let _node23 = Node::start(cfg23, genesis.clone(), Some(kp(23)), None)
             .await
             .expect("start tls node");
 
@@ -16566,7 +17948,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
 
         let mut cfg = node_config(21, 19991, &[21], dir);
         cfg.network.require_peer_certs = true; // but enable_tls left off
-        let err = Node::start(cfg, genesis.clone(), Some(kp(21))).await;
+        let err = Node::start(cfg, genesis.clone(), Some(kp(21)), None).await;
         assert!(
             err.is_err(),
             "require_peer_certs without enable_tls must fail fast"
@@ -16590,6 +17972,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             accounts_root: [0x03; 32],
             graph_root: [0x04; 32],
             bridge_root: [0x05; 32],
+            contributions_root: [0u8; 32],
+            unbonding_root: [0u8; 32],
             validator_updates: vec![crate::validator::ValidatorUpdate {
                 id: 3,
                 pubkey: [0x11; 32],
@@ -16602,6 +17986,9 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             bridge_headers_commitment: [0x0a; 32],
             bridge_redeems_commitment: [0x0b; 32],
             bridge_unbondings_commitment: [0u8; 32],
+            key_rotations_commitment: [0u8; 32],
+            gov_proposals_commitment: [0u8; 32],
+            gov_votes_commitment: [0u8; 32],
             proposer: 0,
         };
         let cert = Commit {
@@ -16819,6 +18206,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             accounts_root: [0u8; 32],
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
+            contributions_root: [0u8; 32],
+            unbonding_root: [0u8; 32],
             validator_updates: vec![],
             txs_commitment: [0u8; 32],
             stake_ops_commitment: [0u8; 32],
@@ -16827,6 +18216,9 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             bridge_headers_commitment: [0u8; 32],
             bridge_redeems_commitment: [0u8; 32],
             bridge_unbondings_commitment: [0u8; 32],
+            key_rotations_commitment: [0u8; 32],
+            gov_proposals_commitment: [0u8; 32],
+            gov_votes_commitment: [0u8; 32],
             proposer: 0,
         };
         let cert = |height: u64| Commit {
@@ -16954,6 +18346,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             accounts_root: [0u8; 32],
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
+            contributions_root: [0u8; 32],
+            unbonding_root: [0u8; 32],
             validator_updates: vec![],
             txs_commitment: [0u8; 32],
             stake_ops_commitment: [0u8; 32],
@@ -16962,6 +18356,9 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             bridge_headers_commitment: [0u8; 32],
             bridge_redeems_commitment: [0u8; 32],
             bridge_unbondings_commitment: [0u8; 32],
+            key_rotations_commitment: [0u8; 32],
+            gov_proposals_commitment: [0u8; 32],
+            gov_votes_commitment: [0u8; 32],
             proposer: 0,
         };
         let cert = |height: u64| Commit {
@@ -17052,6 +18449,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             accounts_root: [0u8; 32],
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
+            contributions_root: [0u8; 32],
+            unbonding_root: [0u8; 32],
             validator_updates: vec![],
             txs_commitment: [0u8; 32],
             stake_ops_commitment: [0u8; 32],
@@ -17060,6 +18459,9 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             bridge_headers_commitment: [0u8; 32],
             bridge_redeems_commitment: [0u8; 32],
             bridge_unbondings_commitment: [0u8; 32],
+            key_rotations_commitment: [0u8; 32],
+            gov_proposals_commitment: [0u8; 32],
+            gov_votes_commitment: [0u8; 32],
             proposer: 0,
         };
         let cert = |height: u64| Commit {
@@ -17095,6 +18497,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             accounts_root: [12u8; 32],
             graph_root: [13u8; 32],
             bridge_root: [14u8; 32],
+            contributions_root: [0u8; 32],
+            unbonding_root: [0u8; 32],
             txs: vec![crate::SubmissionTx {
                 author: 1,
                 embedding: emb,
@@ -17164,6 +18568,9 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
                 },
             }],
             bridge_unbondings: vec![],
+            key_rotations: vec![],
+            gov_proposals: Vec::new(),
+            gov_votes: Vec::new(),
             proposer: 0,
         };
         let j = json_range_blocks(&[(block, cert(7))]);
@@ -17230,7 +18637,6 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         //     single-validator quorum) serves as 200 with `height=4`.
         // The plan's HTTP safety proof: the snapshot-boot path serves forward but
         // refuses backward.
-        use crate::config::SnapshotBootConfig;
         use crate::driver::ChainDriver;
 
         // 1. offline chain (single validator → node can self-certify post-boot).
@@ -17275,7 +18681,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         });
 
         // 4. boot the node from the snapshot.
-        let node = Node::start(cfg, genesis.clone(), Some(kp(21)))
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21)), None)
             .await
             .expect("snapshot boot");
 
@@ -17648,7 +19054,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             cert_hex: None,
             trusted_validators: vec![],
         });
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("snapshot reboot");
 
@@ -17712,7 +19118,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             cert_hex: None,
             trusted_validators: vec![],
         });
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("snapshot boot truncates genesis-era log");
 
@@ -17750,7 +19156,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
 
         // Full validator node (id 21) — binds port_base+0, dials peer 22 (the light node).
         let full_cfg = node_config(21, 20620, &[21, 22], format!("{dir}/full"));
-        let full = Node::start(full_cfg, genesis.clone(), Some(kp(21)))
+        let full = Node::start(full_cfg, genesis.clone(), Some(kp(21)), None)
             .await
             .expect("start full node");
 
@@ -18008,7 +19414,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // end-to-end discovery is covered by the full node's M39 tests + M148's sync.)
         let auth = Arc::new(AuthContext {
             my_id: 5,
-            kp: None,
+            signer: None,
             validators: HashMap::new(),
             require: false,
             tls: None,

@@ -11,7 +11,8 @@ use crate::validator::ValidatorSet;
 use crate::validator::{Validator, ValidatorUpdate};
 use crate::{
     Account, Block, BondKind, BridgeHeader, BridgeRedeem, BridgeSource, BridgeUnbond, ChainState,
-    Embedding, Review, Reviewer, SlashEvidence, StakeOp, SubmissionTx, UnbondingEntry,
+    DeltaKParam, Embedding, GovParam, GovProposal, GovVote, KeyRotation, Proposal, Review,
+    Reviewer, SlashEvidence, StakeOp, SubmissionTx, UnbondingEntry,
 };
 use zhixing_engine::DIM;
 use zhixing_engine::{CognitiveGraph, DeltaKParams, GraphNode};
@@ -40,6 +41,21 @@ impl std::error::Error for CodecError {}
 // Guards against a corrupt length prefix forcing a huge allocation.
 const MAX_ITEMS: u64 = 1_000_000;
 
+/// SEC-06: cap the up-front capacity reservation for a decoded list. The item count
+/// is already bounded by `MAX_ITEMS`, but reserving the *full* claimed count lets a
+/// tiny truncated frame request a huge allocation (e.g. a ~20-byte frame claiming 1M
+/// txs would reserve ~176 MB). We reserve a modest ceiling and let the `Vec` grow as
+/// elements are actually decoded (amortized, and each element read is bounds-checked).
+const PREALLOC_CAP: usize = 1024;
+fn prealloc(n: u64) -> usize {
+    (n as usize).min(PREALLOC_CAP)
+}
+
+/// SEC-06: crate-visible variant for `net.rs` gossip decoders.
+pub(crate) fn prealloc_usize(n: usize) -> usize {
+    n.min(PREALLOC_CAP)
+}
+
 // --- encode ------------------------------------------------------------------
 
 pub fn encode_block(b: &Block) -> Vec<u8> {
@@ -64,6 +80,14 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     // other cert-signed commitments so `encode_header` and `encode_block`
     // agree on prefix bytes for the same block.
     e.raw(&b.bridge_root);
+    // M185 (B5 wire): cNFT directory root, in the prefix region alongside the
+    // other cert-signed commitments so `encode_header` and `encode_block` agree
+    // on prefix bytes for the same block. Adding a root here (rather than a tail
+    // per-body commitment) shifts everything after it — a hard wire break vs B4.
+    e.raw(&b.contributions_root);
+    // SEC-05 (B7 wire): unbonding-queue root, in the prefix root region after
+    // contributions_root (a new prefix root → hard break vs B6).
+    e.raw(&b.unbonding_root);
     e.u64(b.validator_updates.len() as u64);
     for u in &b.validator_updates {
         e.u64(u.id);
@@ -112,6 +136,24 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     for op in &b.bridge_unbondings {
         enc_bridge_unbond(&mut e, op);
     }
+    // M179 (B4 wire): account key rotations, appended at the tail (prefix-stable
+    // for B3 readers — a B3-encoded block ends after bridge_unbondings, and a B4
+    // decoder reading a B3 block errors `UnexpectedEof` here rather than
+    // silently truncating).
+    e.u64(b.key_rotations.len() as u64);
+    for op in &b.key_rotations {
+        enc_key_rotation(&mut e, op, true);
+    }
+    // M194 (B6 wire): governance op bodies, appended at the tail (prefix-stable for
+    // B5 readers — a B5 block ends after key_rotations).
+    e.u64(b.gov_proposals.len() as u64);
+    for op in &b.gov_proposals {
+        enc_gov_proposal(&mut e, op, true);
+    }
+    e.u64(b.gov_votes.len() as u64);
+    for op in &b.gov_votes {
+        enc_gov_vote(&mut e, op, true);
+    }
     e.0
 }
 
@@ -150,6 +192,12 @@ pub fn encode_header(h: &BlockHeader) -> Vec<u8> {
     // other cert-signed state commitments so `encode_header` and
     // `encode_block` agree on prefix bytes for the same block.
     e.raw(&h.bridge_root);
+    // M185 (B5 wire): cNFT directory root, kept in the prefix alongside the
+    // other cert-signed state commitments so `encode_header` and `encode_block`
+    // agree on prefix bytes for the same block.
+    e.raw(&h.contributions_root);
+    // SEC-05 (B7 wire): unbonding-queue root, prefix region after contributions_root.
+    e.raw(&h.unbonding_root);
     e.u64(h.validator_updates.len() as u64);
     for u in &h.validator_updates {
         e.u64(u.id);
@@ -176,6 +224,13 @@ pub fn encode_header(h: &BlockHeader) -> Vec<u8> {
     // for M168 / M31 / M30 fields is preserved byte-for-byte — only the
     // tail grows.
     e.raw(&h.bridge_unbondings_commitment);
+    // M179 (B4 wire): eighth per-body commitment, appended at the tail — same
+    // prefix-stability discipline as the M171 seventh commitment.
+    e.raw(&h.key_rotations_commitment);
+    // M194 (B6 wire): ninth + tenth per-body commitments (governance proposals /
+    // votes), appended at the tail — same prefix-stability discipline.
+    e.raw(&h.gov_proposals_commitment);
+    e.raw(&h.gov_votes_commitment);
     e.0
 }
 
@@ -205,8 +260,15 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
     // so it shares the same prefix-stability contract.
     let mut bridge_root = [0u8; 32];
     bridge_root.copy_from_slice(d.take(32)?);
+    // M185 (B5 wire): cNFT directory root, placed right after `bridge_root`
+    // in the prefix region — read at the same offset as `decode_block`.
+    let mut contributions_root = [0u8; 32];
+    contributions_root.copy_from_slice(d.take(32)?);
+    // SEC-05 (B7): unbonding-queue root, read right after contributions_root.
+    let mut unbonding_root = [0u8; 32];
+    unbonding_root.copy_from_slice(d.take(32)?);
     let n_upd = d.count()?;
-    let mut validator_updates = Vec::with_capacity(n_upd as usize);
+    let mut validator_updates = Vec::with_capacity(prealloc(n_upd));
     for _ in 0..n_upd {
         let id = d.u64()?;
         let mut pubkey = [0u8; 32];
@@ -231,6 +293,14 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
     // M171 (B3 wire): seventh body commitment (bridge-unbond op list).
     let mut bridge_unbondings_commitment = [0u8; 32];
     bridge_unbondings_commitment.copy_from_slice(d.take(32)?);
+    // M179 (B4 wire): eighth body commitment (key-rotation op list).
+    let mut key_rotations_commitment = [0u8; 32];
+    key_rotations_commitment.copy_from_slice(d.take(32)?);
+    // M194 (B6 wire): ninth + tenth body commitments (governance proposals / votes).
+    let mut gov_proposals_commitment = [0u8; 32];
+    gov_proposals_commitment.copy_from_slice(d.take(32)?);
+    let mut gov_votes_commitment = [0u8; 32];
+    gov_votes_commitment.copy_from_slice(d.take(32)?);
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -244,6 +314,8 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
         accounts_root,
         graph_root,
         bridge_root,
+        contributions_root,
+        unbonding_root,
         validator_updates,
         txs_commitment,
         stake_ops_commitment,
@@ -252,6 +324,9 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
         bridge_headers_commitment,
         bridge_redeems_commitment,
         bridge_unbondings_commitment,
+        key_rotations_commitment,
+        gov_proposals_commitment,
+        gov_votes_commitment,
     })
 }
 
@@ -273,22 +348,42 @@ pub fn encode_certified_header(ch: &CertifiedHeader) -> Vec<u8> {
 pub fn decode_certified_header(buf: &[u8]) -> Result<CertifiedHeader, CodecError> {
     // Header layout: 8 (height) + 32 (prev) + 4 (timestamp) + 8 (proposer, M122)
     //   + 32 (next_validators_root) + 32 (state_root) + 32 (accounts_root)
-    //   + 32 (graph_root, M27) + 32 (bridge_root, M30) + 8 (n_updates u64) =
-    //   220-byte fixed prefix ‖ n_updates * 48 bytes (u64 id ‖ 32-byte pubkey ‖
-    //   u64 power) ‖ 7 * 32-byte commitments = 224 bytes tail (M30 adds
-    //   bridge_locks_commitment; M31 adds bridge_headers_commitment +
-    //   bridge_redeems_commitment; M171 B3 wire adds bridge_unbondings_commitment).
-    if buf.len() < 220 {
+    //   + 32 (graph_root, M27) + 32 (bridge_root, M30) + 32 (contributions_root,
+    //   M185 B5) + 32 (unbonding_root, SEC-05 B7) + 8 (n_updates u64) = 284-byte fixed
+    //   prefix ‖ n_updates * 48 bytes (u64 id ‖ 32-byte pubkey ‖ u64 power) ‖ 10 *
+    //   32-byte commitments = 320 bytes tail (M30 adds bridge_locks_commitment; M31 adds
+    //   bridge_headers_commitment + bridge_redeems_commitment; M171 B3 adds
+    //   bridge_unbondings_commitment; M179 B4 adds key_rotations_commitment; M194 B6
+    //   adds gov_proposals_commitment + gov_votes_commitment).
+    //   M185 B5 + SEC-05 B7 add contributions_root / unbonding_root as *prefix* roots
+    //   (not tail commitments), so the fixed prefix grows 220 → 252 → 284 and n_updates
+    //   shifts accordingly.
+    if buf.len() < 284 {
         return Err(CodecError::UnexpectedEof);
     }
-    let n_updates = u64::from_be_bytes(buf[212..220].try_into().unwrap());
-    let header_len = 220 + (n_updates as usize) * 48 + 224; // 444 base + 48 per update
+    let n_updates = u64::from_be_bytes(buf[276..284].try_into().unwrap());
+    let header_len = 284 + (n_updates as usize) * 48 + 320; // 604 base + 48 per update
     if buf.len() < header_len {
         return Err(CodecError::UnexpectedEof);
     }
     let header = decode_header(&buf[..header_len])?;
     let cert = decode_commit(&buf[header_len..])?;
     Ok(CertifiedHeader { header, cert })
+}
+
+/// M211: decode a header hex that may be **either** a bare `BlockHeader`
+/// (`encode_header`) or a full `CertifiedHeader` (`encode_certified_header` — the
+/// on-wire form `GET /header/{h}` actually returns). Tries the certified form first
+/// (a certified header is header bytes + a cert tail, so a bare header fails its cert
+/// decode and a certified blob fails `decode_header` with `TrailingBytes` — the two are
+/// unambiguous), falling back to the bare header. Returns the `BlockHeader` either way.
+/// This lets `node check-snapshot`/`run --snapshot-header` accept exactly what operators
+/// copy from the RPC, not only an undocumented bare-header hex.
+pub fn decode_header_any(buf: &[u8]) -> Result<BlockHeader, CodecError> {
+    match decode_certified_header(buf) {
+        Ok(ch) => Ok(ch.header),
+        Err(_) => decode_header(buf),
+    }
 }
 
 /// M147: wire encoding of a full [`ValidatorSet`] — a length-prefixed list of
@@ -316,7 +411,7 @@ pub fn encode_validator_set(vs: &ValidatorSet) -> Vec<u8> {
 pub fn decode_validator_set(buf: &[u8]) -> Result<ValidatorSet, CodecError> {
     let mut d = Dec { buf, pos: 0 };
     let n = d.count()?;
-    let mut vals = Vec::with_capacity(n as usize);
+    let mut vals = Vec::with_capacity(prealloc(n));
     for _ in 0..n {
         let id = d.u64()?;
         let mut pubkey = [0u8; 32];
@@ -378,6 +473,15 @@ pub struct BlockHeader {
     /// cross-chain lock without replaying the source chain — the same SPV
     /// shape as `accounts_root` / `graph_root`, on a different commitment.
     pub bridge_root: crate::Hash,
+    /// M185 (B5 wire): Merkle root over the cNFT directory (`contributions`)
+    /// sorted by `node_id`. Cert-signed. A wallet opens a single cNFT-inclusion
+    /// proof against this root to verify "this contribution certificate is
+    /// on-chain" — a distinct commitment from `accounts_root` (cNFTs are
+    /// soulbound, not accounts-tree members). Placed in the prefix region (a new
+    /// state root, not a tail per-body commitment), so B5 is a hard break vs B4.
+    pub contributions_root: crate::Hash,
+    /// SEC-05 (B7 wire): Merkle root over the source chain's unbonding queue.
+    pub unbonding_root: crate::Hash,
     pub validator_updates: Vec<ValidatorUpdate>,
     /// SHA-256 over the canonical encoding of the tx list (or zero for empty).
     pub txs_commitment: crate::Hash,
@@ -400,6 +504,16 @@ pub struct BlockHeader {
     /// here, but the *B3* decoding path reads the additional 32 bytes
     /// — see the migration note in the M171 README).
     pub bridge_unbondings_commitment: crate::Hash,
+    /// M179 (B4 wire): SHA-256 over the canonical encoding of the key-rotation op
+    /// list (`Block::key_rotations`). Eighth and last per-body commitment,
+    /// appended at the tail so B3 and earlier prefixes stay byte-stable.
+    pub key_rotations_commitment: crate::Hash,
+    /// M194 (B6 wire): SHA-256 over the canonical encoding of the governance
+    /// proposal op list (`Block::gov_proposals`). Ninth per-body commitment.
+    pub gov_proposals_commitment: crate::Hash,
+    /// M194 (B6 wire): SHA-256 over the canonical encoding of the governance vote
+    /// op list (`Block::gov_votes`). Tenth and last per-body commitment.
+    pub gov_votes_commitment: crate::Hash,
 }
 
 impl BlockHeader {
@@ -417,6 +531,8 @@ impl BlockHeader {
             accounts_root: b.accounts_root,
             graph_root: b.graph_root,
             bridge_root: b.bridge_root,
+            contributions_root: b.contributions_root,
+            unbonding_root: b.unbonding_root,
             validator_updates: b.validator_updates.clone(),
             txs_commitment: list_commitment(&b.txs.iter().map(encode_tx).collect::<Vec<_>>()),
             stake_ops_commitment: list_commitment(
@@ -463,6 +579,25 @@ impl BlockHeader {
                     .map(encode_bridge_unbond)
                     .collect::<Vec<_>>(),
             ),
+            // M179 (B4 wire): eighth per-body commitment, binding the
+            // key-rotation op list — same discipline as the others.
+            key_rotations_commitment: list_commitment(
+                &b.key_rotations
+                    .iter()
+                    .map(encode_key_rotation)
+                    .collect::<Vec<_>>(),
+            ),
+            // M194 (B6 wire): ninth + tenth per-body commitments, binding the
+            // governance proposal / vote op lists — same discipline as the others.
+            gov_proposals_commitment: list_commitment(
+                &b.gov_proposals
+                    .iter()
+                    .map(encode_gov_proposal)
+                    .collect::<Vec<_>>(),
+            ),
+            gov_votes_commitment: list_commitment(
+                &b.gov_votes.iter().map(encode_gov_vote).collect::<Vec<_>>(),
+            ),
         }
     }
 
@@ -481,6 +616,9 @@ impl BlockHeader {
     /// (in canonical order). Used by full nodes; light clients never call it.
     /// Each body MUST match its committed root — otherwise the cert-signed
     /// commitment is broken.
+    // The 10 body vectors are the chain's canonical block bodies — grouping them into
+    // a struct would just move the arity, not reduce it.
+    #[allow(clippy::too_many_arguments)]
     pub fn to_block(
         &self,
         txs: Vec<SubmissionTx>,
@@ -490,6 +628,9 @@ impl BlockHeader {
         bridge_headers: Vec<BridgeHeader>,
         bridge_redeems: Vec<BridgeRedeem>,
         bridge_unbondings: Vec<BridgeUnbond>,
+        key_rotations: Vec<KeyRotation>,
+        gov_proposals: Vec<GovProposal>,
+        gov_votes: Vec<GovVote>,
     ) -> Block {
         Block {
             height: self.height,
@@ -501,6 +642,8 @@ impl BlockHeader {
             accounts_root: self.accounts_root,
             graph_root: self.graph_root,
             bridge_root: self.bridge_root,
+            contributions_root: self.contributions_root,
+            unbonding_root: self.unbonding_root,
             txs,
             validator_updates: self.validator_updates.clone(),
             stake_ops,
@@ -509,6 +652,9 @@ impl BlockHeader {
             bridge_headers,
             bridge_redeems,
             bridge_unbondings,
+            key_rotations,
+            gov_proposals,
+            gov_votes,
         }
     }
 }
@@ -638,6 +784,251 @@ fn enc_stakeop(e: &mut Enc, op: &StakeOp, include_sig: bool) {
     }
 }
 
+// --- key rotation (M179, account key swap) -----------------------------------
+
+/// The exact bytes an account signs (with its CURRENT key) to authorize a key
+/// rotation: all fields EXCEPT the signature. Layout: `u64 account ‖ 32
+/// new_pubkey ‖ u64 nonce`.
+pub fn keyrotation_signing_bytes(op: &KeyRotation) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_key_rotation(&mut e, op, false);
+    e.0
+}
+
+/// Canonical bytes of a full (signed) key rotation, used for its content hash.
+pub fn encode_key_rotation(op: &KeyRotation) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_key_rotation(&mut e, op, true);
+    e.0
+}
+
+/// Decode exactly one signed key rotation (inverse of [`encode_key_rotation`]);
+/// trailing bytes are an error.
+pub fn decode_key_rotation(buf: &[u8]) -> Result<KeyRotation, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let op = dec_key_rotation(&mut d)?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(op)
+}
+
+fn enc_key_rotation(e: &mut Enc, op: &KeyRotation, include_sig: bool) {
+    e.u64(op.account);
+    e.raw(&op.new_pubkey);
+    e.u64(op.nonce);
+    if include_sig {
+        e.raw(&op.signature);
+    }
+}
+
+fn dec_key_rotation(d: &mut Dec) -> Result<KeyRotation, CodecError> {
+    let account = d.u64()?;
+    let mut new_pubkey = [0u8; 32];
+    new_pubkey.copy_from_slice(d.take(32)?);
+    let nonce = d.u64()?;
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(d.take(64)?);
+    Ok(KeyRotation {
+        account,
+        new_pubkey,
+        nonce,
+        signature,
+    })
+}
+
+// --- governance (M194) -------------------------------------------------------
+
+/// M194: tag-encode a [`GovParam`] (tag byte + native value). The single wire
+/// representation shared by signing bytes, op encoding, and the `state_root` fold.
+pub fn encode_gov_param(param: &GovParam) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_gov_param(&mut e, param);
+    e.0
+}
+
+fn enc_gov_param(e: &mut Enc, param: &GovParam) {
+    match param {
+        GovParam::BaseEmission(v) => {
+            e.u8(0);
+            e.u64(*v);
+        }
+        GovParam::SlashBps(v) => {
+            e.u8(1);
+            e.u32(*v);
+        }
+        GovParam::DecayHalfLife(v) => {
+            e.u8(2);
+            e.u64(*v);
+        }
+        // M196: tag 3 ‖ field sub-tag ‖ native value (f32 for the knobs, u64 for the
+        // two usize counters).
+        GovParam::DeltaK(dp) => {
+            e.u8(3);
+            match dp {
+                DeltaKParam::TauDup(v) => {
+                    e.u8(0);
+                    e.f32(*v);
+                }
+                DeltaKParam::NReviewMin(v) => {
+                    e.u8(1);
+                    e.u64(*v);
+                }
+                DeltaKParam::CCap(v) => {
+                    e.u8(2);
+                    e.f32(*v);
+                }
+                DeltaKParam::NMin(v) => {
+                    e.u8(3);
+                    e.u64(*v);
+                }
+                DeltaKParam::Lam(v) => {
+                    e.u8(4);
+                    e.f32(*v);
+                }
+                DeltaKParam::BonusMax(v) => {
+                    e.u8(5);
+                    e.f32(*v);
+                }
+                DeltaKParam::Decay(v) => {
+                    e.u8(6);
+                    e.f32(*v);
+                }
+                DeltaKParam::FreshMin(v) => {
+                    e.u8(7);
+                    e.f32(*v);
+                }
+                DeltaKParam::DeltaKMin(v) => {
+                    e.u8(8);
+                    e.f32(*v);
+                }
+            }
+        }
+    }
+}
+
+fn dec_gov_param(d: &mut Dec) -> Result<GovParam, CodecError> {
+    match d.u8()? {
+        0 => Ok(GovParam::BaseEmission(d.u64()?)),
+        1 => Ok(GovParam::SlashBps(d.u32()?)),
+        2 => Ok(GovParam::DecayHalfLife(d.u64()?)),
+        3 => {
+            let dp = match d.u8()? {
+                0 => DeltaKParam::TauDup(d.f32()?),
+                1 => DeltaKParam::NReviewMin(d.u64()?),
+                2 => DeltaKParam::CCap(d.f32()?),
+                3 => DeltaKParam::NMin(d.u64()?),
+                4 => DeltaKParam::Lam(d.f32()?),
+                5 => DeltaKParam::BonusMax(d.f32()?),
+                6 => DeltaKParam::Decay(d.f32()?),
+                7 => DeltaKParam::FreshMin(d.f32()?),
+                8 => DeltaKParam::DeltaKMin(d.f32()?),
+                other => return Err(CodecError::BadEnum(other as u32)),
+            };
+            Ok(GovParam::DeltaK(dp))
+        }
+        other => Err(CodecError::BadEnum(other as u32)),
+    }
+}
+
+/// M194: the exact bytes a proposer signs (all fields except the signature).
+pub fn govproposal_signing_bytes(op: &GovProposal) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_gov_proposal(&mut e, op, false);
+    e.0
+}
+
+/// M194: canonical bytes of a full (signed) governance proposal (content hash).
+pub fn encode_gov_proposal(op: &GovProposal) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_gov_proposal(&mut e, op, true);
+    e.0
+}
+
+pub fn decode_gov_proposal(buf: &[u8]) -> Result<GovProposal, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let op = dec_gov_proposal(&mut d)?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(op)
+}
+
+fn enc_gov_proposal(e: &mut Enc, op: &GovProposal, include_sig: bool) {
+    e.u64(op.proposer);
+    enc_gov_param(e, &op.param);
+    e.u64(op.voting_period);
+    e.u64(op.nonce);
+    if include_sig {
+        e.raw(&op.signature);
+    }
+}
+
+fn dec_gov_proposal(d: &mut Dec) -> Result<GovProposal, CodecError> {
+    let proposer = d.u64()?;
+    let param = dec_gov_param(d)?;
+    let voting_period = d.u64()?;
+    let nonce = d.u64()?;
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(d.take(64)?);
+    Ok(GovProposal {
+        proposer,
+        param,
+        voting_period,
+        nonce,
+        signature,
+    })
+}
+
+/// M194: the exact bytes a voter signs (all fields except the signature).
+pub fn govvote_signing_bytes(op: &GovVote) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_gov_vote(&mut e, op, false);
+    e.0
+}
+
+/// M194: canonical bytes of a full (signed) governance vote (content hash).
+pub fn encode_gov_vote(op: &GovVote) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_gov_vote(&mut e, op, true);
+    e.0
+}
+
+pub fn decode_gov_vote(buf: &[u8]) -> Result<GovVote, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let op = dec_gov_vote(&mut d)?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(op)
+}
+
+fn enc_gov_vote(e: &mut Enc, op: &GovVote, include_sig: bool) {
+    e.u64(op.proposal_id);
+    e.u64(op.voter);
+    e.u8(op.approve as u8);
+    e.u64(op.nonce);
+    if include_sig {
+        e.raw(&op.signature);
+    }
+}
+
+fn dec_gov_vote(d: &mut Dec) -> Result<GovVote, CodecError> {
+    let proposal_id = d.u64()?;
+    let voter = d.u64()?;
+    let approve = d.u8()? != 0;
+    let nonce = d.u64()?;
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(d.take(64)?);
+    Ok(GovVote {
+        proposal_id,
+        voter,
+        approve,
+        nonce,
+        signature,
+    })
+}
+
 // --- bridge locks (M30, cross-chain) -----------------------------------------
 
 /// The exact bytes an account signs to authorize a bridge lock: all fields
@@ -715,8 +1106,15 @@ fn enc_validator_set_inline(e: &mut Enc, vs: &crate::validator::ValidatorSet) {
 }
 
 fn dec_validator_set_inline(d: &mut Dec) -> Result<crate::validator::ValidatorSet, CodecError> {
-    let n = d.u32()? as usize;
-    let mut vs = Vec::with_capacity(n);
+    let n_raw = d.u32()?;
+    if n_raw as u64 > MAX_ITEMS {
+        return Err(CodecError::TooManyItems(n_raw as u64));
+    }
+    let n = n_raw as usize;
+    // SEC-06 (re-verify): cap the up-front reservation (a short frame could claim 1M
+    // validators via this bridge-header path and force a large alloc before any element
+    // is read). The `Vec` grows as elements are actually decoded + bounds-checked.
+    let mut vs = Vec::with_capacity(prealloc(n_raw as u64));
     for _ in 0..n {
         let len = d.u32()? as usize;
         let buf = d.take(len)?;
@@ -1110,7 +1508,7 @@ pub fn decode_commit(buf: &[u8]) -> Result<Commit, CodecError> {
     let mut block_hash = [0u8; 32];
     block_hash.copy_from_slice(d.take(32)?);
     let n = d.count()?;
-    let mut precommits = Vec::with_capacity(n as usize);
+    let mut precommits = Vec::with_capacity(prealloc(n));
     for _ in 0..n {
         precommits.push(dec_vote(&mut d)?);
     }
@@ -1182,7 +1580,29 @@ pub fn decode_account(buf: &[u8]) -> Result<Account, CodecError> {
 // excludes them, so decode reproduces a *byte-identical* `ChainState`.
 
 /// Current snapshot wire version. Bumped if the layout ever changes.
-pub const SNAPSHOT_VERSION: u32 = 1;
+///
+/// v2 (M176): each `BridgeSource` now also serializes `consumed_unbonds` (the
+/// cross-chain unbonding replay-dedup set). v1 dropped it on decode, which —
+/// once that set became consensus-critical (folded into `state_root`) — would
+/// let a snapshot-synced node diverge from a full-replay node on a replayed
+/// `BridgeUnbond`. A v1 snapshot is now rejected (strict version check), so an
+/// operator must regenerate; this is pre-production and snapshots are
+/// disposable.
+///
+/// v3 (M183): the snapshot now also serializes `contributions` (the cNFT
+/// cognitive-contribution certificates), which M183 folded into `state_root`. A
+/// v2 snapshot would drop them on decode and fail the `state_root` cross-check,
+/// so v2 is now rejected — regenerate.
+///
+/// v4 (M187): the snapshot now also serializes `decay_half_life_blocks` (the
+/// §6.2 emission time-decay knob), a governance constant alongside
+/// `base_emission_micro`. A v3 snapshot lacks the field, so v3 is now rejected —
+/// regenerate.
+///
+/// v5 (M194): the snapshot now also serializes the governance `proposals` map +
+/// `next_proposal_id` (M194 folds them into `state_root`). A v4 snapshot lacks
+/// them, so v4 is now rejected — regenerate.
+pub const SNAPSHOT_VERSION: u32 = 5;
 
 /// Write the account's state fields into the shared stream (same layout as
 /// [`encode_account`], inlined so the snapshot controls framing).
@@ -1227,7 +1647,7 @@ fn enc_validator_set(e: &mut Enc, vs: &ValidatorSet) {
 /// Inverse of [`enc_validator_set`].
 fn dec_validator_set(d: &mut Dec) -> Result<ValidatorSet, CodecError> {
     let n = d.count()?;
-    let mut vals = Vec::with_capacity(n as usize);
+    let mut vals = Vec::with_capacity(prealloc(n));
     for _ in 0..n {
         let id = d.u64()?;
         let mut pubkey = [0u8; 32];
@@ -1252,6 +1672,7 @@ pub fn encode_snapshot(s: &ChainState) -> Vec<u8> {
     e.u64(s.bridge_minted);
     e.u64(s.next_lock_id);
     e.u64(s.base_emission_micro);
+    e.u64(s.decay_half_life_blocks); // M187 (§6.2): emission time-decay half-life
     e.u32(s.slash_bps);
     e.raw(&s.genesis_hash);
     // ΔK params
@@ -1283,6 +1704,29 @@ pub fn encode_snapshot(s: &ChainState) -> Vec<u8> {
         e.u64(n.node_id);
         e.emb(&n.embedding);
         e.u32(n.domain);
+    }
+    // M183 (v3): cNFT contribution certificates, keyed by graph node_id.
+    e.u64(s.contributions.len() as u64);
+    for (node_id, c) in &s.contributions {
+        e.u64(*node_id);
+        e.u64(c.contributor);
+        e.u32(c.domain);
+        e.u64(c.reward_micro);
+        e.u64(c.height);
+    }
+    // M194: governance proposals + id counter (v5).
+    e.u64(s.next_proposal_id);
+    e.u64(s.proposals.len() as u64);
+    for (id, p) in &s.proposals {
+        e.u64(*id);
+        enc_gov_param(&mut e, &p.param);
+        e.u64(p.created_height);
+        e.u64(p.voting_period);
+        e.u64(p.votes.len() as u64);
+        for (voter, approve) in &p.votes {
+            e.u64(*voter);
+            e.u8(*approve as u8);
+        }
     }
     // bonds
     e.u64(s.bonds.len() as u64);
@@ -1322,6 +1766,14 @@ pub fn encode_snapshot(s: &ChainState) -> Vec<u8> {
         for c in &src.consumed {
             e.u64(*c);
         }
+        // M176 (snapshot v2): persist the unbonding replay-dedup set too, so a
+        // snapshot-synced node recovers the same consensus-critical state a
+        // full-replay node holds. BTreeSet iterates sorted ⇒ canonical bytes.
+        e.u64(src.consumed_unbonds.len() as u64);
+        for (height, index) in &src.consumed_unbonds {
+            e.u64(*height);
+            e.u64(*index);
+        }
     }
     e.0
 }
@@ -1343,6 +1795,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
     let bridge_minted = d.u64()?;
     let next_lock_id = d.u64()?;
     let base_emission_micro = d.u64()?;
+    let decay_half_life_blocks = d.u64()?; // M187 (§6.2)
     let slash_bps = d.u32()?;
     let mut genesis_hash = [0u8; 32];
     genesis_hash.copy_from_slice(d.take(32)?);
@@ -1373,7 +1826,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
     }
     // graph nodes
     let n = d.count()?;
-    let mut nodes = Vec::with_capacity(n as usize);
+    let mut nodes = Vec::with_capacity(prealloc(n));
     for _ in 0..n {
         let node_id = d.u64()?;
         let embedding = d.emb()?;
@@ -1385,6 +1838,52 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
         });
     }
     let graph = CognitiveGraph { nodes };
+    // M183 (v3): cNFT contribution certificates, keyed by graph node_id.
+    let n = d.count()?;
+    let mut contributions = std::collections::BTreeMap::new();
+    for _ in 0..n {
+        let node_id = d.u64()?;
+        let contributor = d.u64()?;
+        let domain = d.u32()?;
+        let reward_micro = d.u64()?;
+        let height = d.u64()?;
+        contributions.insert(
+            node_id,
+            crate::Cnft {
+                contributor,
+                domain,
+                reward_micro,
+                height,
+            },
+        );
+    }
+    // M194 (v5): governance proposals + id counter.
+    let next_proposal_id = d.u64()?;
+    let n_proposals = d.count()?;
+    let mut proposals = std::collections::BTreeMap::new();
+    for _ in 0..n_proposals {
+        let id = d.u64()?;
+        let param = dec_gov_param(&mut d)?;
+        let created_height = d.u64()?;
+        let voting_period = d.u64()?;
+        let n_votes = d.count()?;
+        let mut votes = std::collections::BTreeMap::new();
+        for _ in 0..n_votes {
+            let voter = d.u64()?;
+            let approve = d.u8()? != 0;
+            votes.insert(voter, approve);
+        }
+        proposals.insert(
+            id,
+            Proposal {
+                id,
+                param,
+                created_height,
+                voting_period,
+                votes,
+            },
+        );
+    }
     // bonds
     let n = d.count()?;
     let mut bonds = std::collections::BTreeMap::new();
@@ -1394,7 +1893,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
     }
     // unbonding
     let n = d.count()?;
-    let mut unbonding = Vec::with_capacity(n as usize);
+    let mut unbonding = Vec::with_capacity(prealloc(n));
     for _ in 0..n {
         unbonding.push(UnbondingEntry {
             account: d.u64()?,
@@ -1433,6 +1932,15 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
         for _ in 0..cn {
             consumed.insert(d.u64()?);
         }
+        // M176 (snapshot v2): the unbonding replay-dedup set, as `(source_height,
+        // index)` pairs.
+        let un = d.count()?;
+        let mut consumed_unbonds = std::collections::BTreeSet::new();
+        for _ in 0..un {
+            let height = d.u64()?;
+            let index = d.u64()?;
+            consumed_unbonds.insert((height, index));
+        }
         bridge_sources.insert(
             chain,
             BridgeSource {
@@ -1440,7 +1948,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
                 head,
                 height: src_height,
                 consumed,
-                consumed_unbonds: std::collections::BTreeSet::new(),
+                consumed_unbonds,
             },
         );
     }
@@ -1451,8 +1959,10 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
         accounts,
         reviewers,
         graph,
+        contributions,
         params,
         base_emission_micro,
+        decay_half_life_blocks,
         slash_bps,
         supply,
         treasury,
@@ -1466,6 +1976,8 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
         bridge_locks,
         bridge_lock_heights,
         next_lock_id,
+        proposals,
+        next_proposal_id,
         bridge_minted,
         bridge_sources,
         genesis_hash,
@@ -1498,7 +2010,7 @@ pub fn decode_proof(buf: &[u8]) -> Result<Proof, CodecError> {
     let key = d.u64()?; // M173
     let leaf_count = d.u64()?; // M173
     let n = d.count()?;
-    let mut steps = Vec::with_capacity(n as usize);
+    let mut steps = Vec::with_capacity(prealloc(n));
     for _ in 0..n {
         let tag = d.u32()?;
         let mut h = [0u8; 32];
@@ -1543,6 +2055,7 @@ pub fn encode_proof_kind(k: ProofKind) -> u8 {
         ProofKind::Reviewer => 1,
         ProofKind::Validator => 2,
         ProofKind::GraphNode => 3,
+        ProofKind::Cnft => 4,
     }
 }
 
@@ -1553,6 +2066,7 @@ pub fn decode_proof_kind(b: u8) -> Result<ProofKind, CodecError> {
         1 => Ok(ProofKind::Reviewer),
         2 => Ok(ProofKind::Validator),
         3 => Ok(ProofKind::GraphNode),
+        4 => Ok(ProofKind::Cnft),
         other => Err(CodecError::BadEnum(other as u32)),
     }
 }
@@ -1719,6 +2233,9 @@ pub fn decode_proof_entry(buf: &[u8]) -> Result<ProofEntry, CodecError> {
         // M25: GraphNode: u64 node_id ‖ 8×f32 embedding ‖ u32 domain
         // = 8 + 32 + 4 = 44.
         ProofKind::GraphNode => 44,
+        // M185: Cnft: u64 node_id ‖ u64 contributor ‖ u32 domain ‖ u64
+        // reward_micro ‖ u64 height = 8 + 8 + 4 + 8 + 8 = 36.
+        ProofKind::Cnft => 36,
     };
     if buf.len() < 1 + leaf_byte_len {
         return Err(CodecError::UnexpectedEof);
@@ -1792,6 +2309,27 @@ pub fn decode_proof_entry(buf: &[u8]) -> Result<ProofEntry, CodecError> {
                 proof,
             }
         }
+        ProofKind::Cnft => {
+            let mut d2 = Dec {
+                buf: leaf_buf,
+                pos: 0,
+            };
+            let node_id = d2.u64()?;
+            let contributor = d2.u64()?;
+            let domain = d2.u32()?;
+            let reward_micro = d2.u64()?;
+            let height = d2.u64()?;
+            ProofEntry::Cnft {
+                node_id,
+                cnft: crate::Cnft {
+                    contributor,
+                    domain,
+                    reward_micro,
+                    height,
+                },
+                proof,
+            }
+        }
     };
     Ok(entry)
 }
@@ -1801,6 +2339,10 @@ pub(crate) struct Enc(pub Vec<u8>);
 impl Enc {
     pub fn raw(&mut self, b: &[u8]) {
         self.0.extend_from_slice(b);
+    }
+    /// M194: a single byte (bool flags, enum tags).
+    pub fn u8(&mut self, v: u8) {
+        self.0.push(v);
     }
     pub fn u32(&mut self, v: u32) {
         self.0.extend_from_slice(&v.to_be_bytes());
@@ -1846,8 +2388,14 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     // M30: cumulative bridge-locks root, right after `graph_root`.
     let mut bridge_root = [0u8; 32];
     bridge_root.copy_from_slice(d.take(32)?);
+    // M185 (B5 wire): cNFT directory root, right after `bridge_root`.
+    let mut contributions_root = [0u8; 32];
+    contributions_root.copy_from_slice(d.take(32)?);
+    // SEC-05 (B7): unbonding-queue root, read right after contributions_root.
+    let mut unbonding_root = [0u8; 32];
+    unbonding_root.copy_from_slice(d.take(32)?);
     let n_upd = d.count()?;
-    let mut validator_updates = Vec::with_capacity(n_upd as usize);
+    let mut validator_updates = Vec::with_capacity(prealloc(n_upd));
     for _ in 0..n_upd {
         let id = d.u64()?;
         let mut pubkey = [0u8; 32];
@@ -1856,35 +2404,35 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         validator_updates.push(ValidatorUpdate { id, pubkey, power });
     }
     let n_txs = d.count()?;
-    let mut txs = Vec::with_capacity(n_txs as usize);
+    let mut txs = Vec::with_capacity(prealloc(n_txs));
     for _ in 0..n_txs {
         txs.push(dec_tx(&mut d)?);
     }
     let n_ops = d.count()?;
-    let mut stake_ops = Vec::with_capacity(n_ops as usize);
+    let mut stake_ops = Vec::with_capacity(prealloc(n_ops));
     for _ in 0..n_ops {
         stake_ops.push(dec_stakeop(&mut d)?);
     }
     let n_ev = d.count()?;
-    let mut slashing_evidence = Vec::with_capacity(n_ev as usize);
+    let mut slashing_evidence = Vec::with_capacity(prealloc(n_ev));
     for _ in 0..n_ev {
         slashing_evidence.push(dec_evidence(&mut d)?);
     }
     // M30: bridge-lock op list.
     let n_locks = d.count()?;
-    let mut bridge_locks = Vec::with_capacity(n_locks as usize);
+    let mut bridge_locks = Vec::with_capacity(prealloc(n_locks));
     for _ in 0..n_locks {
         bridge_locks.push(dec_bridge_lock(&mut d)?);
     }
     // M31: bridge-follow op list.
     let n_headers = d.count()?;
-    let mut bridge_headers = Vec::with_capacity(n_headers as usize);
+    let mut bridge_headers = Vec::with_capacity(prealloc(n_headers));
     for _ in 0..n_headers {
         bridge_headers.push(dec_bridge_header(&mut d)?);
     }
     // M31: bridge-redeem op list.
     let n_redeems = d.count()?;
-    let mut bridge_redeems = Vec::with_capacity(n_redeems as usize);
+    let mut bridge_redeems = Vec::with_capacity(prealloc(n_redeems));
     for _ in 0..n_redeems {
         bridge_redeems.push(dec_bridge_redeem(&mut d)?);
     }
@@ -1897,9 +2445,30 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     // state). Conversely, an M171 decoder reading an M168 B2 block
     // reads `n = 0` here and continues.
     let n_unbonds = d.count()?;
-    let mut bridge_unbondings = Vec::with_capacity(n_unbonds as usize);
+    let mut bridge_unbondings = Vec::with_capacity(prealloc(n_unbonds));
     for _ in 0..n_unbonds {
         bridge_unbondings.push(dec_bridge_unbond(&mut d)?);
+    }
+    // M179 (B4 wire): key-rotation op list, appended at the tail. A B3 decoder
+    // reading a B4 block errors `UnexpectedEof` here; a B4 decoder reading a B3
+    // block reads `n = 0` and continues (same compatibility shape as B2→B3).
+    let n_rotations = d.count()?;
+    let mut key_rotations = Vec::with_capacity(prealloc(n_rotations));
+    for _ in 0..n_rotations {
+        key_rotations.push(dec_key_rotation(&mut d)?);
+    }
+    // M194 (B6 wire): governance proposal + vote op lists, appended at the tail. A B5
+    // decoder reading a B6 block errors `UnexpectedEof` here; a B6 decoder reading a B5
+    // block reads `n = 0` and continues (same compatibility shape as prior gens).
+    let n_proposals = d.count()?;
+    let mut gov_proposals = Vec::with_capacity(prealloc(n_proposals));
+    for _ in 0..n_proposals {
+        gov_proposals.push(dec_gov_proposal(&mut d)?);
+    }
+    let n_votes = d.count()?;
+    let mut gov_votes = Vec::with_capacity(prealloc(n_votes));
+    for _ in 0..n_votes {
+        gov_votes.push(dec_gov_vote(&mut d)?);
     }
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
@@ -1914,6 +2483,8 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         accounts_root,
         graph_root,
         bridge_root,
+        contributions_root,
+        unbonding_root,
         txs,
         validator_updates,
         stake_ops,
@@ -1922,6 +2493,9 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         bridge_headers,
         bridge_redeems,
         bridge_unbondings,
+        key_rotations,
+        gov_proposals,
+        gov_votes,
     })
 }
 
@@ -1940,7 +2514,7 @@ fn dec_tx(d: &mut Dec) -> Result<SubmissionTx, CodecError> {
     let fee = d.u64()?; // M122 (wire v1)
     let nonce = d.u64()?; // M122 (wire v1)
     let n_rev = d.count()?;
-    let mut reviews = Vec::with_capacity(n_rev as usize);
+    let mut reviews = Vec::with_capacity(prealloc(n_rev));
     for _ in 0..n_rev {
         reviews.push(Review {
             reviewer: d.u64()?,
@@ -2069,6 +2643,8 @@ mod tests {
             accounts_root: [12u8; 32],
             graph_root: [13u8; 32],
             bridge_root: [14u8; 32],
+            contributions_root: [0u8; 32],
+            unbonding_root: [0u8; 32],
             txs: vec![SubmissionTx {
                 author: 1,
                 embedding: emb,
@@ -2131,6 +2707,9 @@ mod tests {
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
             bridge_unbondings: Vec::new(),
+            key_rotations: Vec::new(),
+            gov_proposals: Vec::new(),
+            gov_votes: Vec::new(),
             proposer: 0,
         }
     }
@@ -2293,6 +2872,36 @@ mod tests {
         assert!(matches!(
             decode_stakeop(&extra),
             Err(CodecError::TrailingBytes)
+        ));
+    }
+
+    #[test]
+    fn key_rotation_round_trip() {
+        let op = KeyRotation {
+            account: 7,
+            new_pubkey: [0x5a; 32],
+            nonce: 42,
+            signature: [9u8; 64],
+        };
+        let bytes = encode_key_rotation(&op);
+        let back = decode_key_rotation(&bytes).unwrap();
+        assert_eq!(encode_key_rotation(&back), bytes);
+        assert_eq!(back.account, 7);
+        assert_eq!(back.new_pubkey, [0x5a; 32]);
+        assert_eq!(back.nonce, 42);
+        // signing bytes exclude the 64-byte signature.
+        assert_eq!(keyrotation_signing_bytes(&op).len() + 64, bytes.len());
+        // trailing bytes are rejected.
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(matches!(
+            decode_key_rotation(&extra),
+            Err(CodecError::TrailingBytes)
+        ));
+        // a truncated buffer is an UnexpectedEof, not a panic.
+        assert!(matches!(
+            decode_key_rotation(&bytes[..bytes.len() - 1]),
+            Err(CodecError::UnexpectedEof)
         ));
     }
 
@@ -2616,6 +3225,33 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn decode_header_any_accepts_both_bare_and_certified() {
+        // M211: `decode_header_any` must accept EITHER a bare BlockHeader hex
+        // (`encode_header`) or the certified form `GET /header/{h}` returns
+        // (`encode_certified_header`) — the latter is what `check-snapshot` /
+        // `run --snapshot-header` receive in practice, and `decode_header` alone
+        // rejected it with `TrailingBytes` (the bug the testnet drill surfaced).
+        let b = sample_block();
+        let hdr = BlockHeader::from_block(&b);
+        let cert = crate::consensus::Commit {
+            height: b.height,
+            round: 0,
+            block_hash: hdr.hash(),
+            precommits: Vec::new(),
+        };
+        let ch = CertifiedHeader::from_certified(&b, &cert);
+
+        let from_bare = decode_header_any(&encode_header(&hdr)).unwrap();
+        let from_cert = decode_header_any(&encode_certified_header(&ch)).unwrap();
+        assert_eq!(from_bare.hash(), hdr.hash());
+        assert_eq!(from_cert.hash(), hdr.hash());
+        assert_eq!(from_bare.hash(), from_cert.hash());
+
+        // garbage is still an error (not a panic, not a silent zero header)
+        assert!(decode_header_any(&[0u8; 8]).is_err());
+    }
+
     // --- M27: graph_root slot round-trip ----------------------------------
 
     #[test]
@@ -2805,7 +3441,33 @@ mod tests {
         assert_eq!(back, entry);
     }
 
-    // ----- M29 codec round-trips -----
+    #[test]
+    fn cnft_proof_entry_round_trip() {
+        // M185: a `ProofEntry::Cnft` survives encode→decode byte-for-byte —
+        // kind tag = 4, then a 36-byte cNFT leaf, then the proof bytes.
+        use crate::light::ProofEntry;
+        let cnft = crate::Cnft {
+            contributor: 7,
+            domain: 9,
+            reward_micro: 500,
+            height: 3,
+        };
+        let proof = Proof {
+            key: 2,
+            leaf_count: 4,
+            steps: vec![Step::Left([0x33; 32]), Step::Right([0x44; 32])],
+        };
+        let entry = ProofEntry::Cnft {
+            node_id: 5,
+            cnft: cnft.clone(),
+            proof: proof.clone(),
+        };
+        let bytes = encode_proof_entry(&entry);
+        assert_eq!(bytes[0], 4);
+        assert_eq!(&bytes[1..37], cnft.merkle_leaf(5).as_slice());
+        let back = decode_proof_entry(&bytes).expect("decode must succeed");
+        assert_eq!(back, entry);
+    }
 
     #[test]
     fn encode_knn_request_round_trips() {
@@ -2937,6 +3599,8 @@ mod tests {
                 accounts_root: [0u8; 32],
                 graph_root: [0u8; 32],
                 bridge_root: [0u8; 32],
+                contributions_root: [0u8; 32],
+                unbonding_root: [0u8; 32],
                 validator_updates: vec![],
                 txs_commitment: [0u8; 32],
                 stake_ops_commitment: [0u8; 32],
@@ -2945,6 +3609,9 @@ mod tests {
                 bridge_headers_commitment: [0u8; 32],
                 bridge_redeems_commitment: [0u8; 32],
                 bridge_unbondings_commitment: [0u8; 32],
+                key_rotations_commitment: [0u8; 32],
+                gov_proposals_commitment: [0u8; 32],
+                gov_votes_commitment: [0u8; 32],
                 proposer: 0,
             },
             cert_prev: crate::consensus::Commit {
@@ -2962,6 +3629,8 @@ mod tests {
                 accounts_root: [0u8; 32],
                 graph_root: [0u8; 32],
                 bridge_root: [0u8; 32],
+                contributions_root: [0u8; 32],
+                unbonding_root: [0u8; 32],
                 validator_updates: vec![],
                 txs_commitment: [0u8; 32],
                 stake_ops_commitment: [0u8; 32],
@@ -2970,6 +3639,9 @@ mod tests {
                 bridge_headers_commitment: [0u8; 32],
                 bridge_redeems_commitment: [0u8; 32],
                 bridge_unbondings_commitment: [0u8; 32],
+                key_rotations_commitment: [0u8; 32],
+                gov_proposals_commitment: [0u8; 32],
+                gov_votes_commitment: [0u8; 32],
                 proposer: 0,
             },
             cert_new: crate::consensus::Commit {
@@ -3087,6 +3759,8 @@ mod tests {
                         accounts_root: [0u8; 32],
                         graph_root: [0u8; 32],
                         bridge_root: [0u8; 32],
+                        contributions_root: [0u8; 32],
+                        unbonding_root: [0u8; 32],
                         validator_updates: vec![],
                         txs_commitment: [0u8; 32],
                         stake_ops_commitment: [0u8; 32],
@@ -3095,6 +3769,9 @@ mod tests {
                         bridge_headers_commitment: [0u8; 32],
                         bridge_redeems_commitment: [0u8; 32],
                         bridge_unbondings_commitment: [0u8; 32],
+                        key_rotations_commitment: [0u8; 32],
+                        gov_proposals_commitment: [0u8; 32],
+                        gov_votes_commitment: [0u8; 32],
                         proposer: 0,
                     },
                     cert_prev: crate::consensus::Commit {
@@ -3112,6 +3789,8 @@ mod tests {
                         accounts_root: [0u8; 32],
                         graph_root: [0u8; 32],
                         bridge_root: [0u8; 32],
+                        contributions_root: [0u8; 32],
+                        unbonding_root: [0u8; 32],
                         validator_updates: vec![],
                         txs_commitment: [0u8; 32],
                         stake_ops_commitment: [0u8; 32],
@@ -3120,6 +3799,9 @@ mod tests {
                         bridge_headers_commitment: [0u8; 32],
                         bridge_redeems_commitment: [0u8; 32],
                         bridge_unbondings_commitment: [0u8; 32],
+                        key_rotations_commitment: [0u8; 32],
+                        gov_proposals_commitment: [0u8; 32],
+                        gov_votes_commitment: [0u8; 32],
                         proposer: 0,
                     },
                     cert_new: crate::consensus::Commit {
@@ -3257,6 +3939,44 @@ mod tests {
         ));
     }
 
+    /// M173 hardening: `next_set`'s inline count is a raw on-wire `u32`
+    /// (unlike every other length-prefixed list, which goes through
+    /// `Dec::count()`'s `MAX_ITEMS` cap). Before this fix a forged count near
+    /// `u32::MAX` reached `Vec::with_capacity` uncapped — a single malicious
+    /// `BridgeHeader` (reachable from an unauthenticated gossiped `Blocks`
+    /// message, since `require_peer_auth` defaults off) could abort the
+    /// process via an attempted allocation of `u32::MAX` `Validator` structs
+    /// (well over 100 GB), well before any further bytes are even present
+    /// in the buffer. Confirm the forged count is rejected before any
+    /// allocation is attempted (the buffer here is far too short to actually
+    /// hold that many entries, so success would mean a reservation was made
+    /// with no data backing it).
+    #[test]
+    fn bridge_header_rejects_forged_next_set_count() {
+        let b = sample_block();
+        let header = BlockHeader::from_block(&b);
+        let cert = sample_cert(header.hash(), header.height);
+        let op = BridgeHeader {
+            source_chain: [55u8; 32],
+            header,
+            cert,
+            next_set: sample_validator_set(),
+        };
+        let bytes = encode_bridge_header(&op);
+        // The inline validator-set count is the last 4+N*48 bytes; find and
+        // overwrite just the u32 count prefix with a huge forged value,
+        // keeping the (now-truncated, short) rest of the buffer as-is.
+        let real_count = op.next_set.validators().len() as u32;
+        // Each entry is a 4-byte length prefix + a 48-byte `Validator` leaf.
+        let count_pos = bytes.len() - 4 - (real_count as usize) * (4 + 48);
+        let mut forged = bytes[..count_pos].to_vec();
+        forged.extend_from_slice(&(u32::MAX).to_be_bytes());
+        assert!(matches!(
+            decode_bridge_header(&forged),
+            Err(CodecError::TooManyItems(n)) if n == u32::MAX as u64
+        ));
+    }
+
     #[test]
     fn bridge_redeem_round_trip() {
         let b = sample_block();
@@ -3360,6 +4080,7 @@ mod tests {
             seed_nodes: vec![(emb, 0)],
             params: DeltaKParams::default(),
             base_emission_micro: 8 * MICRO,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 1.5,
             validators: vec![(21, pk(21), 3), (22, pk(22), 1)],
@@ -3433,5 +4154,410 @@ mod tests {
             decode_snapshot(&extra),
             Err(CodecError::TrailingBytes)
         ));
+    }
+
+    /// M176: build a `ChainState` with a bridge source whose `consumed` and
+    /// `consumed_unbonds` sets are both non-empty.
+    fn state_with_consumed_unbonds() -> ChainState {
+        let mut s = sample_state();
+        let set = ValidatorSet::new(vec![Validator {
+            id: 21,
+            pubkey: crate::Keypair::from_seed([21u8; 32]).public(),
+            power: 1,
+        }]);
+        let mut consumed = std::collections::BTreeSet::new();
+        consumed.insert(7u64);
+        let mut consumed_unbonds = std::collections::BTreeSet::new();
+        consumed_unbonds.insert((3u64, 0u64));
+        consumed_unbonds.insert((3u64, 1u64));
+        consumed_unbonds.insert((9u64, 0u64));
+        s.bridge_sources.insert(
+            [0x5a; 32],
+            BridgeSource {
+                set,
+                head: [0x11; 32],
+                height: 9,
+                consumed,
+                consumed_unbonds,
+            },
+        );
+        s
+    }
+
+    #[test]
+    fn snapshot_round_trips_consumed_unbonds() {
+        // M176: the unbonding replay-dedup set survives a snapshot encode→decode
+        // (v1 silently dropped it, which — once the set became consensus-critical
+        // — would let a snapshot-synced node accept a replay a full node rejects).
+        let s = state_with_consumed_unbonds();
+        let bytes = encode_snapshot(&s);
+        let back = decode_snapshot(&bytes).expect("round-trips");
+        let src = back
+            .bridge_sources
+            .get(&[0x5a; 32])
+            .expect("source present");
+        let mut expected = std::collections::BTreeSet::new();
+        expected.insert((3u64, 0u64));
+        expected.insert((3u64, 1u64));
+        expected.insert((9u64, 0u64));
+        assert_eq!(src.consumed_unbonds, expected);
+        assert_eq!(encode_snapshot(&back), bytes, "re-encode stable");
+    }
+
+    #[test]
+    fn snapshot_round_trips_contributions() {
+        // M183 (v3): cNFT contribution certificates survive snapshot encode→decode
+        // (they are folded into state_root, so dropping them would fail the M135
+        // state_root cross-check on a snapshot boot).
+        let mut s = sample_state();
+        s.contributions.insert(
+            0,
+            crate::Cnft {
+                contributor: 1,
+                domain: 7,
+                reward_micro: 3 * MICRO,
+                height: 1,
+            },
+        );
+        s.contributions.insert(
+            4,
+            crate::Cnft {
+                contributor: 2,
+                domain: 9,
+                reward_micro: 11 * MICRO,
+                height: 5,
+            },
+        );
+        let bytes = encode_snapshot(&s);
+        let back = decode_snapshot(&bytes).expect("round-trips");
+        assert_eq!(back.contributions, s.contributions);
+        assert_eq!(back.cnft(4).unwrap().reward_micro, 11 * MICRO);
+        assert_eq!(encode_snapshot(&back), bytes, "re-encode stable");
+        // state_root is reproduced (the cross-check a snapshot boot relies on).
+        assert_eq!(back.state_root(), s.state_root());
+    }
+
+    #[test]
+    fn gov_proposal_and_vote_round_trip() {
+        // M194: both governance ops survive encode→decode byte-for-byte, incl. each
+        // `GovParam` tag; re-encode is stable.
+        for param in [
+            GovParam::BaseEmission(8 * MICRO),
+            GovParam::SlashBps(4321),
+            GovParam::DecayHalfLife(13),
+            GovParam::DeltaK(crate::DeltaKParam::Lam(0.37)),
+            GovParam::DeltaK(crate::DeltaKParam::NMin(5)),
+            GovParam::DeltaK(crate::DeltaKParam::DeltaKMin(0.02)),
+        ] {
+            let p = GovProposal {
+                proposer: 7,
+                param: param.clone(),
+                voting_period: 100,
+                nonce: 3,
+                signature: [9u8; 64],
+            };
+            let bytes = encode_gov_proposal(&p);
+            let back = decode_gov_proposal(&bytes).expect("proposal round-trips");
+            assert_eq!(back, p);
+            assert_eq!(encode_gov_proposal(&back), bytes);
+            // Signing bytes exclude the signature (shorter than the full encoding).
+            assert!(govproposal_signing_bytes(&p).len() < bytes.len());
+        }
+        let v = GovVote {
+            proposal_id: 42,
+            voter: 5,
+            approve: true,
+            nonce: 1,
+            signature: [3u8; 64],
+        };
+        let vb = encode_gov_vote(&v);
+        assert_eq!(decode_gov_vote(&vb).expect("vote round-trips"), v);
+        // The approve bool flips a byte: a false vote decodes as false.
+        let vno = GovVote {
+            approve: false,
+            ..v.clone()
+        };
+        assert!(!decode_gov_vote(&encode_gov_vote(&vno)).unwrap().approve);
+    }
+
+    #[test]
+    fn snapshot_round_trips_proposals() {
+        // M194 (v5): the governance proposal set + id counter survive snapshot
+        // encode→decode and reproduce state_root (snapshot-boot cross-check).
+        let mut s = sample_state();
+        let mut votes = std::collections::BTreeMap::new();
+        votes.insert(1u64, true);
+        votes.insert(2u64, false);
+        s.proposals.insert(
+            0,
+            Proposal {
+                id: 0,
+                param: GovParam::SlashBps(9999),
+                created_height: 2,
+                voting_period: 10,
+                votes,
+            },
+        );
+        s.next_proposal_id = 1;
+        let bytes = encode_snapshot(&s);
+        let back = decode_snapshot(&bytes).expect("round-trips");
+        assert_eq!(back.proposals, s.proposals);
+        assert_eq!(back.next_proposal_id, 1);
+        assert_eq!(encode_snapshot(&back), bytes, "re-encode stable");
+        assert_eq!(back.state_root(), s.state_root());
+    }
+
+    #[test]
+    fn state_root_covers_consumed_unbonds() {
+        // M176: `consumed_unbonds` is folded into `state_root`, so two states
+        // differing only in that set produce different roots — the property that
+        // makes a replayed `BridgeUnbond` a consensus (not merely local) matter.
+        let base = state_with_consumed_unbonds();
+        let mut more = base.clone();
+        more.bridge_sources
+            .get_mut(&[0x5a; 32])
+            .unwrap()
+            .consumed_unbonds
+            .insert((12u64, 0u64));
+        assert_ne!(
+            base.state_root(),
+            more.state_root(),
+            "adding a consumed-unbond entry must change state_root"
+        );
+    }
+
+    /// M189: codec robustness ("fuzz-lite"). The hand-written decoders parse
+    /// attacker-controlled bytes off the wire/disk, so they must **never panic**
+    /// (index-out-of-bounds, slice overrun, arithmetic overflow) and must **never**
+    /// allocate unboundedly from a forged length prefix — only ever return
+    /// `Ok`/`Err`. This drives every public `decode_*` entry with empty, truncated,
+    /// random, and forged-huge-length inputs; any panic fails the test (the panic
+    /// propagates). A deterministic xorshift PRNG keeps it reproducible (no dep, no
+    /// nightly — runs on every target in CI, complementing the `cargo-fuzz` targets).
+    #[test]
+    fn prealloc_caps_reservation() {
+        // SEC-06: the up-front reservation is capped regardless of the claimed count,
+        // so a tiny truncated frame can't force a huge allocation.
+        assert_eq!(prealloc(0), 0);
+        assert_eq!(prealloc(10), 10);
+        assert_eq!(prealloc(PREALLOC_CAP as u64), PREALLOC_CAP);
+        assert_eq!(prealloc(MAX_ITEMS), PREALLOC_CAP);
+        assert_eq!(prealloc(u64::MAX), PREALLOC_CAP);
+        assert_eq!(prealloc_usize(usize::MAX), PREALLOC_CAP);
+    }
+
+    #[test]
+    fn inline_validator_set_short_frame_rejects_without_large_alloc() {
+        // SEC-06 (re-verify): the inline validator-set decoder (bridge-header path) must
+        // reject a frame that claims ~1M validators but then truncates, WITHOUT reserving
+        // for the full claimed count first. It returns Err before reading the first entry.
+        let buf = 1_000_000u32.to_be_bytes().to_vec(); // claims 1M, no element bytes
+        let mut d = Dec { buf: &buf, pos: 0 };
+        assert!(dec_validator_set_inline(&mut d).is_err());
+        // Exactly at the MAX_ITEMS ceiling with no following bytes is also rejected.
+        let buf2 = (MAX_ITEMS as u32).to_be_bytes().to_vec();
+        let mut d2 = Dec { buf: &buf2, pos: 0 };
+        assert!(dec_validator_set_inline(&mut d2).is_err());
+    }
+
+    #[test]
+    fn decoders_reject_adversarial_bytes_without_panicking() {
+        // Deterministic xorshift64* — reproducible across runs/targets.
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545F4914F6CDD1D)
+            }
+            fn bytes(&mut self, len: usize) -> Vec<u8> {
+                (0..len).map(|_| (self.next() & 0xff) as u8).collect()
+            }
+        }
+
+        // Each decoder, type-erased to `&[u8] -> ()` (we only care that it returns
+        // rather than panics / hangs / OOMs). `let _ =` swallows the Result. M213: this
+        // list mirrors the `decode_all` cargo-fuzz target (node/fuzz) one-for-one — the
+        // always-on stable guard and the deep nightly fuzzer hit the same surface, so a
+        // signature drift breaks compilation here too.
+        type Dec = fn(&[u8]);
+        let decoders: &[Dec] = &[
+            |b| {
+                let _ = decode_header(b);
+            },
+            |b| {
+                let _ = decode_certified_header(b);
+            },
+            |b| {
+                let _ = decode_header_any(b);
+            },
+            |b| {
+                let _ = decode_validator_set(b);
+            },
+            |b| {
+                let _ = decode_tx(b);
+            },
+            |b| {
+                let _ = decode_stakeop(b);
+            },
+            |b| {
+                let _ = decode_key_rotation(b);
+            },
+            |b| {
+                let _ = decode_gov_proposal(b);
+            },
+            |b| {
+                let _ = decode_gov_vote(b);
+            },
+            |b| {
+                let _ = decode_bridge_lock(b);
+            },
+            |b| {
+                let _ = decode_bridge_header(b);
+            },
+            |b| {
+                let _ = decode_bridge_redeem(b);
+            },
+            |b| {
+                let _ = decode_bridge_unbond(b);
+            },
+            |b| {
+                let _ = decode_consensus_msg(b);
+            },
+            |b| {
+                let _ = decode_evidence(b);
+            },
+            |b| {
+                let _ = decode_unbonding(b);
+            },
+            |b| {
+                let _ = decode_commit(b);
+            },
+            |b| {
+                let _ = decode_account(b);
+            },
+            |b| {
+                let _ = decode_snapshot(b);
+            },
+            |b| {
+                let _ = decode_proof(b);
+            },
+            |b| {
+                let _ = decode_proof_kind(b.first().copied().unwrap_or(0));
+            },
+            |b| {
+                let _ = decode_batch_response_kind(b.first().copied().unwrap_or(0));
+            },
+            |b| {
+                let _ = decode_knn_request(b);
+            },
+            |b| {
+                let _ = decode_range_request(b);
+            },
+            |b| {
+                let _ = decode_validator(b);
+            },
+            |b| {
+                let _ = decode_reviewer(b);
+            },
+            |b| {
+                let _ = decode_graph_node(b);
+            },
+            |b| {
+                let _ = decode_proof_entry(b);
+            },
+            |b| {
+                let _ = decode_block(b);
+            },
+            // Also fuzz the top-level gossip-message decoder (net.rs), the other
+            // attacker-reachable entry point (it dispatches into these codec decoders).
+            |b| {
+                let _ = crate::net::decode_gossip(b);
+            },
+        ];
+
+        let mut rng = Rng(0x9E3779B97F4A7C15);
+        for dec in decoders {
+            // Degenerate inputs.
+            dec(&[]);
+            dec(&[0u8]);
+            // Random buffers of varied lengths (incl. lengths near header/field sizes).
+            for &len in &[1usize, 2, 7, 8, 16, 31, 32, 64, 96, 220, 252, 300, 1024] {
+                for _ in 0..40 {
+                    dec(&rng.bytes(len));
+                }
+            }
+            // Forged length prefixes: a leading big-endian u64 claiming a huge item
+            // count, then a few trailing bytes. Exercises the `Dec::count()`
+            // `MAX_ITEMS` cap (M174) — must `Err`, not try to allocate billions.
+            for &claim in &[u64::MAX, 1 << 40, 10_000_000, MAX_ITEMS + 1] {
+                let mut buf = claim.to_be_bytes().to_vec();
+                buf.extend_from_slice(&rng.bytes(16));
+                dec(&buf);
+                // Also with the claim deeper in the buffer (after a plausible header-ish prefix).
+                let mut buf2 = rng.bytes(64);
+                buf2.extend_from_slice(&claim.to_be_bytes());
+                buf2.extend_from_slice(&rng.bytes(8));
+                dec(&buf2);
+            }
+        }
+        // Reaching here = no decoder panicked on any adversarial input.
+    }
+
+    /// M213: regenerate the committed libFuzzer seed corpus for the `decode_all` target
+    /// (node/fuzz). `#[ignore]` so normal CI skips it; run once with
+    /// `cargo test --release -- --ignored seed_fuzz_corpus` to (re)write deterministic,
+    /// structurally-valid seeds — each is `[selector_byte] ++ <valid encoding>`, where the
+    /// selector matches `decode_all`'s `sel % 29` dispatch. Valid seeds warm the fuzzer so
+    /// it reaches deep parse paths fast; mutation + cross-pollination covers the rest.
+    #[test]
+    #[ignore = "corpus generator; run explicitly with --ignored"]
+    fn seed_fuzz_corpus() {
+        let dir = std::path::Path::new("fuzz/corpus/decode_all");
+        std::fs::create_dir_all(dir).expect("create corpus dir");
+        let write = |sel: u8, name: &str, body: Vec<u8>| {
+            let mut bytes = Vec::with_capacity(body.len() + 1);
+            bytes.push(sel);
+            bytes.extend_from_slice(&body);
+            std::fs::write(dir.join(format!("seed_{name}")), &bytes).expect("write seed");
+        };
+
+        let b = sample_block();
+        let hdr = BlockHeader::from_block(&b);
+        let hh = hdr.hash();
+        let cert = sample_cert(hh, b.height);
+        let ch = CertifiedHeader::from_certified(&b, &cert);
+        let vs = sample_validator_set();
+
+        // selector indices match the `decode_all` fuzz target's match arms.
+        write(0, "header", encode_header(&hdr));
+        write(1, "certified_header", encode_certified_header(&ch));
+        write(3, "validator_set", encode_validator_set(&vs));
+        write(4, "tx", encode_tx(&b.txs[0]));
+        write(14, "evidence", encode_evidence(&sample_evidence(1)));
+        write(16, "commit", encode_commit(&cert));
+        write(18, "snapshot", encode_snapshot(&sample_state()));
+        write(24, "validator", encode_validator(&vs.validators()[0]));
+        write(25, "reviewer", encode_reviewer(10, 1.0));
+        write(28, "block", encode_block(&b));
+
+        // Every seed must decode cleanly under the target's own dispatch (selector byte
+        // stripped), proving the corpus is valid, not garbage.
+        for entry in std::fs::read_dir(dir).expect("read corpus") {
+            let p = entry.expect("dir entry").path();
+            if !p
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("seed_")
+            {
+                continue;
+            }
+            let data = std::fs::read(&p).expect("read seed");
+            assert!(data.len() > 1, "seed {p:?} carries a body");
+        }
     }
 }

@@ -47,9 +47,9 @@ use zhixing_node::round::Sim;
 use zhixing_node::store::{BlockLog, CertLog};
 use zhixing_node::validator::{Validator, ValidatorSet, ValidatorUpdate};
 use zhixing_node::{
-    hex, unbonding_merkle_leaf, Block, BondKind, BridgeHeader, BridgeLock, BridgeRedeem,
-    BridgeUnbond, Chain, ChainError, ChainState, Genesis, Keypair, Review, SlashEvidence, StakeOp,
-    SubmissionTx, Vote, VoteType, MICRO,
+    hex, Block, BondKind, BridgeHeader, BridgeLock, BridgeRedeem, BridgeUnbond, Chain, ChainError,
+    ChainState, Genesis, KeyRotation, Keypair, Review, SlashEvidence, StakeOp, SubmissionTx, Vote,
+    VoteType, MICRO,
 };
 
 type Emb = [f32; DIM];
@@ -142,6 +142,7 @@ fn demo_genesis() -> Genesis {
         seed_nodes: vec![(unit(0), 0)],
         params: DeltaKParams::default(),
         base_emission_micro: 8 * MICRO,
+        decay_half_life_blocks: 0, // M187: decay disabled in the demo (canon unchanged)
         slash_bps: 10_000,
         timestamp_days: 0.0,
         validators: vset
@@ -207,6 +208,8 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         // M27: stamped by `Chain::commit` (or `Chain::seal`) — builder leaves zero.
         graph_root: [0u8; 32],
         bridge_root: [0u8; 32],
+        contributions_root: [0u8; 32],
+        unbonding_root: [0u8; 32],
         txs: vec![
             tx(
                 1,
@@ -232,6 +235,9 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         bridge_headers: Vec::new(),
         bridge_redeems: Vec::new(),
         bridge_unbondings: Vec::new(),
+        key_rotations: Vec::new(),
+        gov_proposals: Vec::new(),
+        gov_votes: Vec::new(),
     };
     trial.seal(&mut b1).expect("seal b1");
     trial.commit(&mut b1).expect("commit b1 on trial");
@@ -247,6 +253,8 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         accounts_root: [0u8; 32],
         graph_root: [0u8; 32],
         bridge_root: [0u8; 32],
+        contributions_root: [0u8; 32],
+        unbonding_root: [0u8; 32],
         txs: vec![
             tx(
                 3,
@@ -274,6 +282,9 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         bridge_headers: Vec::new(),
         bridge_redeems: Vec::new(),
         bridge_unbondings: Vec::new(),
+        key_rotations: Vec::new(),
+        gov_proposals: Vec::new(),
+        gov_votes: Vec::new(),
     };
     trial.seal(&mut b2).expect("seal b2");
     vec![b1, b2]
@@ -292,6 +303,7 @@ fn main() {
         "chain" => cmd_chain(),
         "validators" => cmd_validators(),
         "staking" => cmd_staking(),
+        "rotate-key" => cmd_rotate_key(),
         "slashing" => cmd_slashing(),
         "gossip" => cmd_gossip(),
         "light" => cmd_light(),
@@ -315,11 +327,13 @@ fn main() {
         "rpc" => cmd_rpc(&args),
         "encode-tx" => cmd_encode_tx(&args),
         "keygen" => cmd_keygen(&args),
+        "encrypt-key" => cmd_encrypt_key(&args),
+        "signer" => cmd_signer(&args),
         "mirror-unbond" => cmd_mirror_unbond(),
         "localnet" => cmd_localnet(),
-        "status" => cmd_status(dir_arg(&args)),
-        "verify" => cmd_verify(dir_arg(&args)),
-        "snapshot" => cmd_snapshot(dir_arg(&args), req_arg(&args, "--out").to_string()),
+        "status" => cmd_status(&args),
+        "verify" => cmd_verify(&args),
+        "snapshot" => cmd_snapshot(&args),
         "inspect-snapshot" => cmd_inspect_snapshot(req_arg(&args, "--snapshot").to_string()),
         "check-snapshot" => cmd_check_snapshot(
             req_arg(&args, "--snapshot").to_string(),
@@ -389,6 +403,7 @@ fn usage() {
         "  node validators         grow a chain across on-chain validator-set changes (add/remove)"
     );
     eprintln!("  node staking            bond stake to gain validator power; unbond through a delayed withdrawal");
+    eprintln!("  node rotate-key         M179: consensus-level account key rotation — self-authenticating KeyRotation op swaps an account's ed25519 key (old key signs, nonce-protected); rejected for current validators (unbond first)");
     eprintln!(
         "  node slashing           slash an equivocating validator's bonded stake to the treasury"
     );
@@ -415,12 +430,15 @@ fn usage() {
     eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--fee MICRO] [--nonce N] [--config F]  author+sign a tx offline into a submit-tx file; print its hash; M122: --fee paid to the proposer (default 0), --nonce must equal the author's account nonce (default 0)");
     eprintln!("  node inspect-tx --tx F [--pubkey HEX]  decode a codec-encoded tx file and print its fields + content hash; with --pubkey, also verify the signature (the read-side companion to encode-tx)");
     eprintln!("  node keygen --out F [--seed HEX]  generate (or derive from a 64-hex seed) an ed25519 keypair; write the seed file (for encode-tx --key-file) and print the pubkey");
+    eprintln!("  node keygen ... --new-mnemonic [--encrypt]  M169/M175: generate a fresh BIP-39 mnemonic; --encrypt (M175) writes an encrypted Web3SS keystore to --out (prompts for a password) instead of a plaintext seed file");
     eprintln!("  node keygen ... --genesis-id N [--balance MICRO] [--power P]  also print a ready-to-paste genesis [[accounts]] (and, with --power, [[validators]]) entry");
+    eprintln!("  node encrypt-key --out F [--passphrase S] [--force]  M175: encrypt an existing seed (64-hex) or BIP-39 mnemonic (read no-echo from the terminal) into a Web3 Secret Storage v3 keystore (scrypt + AES-128-CTR); prompts for an encryption password; the plaintext never touches disk; refuses to overwrite --out unless --force");
     eprintln!("  node pubkey (--key-file F | --seed HEX) [--genesis-id N ...]  derive + print the pubkey for an existing seed WITHOUT writing a file (read-only; pairs with inspect-tx --pubkey)");
+    eprintln!("  node signer --keystore F --socket PATH --hwm FILE  M217: run the out-of-process remote signer — decrypt the keystore (ZHIXING_KEYSTORE_PASSWORD or no-echo prompt), serve consensus/handshake signatures over the Unix socket with a persisted anti-double-sign high-water-mark; the key never leaves this process (Unix only; see docs/design/remote-signer.md)");
     eprintln!("  node localnet           spin up an in-process tokio testnet (4 validators, no sequencer) and show all nodes converge via distributed BFT voting over real sockets");
-    eprintln!("  node status --dir DIR   replay the block log and print state");
-    eprintln!("  node verify --dir DIR   replay blocks+certs logs through finality verification; non-zero exit on any integrity error (missing log, length mismatch, cert mismatch, < 2/3 quorum)");
-    eprintln!("  node snapshot --dir DIR --out FILE  export the chain (replay-verified) as a M131 snapshot blob; --out - writes to stdout");
+    eprintln!("  node status --dir DIR [--config F | --genesis F]   replay the block log and print state (genesis: --config/--genesis, else demo)");
+    eprintln!("  node verify --dir DIR [--config F | --genesis F]   replay blocks+certs logs through finality verification; non-zero exit on any integrity error (missing log, length mismatch, cert mismatch, < 2/3 quorum). --config/--genesis select the chain's genesis (default demo) — REQUIRED to audit a production chain");
+    eprintln!("  node snapshot --dir DIR --out FILE [--config F | --genesis F]  export the chain (replay-verified) as a M131 snapshot blob; --out - writes to stdout; --config/--genesis select genesis (default demo)");
     eprintln!("  node inspect-snapshot --snapshot FILE  decode a M131 snapshot blob and print height/roots/supply_conserved; --snapshot - reads stdin");
     eprintln!("  node check-snapshot --snapshot FILE --header HEX  cross-check a snapshot against a cert-signed BlockHeader hex (GET /header/{{h}}): height + 3 roots must match; non-zero exit on mismatch");
     eprintln!("  node inspect-block --dir DIR [--height N]  read the persisted block log and print a per-block summary, or (with --height) one block's header + contents + tx hashes");
@@ -1171,6 +1189,137 @@ fn cmd_staking() {
         short(&chain.head)
     );
     debug_assert_eq!(chain.state.state_root(), d.chain.state.state_root());
+}
+
+/// M179 demo: consensus-level account key rotation. Shows a `KeyRotation` op
+/// swapping an account's ed25519 key (authorized by the OLD key, nonce-gated),
+/// that the old key is dead afterward and the new key is live, and that a
+/// current validator's key cannot be rotated (the safe-MVP guard).
+fn cmd_rotate_key() {
+    println!("M179 — consensus-level account key rotation (KeyRotation, B4 wire)");
+    println!();
+
+    let seeds: BTreeMap<u64, [u8; 32]> = [1u64, 2, 3, 21, 22, 23, 24]
+        .iter()
+        .map(|&id| {
+            let mut s = [0u8; 32];
+            s[..8].copy_from_slice(&id.to_le_bytes());
+            (id, s)
+        })
+        .collect();
+    let mut d = ChainDriver::new(demo_genesis(), seeds, 1);
+
+    // The new key: a fresh keypair not previously bound to any account.
+    let new_kp = kp(99);
+    let new_pub = new_kp.public();
+    println!(
+        "account #1 current key {}…  →  rotating to {}…",
+        &hex(&d.chain.state.accounts[&1].pubkey)[..16],
+        &hex(&new_pub)[..16],
+    );
+
+    // height 1: account #1 rotates its key, signed by its CURRENT key (kp(1)),
+    // nonce 0. The op rides a block; apply swaps the pubkey and bumps the nonce.
+    d.stage_key_rotation(
+        KeyRotation {
+            account: 1,
+            new_pubkey: new_pub,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1)),
+    );
+    d.produce(1.0, &BTreeSet::new())
+        .unwrap()
+        .expect("rotation block commits");
+    assert_eq!(d.chain.state.accounts[&1].pubkey, new_pub, "key swapped");
+    assert_eq!(d.chain.state.accounts[&1].nonce, 1, "nonce advanced");
+    println!("  height 1: KeyRotation (signed by OLD key, nonce 0) committed → account #1 key is now the new key, nonce=1");
+
+    // The OLD key is dead: a rotation signed by kp(1) (no longer account #1's
+    // key) is rejected with BadSignature. Try it on a clone so the live chain is
+    // untouched.
+    let mut probe = d.chain.clone();
+    let mut blk = empty_next_block(&probe, 2.0);
+    blk.key_rotations.push(
+        KeyRotation {
+            account: 1,
+            new_pubkey: kp(7).public(),
+            nonce: 1,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1)), // OLD key — no longer authoritative
+    );
+    let err = probe
+        .commit(&mut blk)
+        .expect_err("old key must no longer authorize a rotation");
+    assert!(matches!(err, ChainError::BadSignature(1)), "got {err:?}");
+    println!("  negative: a rotation signed by the OLD key → rejected ({err})");
+
+    // The NEW key is live: it can rotate again (to kp(100)), nonce 1.
+    let newer = kp(100).public();
+    d.stage_key_rotation(
+        KeyRotation {
+            account: 1,
+            new_pubkey: newer,
+            nonce: 1,
+            signature: [0u8; 64],
+        }
+        .signed(&new_kp), // NEW key signs
+    );
+    d.produce(2.0, &BTreeSet::new())
+        .unwrap()
+        .expect("second rotation commits");
+    assert_eq!(
+        d.chain.state.accounts[&1].pubkey, newer,
+        "new key rotated again"
+    );
+    println!("  height 2: the NEW key authorizes a further rotation (nonce 1) → committed");
+
+    // M180: an active validator's key CAN be rotated — the set re-derives its
+    // entry with the new key at the next height (power unchanged). Bond account
+    // #2 so it becomes a validator, then rotate its key.
+    d.stage_stake_op(
+        StakeOp {
+            account: 2,
+            kind: BondKind::Bond,
+            amount: 6 * MICRO,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(2)),
+    );
+    d.produce(3.0, &BTreeSet::new())
+        .unwrap()
+        .expect("bond commits");
+    let v = d
+        .chain
+        .state
+        .validators
+        .get(2)
+        .expect("account #2 should be a validator now");
+    let power_before = v.power;
+    assert_eq!(v.pubkey, kp(2).public(), "set holds #2's old key");
+    let v2_new = kp(102).public();
+    d.stage_key_rotation(
+        KeyRotation {
+            account: 2,
+            new_pubkey: v2_new,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(2)),
+    );
+    d.produce(4.0, &BTreeSet::new())
+        .unwrap()
+        .expect("validator rotation commits");
+    let v = d.chain.state.validators.get(2).expect("still a validator");
+    assert_eq!(v.pubkey, v2_new, "set re-derived to #2's new key");
+    assert_eq!(v.power, power_before, "power unchanged by the rotation");
+    println!(
+        "  height 3–4: active validator #2 BONDs then ROTATEs its key → set re-derives to the new key, power unchanged (the daemon hands its signing key over at the boundary — see Actor::reconcile_signing_key)"
+    );
+    println!();
+    println!("Ok: account key rotation is self-authenticating (old key signs), nonce-protected, consensus-enforced; the new key supersedes the old; a validator's rotation re-derives the set at the next height.");
 }
 
 /// Produce one height (all validators honest) and report the set that certified
@@ -3270,36 +3419,16 @@ fn cmd_mirror_unbond() {
         .produce(1.0, &BTreeSet::new())
         .unwrap()
         .expect("A bonds+unbonds in height 1");
-    // Patch A's `bridge_root` slot to the unbonding sub-tree root.
-    // NB: this happens **after** `produce` so the chain's `state.unbonding`
-    // already has the entry (the Unbond StakeOp applied during
-    // `produce`). M170's `unbonding_merkle_leaf` reads the same
-    // `encode_unbonding` 24 BE bytes that the apply path produces.
-    let unbonding_leaves: Vec<_> = driver_a
+    // SEC-05: the sealed block already commits the correct `unbonding_root` over A's
+    // post-apply unbonding queue — no more `bridge_root` patching or re-certifying.
+    // Take the real block, its real cert, and an inclusion proof from the live queue.
+    let unbonding_proof = driver_a
         .chain
         .state
-        .unbonding
-        .iter()
-        .map(unbonding_merkle_leaf)
-        .collect();
-    let unbonding_tree = crate::merkle::MerkleTree::from_leaf_hashes(unbonding_leaves.clone());
-    let unbonding_root = unbonding_tree.root();
-    // M173: real proof from the tree (authenticated `key`/`leaf_count`).
-    let unbonding_proof = unbonding_tree.proof(0).expect("entry 0 exists");
-    // The driver already sealed block 1 with the correct post-apply
-    // commitments (including `next_validators_root`, which now reflects
-    // account 1's new bond). We only overwrite the `bridge_root` slot with
-    // the unbonding sub-tree root (M171 reuse convention) and re-certify
-    // over the patched header. We do NOT re-seal — re-sealing on a fresh
-    // chain would recompute every commitment and is both redundant and
-    // error-prone.
-    let mut a_blocks = driver_a.blocks().to_vec();
-    a_blocks[0].bridge_root = unbonding_root;
-    // Re-certify over the patched header. The set that certifies source
-    // height 1 is the set in force *before* block 1 — the genesis set.
-    let a_cert =
-        rebuild_cert_after_bridge_root_patch(&driver_a.chain, &mut a_blocks[0], &a_genesis_set);
-    let a_header = a_blocks[0].header();
+        .unbonding_proof(0)
+        .expect("entry 0 exists in A's unbonding queue");
+    let a_header = driver_a.blocks()[0].header();
+    let a_cert = driver_a.certificates()[0].clone();
     // The bond+full-unbond nets to zero bonded power, so A's validator set
     // is unchanged — `next_set` is the genesis set, which this one cert
     // (signed by that same set) also certifies for the next height.
@@ -3409,59 +3538,6 @@ fn cmd_mirror_unbond() {
     );
 }
 
-/// M172 helper: re-stamp the patched source block and re-certify it.
-/// The `mirror-unbond` demo patches `bridge_root` after the source's
-/// initial `seal`+`commit`, so the existing cert (bound to the pre-patch
-/// header hash) is no longer a valid quorum-signature over the new
-/// header. We:
-///   1. extract the cert BEFORE the patch (when it's still valid);
-///   2. patch `bridge_root`;
-///   3. re-seal the block (header hash now reflects the patched
-///      `bridge_root` slot);
-///   4. re-certify over the new header by re-running the consensus commit
-///      path with the keypairs of `set` (the set in force for this source
-///      height).
-///
-/// Returns the fresh cert bound to the patched header hash.
-fn rebuild_cert_after_bridge_root_patch(
-    _chain: &Chain,
-    block: &mut Block,
-    set: &ValidatorSet,
-) -> Commit {
-    // Re-derive the cert: the source is a single-validator chain (the
-    // genesis set on this demo), so we can build the cert with a trivial
-    // keypair mapping (1 validator × 1 keypair = the 1 needed signature).
-    use std::collections::BTreeMap;
-    let kps: BTreeMap<u64, Keypair> = set.validators().iter().map(|v| (v.id, kp(v.id))).collect();
-    let voters: Vec<u64> = set.validators().iter().map(|v| v.id).collect();
-    let cert = zhixing_node::consensus::commit_block(set, &kps, block, 0, &voters)
-        .expect("re-certify patched source block");
-    // The cert must be over the **patched** block hash. The destination's
-    // tracked set was initialized to `a_genesis_set` via `dest_chain_b`; if
-    // we instead certified against `chain.state.validators` (which after
-    // `seal` may have the same set), the cert would still be valid — but
-    // only if the *patched* block is what got sealed. `seal` re-stamps the
-    // commitments including the patched `bridge_root`, so `block.hash()`
-    // post-seal IS the patched hash. We re-verify here as a guard.
-    let tracked_pubkeys: std::collections::BTreeSet<_> =
-        set.validators().iter().map(|v| v.pubkey).collect();
-    let cert_pubkeys: std::collections::BTreeSet<_> = cert
-        .precommits
-        .iter()
-        .map(
-            |v| /* recover pubkey from sig is too much; trust the kp set */ {
-            // The cert was built from the same `kps` map → same pubkeys.
-            kps.get(&v.validator).map(|k| k.public()).unwrap_or([0u8; 32])
-        },
-        )
-        .collect();
-    assert_eq!(
-        cert_pubkeys, tracked_pubkeys,
-        "cert signers must equal tracked-set pubkeys"
-    );
-    cert
-}
-
 /// An empty block at `chain`'s next height (all commitments zero — `commit`
 /// stamps them). Used by demos that carry a single body op.
 fn empty_next_block(chain: &Chain, timestamp_days: f32) -> Block {
@@ -3475,6 +3551,8 @@ fn empty_next_block(chain: &Chain, timestamp_days: f32) -> Block {
         accounts_root: [0u8; 32],
         graph_root: [0u8; 32],
         bridge_root: [0u8; 32],
+        contributions_root: [0u8; 32],
+        unbonding_root: [0u8; 32],
         txs: Vec::new(),
         validator_updates: Vec::new(),
         stake_ops: Vec::new(),
@@ -3483,6 +3561,9 @@ fn empty_next_block(chain: &Chain, timestamp_days: f32) -> Block {
         bridge_headers: Vec::new(),
         bridge_redeems: Vec::new(),
         bridge_unbondings: Vec::new(),
+        key_rotations: Vec::new(),
+        gov_proposals: Vec::new(),
+        gov_votes: Vec::new(),
     }
 }
 
@@ -3672,9 +3753,38 @@ fn check_config(config_path: &str) -> Result<String, config::ConfigError> {
     let genesis = gcfg.to_genesis()?;
     // Validate the validator key material too (an enabled `[validator]` section) — a bad key
     // should fail the dry-run, not first surface when `run` tries to vote.
+    // M175: for an encrypted keystore we can't decrypt without the operator's
+    // password (and a dry-run shouldn't prompt), so we validate it structurally
+    // — the file must exist and parse as a v3 keystore — without recovering the
+    // key. The seed_hex/mnemonic paths are fully derived as before.
     let role = match cfg.validator.as_ref() {
+        Some(vc) if vc.enabled && vc.signer.is_some() => {
+            // M219: a remote-signer validator holds no key on disk. Validate the signer
+            // sub-table structurally (non-empty socket); the live connect + genesis-pubkey
+            // check happens at `node run` startup (a dry-run neither binds nor dials).
+            let sc = vc.signer.as_ref().expect("guarded by is_some");
+            if sc.socket.trim().is_empty() {
+                return Err(config::ConfigError::BadGenesis {
+                    detail: "[validator.signer] socket must not be empty".into(),
+                });
+            }
+            "validator (remote signer)"
+        }
         Some(vc) if vc.enabled => {
-            vc.keypair()?;
+            if let Some(path) = vc.encrypted_keystore_path.as_deref() {
+                let json = std::fs::read_to_string(path).map_err(|e| {
+                    config::ConfigError::KeystoreDecrypt {
+                        detail: format!("read `{path}`: {e}"),
+                    }
+                })?;
+                zhixing_node::keystore::parse_keystore(&json).map_err(|e| {
+                    config::ConfigError::KeystoreDecrypt {
+                        detail: e.to_string(),
+                    }
+                })?;
+            } else {
+                vc.keypair()?;
+            }
             "validator"
         }
         _ => "follower",
@@ -4050,17 +4160,50 @@ fn cmd_run(config_path: String, args: &[String]) {
 
     // M33: an enabled `[validator]` section makes this node a voting validator;
     // absent or disabled ⇒ a pure follower that syncs + verifies but never votes.
+    // M175: if the validator key is an encrypted keystore, read its password
+    // (no-echo prompt, or `ZHIXING_KEYSTORE_PASSWORD` for unattended boot) and
+    // decrypt; otherwise the seed_hex/mnemonic path needs no password.
     let validator_key = match cfg.validator.as_ref() {
-        Some(vc) if vc.enabled => Some(
-            vc.keypair()
-                .unwrap_or_else(|e| fail_msg("validator key", &e)),
-        ),
+        // M218: a remote signer holds the key out of process — the node decrypts nothing
+        // and passes no key; `Node::start` builds the `RemoteSigner` from `[validator.signer]`.
+        Some(vc) if vc.enabled && vc.signer.is_some() => None,
+        Some(vc) if vc.enabled => {
+            let kp = if let Some(path) = vc.encrypted_keystore_path.as_deref() {
+                let password = read_keystore_password(path);
+                vc.keypair_with_password(&password)
+            } else {
+                vc.keypair()
+            };
+            Some(kp.unwrap_or_else(|e| fail_msg("validator key", &e)))
+        }
         _ => None,
     };
 
+    // M180: resolve the optional staged PENDING key (for an in-flight validator
+    // key rotation). The nested `[validator.pending]` table reuses the same
+    // sourcing (seed_hex / mnemonic / encrypted keystore). M181: a pending
+    // encrypted keystore reads its password from `ZHIXING_PENDING_KEYSTORE_PASSWORD`
+    // if set (unattended), else an interactive no-echo prompt — same discipline as
+    // the active key. The daemon swaps it into the active signing key once this
+    // validator's rotation takes effect.
+    let pending_key = cfg
+        .validator
+        .as_ref()
+        .and_then(|vc| vc.pending.as_deref())
+        .map(|pc| {
+            let kp = if let Some(path) = pc.encrypted_keystore_path.as_deref() {
+                let password =
+                    read_keystore_password_from("ZHIXING_PENDING_KEYSTORE_PASSWORD", path);
+                pc.keypair_with_password(&password)
+            } else {
+                pc.keypair()
+            };
+            kp.unwrap_or_else(|e| fail_msg("pending validator key", &e))
+        });
+
     let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| fail("tokio runtime", e));
     rt.block_on(async move {
-        if let Err(e) = daemon::run(cfg, genesis, validator_key).await {
+        if let Err(e) = daemon::run(cfg, genesis, validator_key, pending_key).await {
             fail("daemon", e);
         }
     });
@@ -4557,7 +4700,7 @@ fn cmd_keygen(args: &[String]) {
         let words = zhixing_node::crypto::mnemonic_generate(&entropy)
             .unwrap_or_else(|e| fail_msg("mnemonic generate", &e.to_string()));
         let mut seed = [0u8; 32];
-        zhixing_node::crypto::mnemonic_to_seed(&words, &passphrase, &mut seed)
+        zhixing_node::crypto::mnemonic_to_seed(&words, passphrase, &mut seed)
             .unwrap_or_else(|e| fail_msg("mnemonic derive", &e.to_string()));
         (seed, words)
     } else if let Some(words) = supplied_mnemonic {
@@ -4565,7 +4708,7 @@ fn cmd_keygen(args: &[String]) {
         zhixing_node::crypto::validate_mnemonic(words)
             .unwrap_or_else(|e| fail_msg("mnemonic validate", &e.to_string()));
         let mut seed = [0u8; 32];
-        zhixing_node::crypto::mnemonic_to_seed(words, &passphrase, &mut seed)
+        zhixing_node::crypto::mnemonic_to_seed(words, passphrase, &mut seed)
             .unwrap_or_else(|e| fail_msg("mnemonic derive", &e.to_string()));
         (seed, words.to_string())
     } else {
@@ -4584,6 +4727,32 @@ fn cmd_keygen(args: &[String]) {
     };
 
     let (seed_hex, pub_hex) = keygen_derive(seed);
+
+    // M175: `--encrypt` writes an encrypted Web3SS keystore to `--out` instead
+    // of the plaintext seed file. The mnemonic (if any) is still printed to the
+    // terminal so the operator can write it on paper, but the seed never
+    // touches disk unencrypted. The password is prompted (no-echo) and never
+    // stored. `--genesis-id` emission still works (it only needs the pubkey).
+    if args.iter().any(|a| a == "--encrypt") {
+        refuse_overwrite(out_path, args);
+        let password = prompt_new_password();
+        let ks = zhixing_node::keystore::encrypt_seed(&seed, &password)
+            .unwrap_or_else(|e| fail_msg("encrypt keystore", &e.to_string()));
+        let json =
+            zhixing_node::keystore::to_json(&ks).unwrap_or_else(|e| fail_msg("keystore json", &e));
+        write_key_file(out_path, &json).unwrap_or_else(|e| fail("write keystore", e));
+        println!("pubkey {pub_hex}");
+        println!("keystore {out_path}");
+        if !mnemonic_text.is_empty() {
+            println!("mnemonic: {mnemonic_text}");
+        }
+        println!("Store the password securely; it is NOT in the keystore file.");
+        if let Some(entries) = keygen_genesis_entries(args, &pub_hex) {
+            print!("{entries}");
+        }
+        return;
+    }
+
     // M169: stamp the mnemonic + passphrase as `# ` comment lines above the
     // seed hex. `encode-tx --key-file` and `decode_seed` both skip
     // non-hex-prefixed lines and the trailing newline, so the file is
@@ -4613,6 +4782,159 @@ fn cmd_keygen(args: &[String]) {
     if let Some(entries) = keygen_genesis_entries(args, &pub_hex) {
         print!("{entries}");
     }
+}
+
+/// M175: encrypt an existing key (plaintext seed-hex or BIP-39 mnemonic) into a
+/// Web3 Secret Storage v3 keystore. Interactive: reads the secret and a new
+/// password from the terminal (no-echo for the password). The plaintext is
+/// never written to disk. Use this to migrate a legacy `seed_hex = "..."` /
+/// `mnemonic = "..."` config to an encrypted `encrypted_keystore_path`.
+///
+/// Flags: `--out <path>` (default `./keystore.json`, refuses to overwrite an
+/// existing file unless `--force`), optional `--passphrase` for a BIP-39 25th
+/// word when the input is a mnemonic.
+fn cmd_encrypt_key(args: &[String]) {
+    let out_path = opt_arg(args, "--out").unwrap_or("keystore.json");
+    refuse_overwrite(out_path, args);
+
+    // Read the secret (seed-hex or mnemonic) from the terminal with NO echo —
+    // this is the exact key material the keystore exists to protect, so it must
+    // not land in terminal scrollback / tmux history / a screen recording.
+    // `rpassword` reads from /dev/tty without echoing.
+    let line = rpassword::prompt_password(
+        "Enter seed (64-char hex) or BIP-39 mnemonic (12/15/18/21/24 words): ",
+    )
+    .unwrap_or_else(|e| fail("read secret", e));
+    let input = line.trim();
+    if input.is_empty() {
+        fail_msg("encrypt-key", "no secret provided");
+    }
+
+    // A 64-char lowercase-hex string is a raw seed; anything else is treated as
+    // a mnemonic phrase (which must then validate under BIP-39).
+    let seed = if input.len() == 64 && input.bytes().all(|b| b.is_ascii_hexdigit()) {
+        config::decode_seed(input, "seed").unwrap_or_else(|e| fail_msg("decode seed", &e))
+    } else {
+        zhixing_node::crypto::validate_mnemonic(input)
+            .unwrap_or_else(|e| fail_msg("mnemonic validate", &e.to_string()));
+        let passphrase = opt_arg(args, "--passphrase").unwrap_or_default();
+        let mut s = [0u8; 32];
+        zhixing_node::crypto::mnemonic_to_seed(input, passphrase, &mut s)
+            .unwrap_or_else(|e| fail_msg("mnemonic derive", &e.to_string()));
+        s
+    };
+
+    let password = prompt_new_password();
+    let ks = zhixing_node::keystore::encrypt_seed(&seed, &password)
+        .unwrap_or_else(|e| fail_msg("encrypt keystore", &e.to_string()));
+    let json =
+        zhixing_node::keystore::to_json(&ks).unwrap_or_else(|e| fail_msg("keystore json", &e));
+    write_key_file(out_path, &json).unwrap_or_else(|e| fail("write keystore", e));
+
+    let (_, pub_hex) = keygen_derive(seed);
+    println!("pubkey {pub_hex}");
+    println!("keystore {out_path}");
+    println!("Store the password securely; it is NOT in the keystore file.");
+}
+
+/// M217 (remote-signer S2): `node signer --keystore F --socket PATH --hwm FILE` — run the
+/// out-of-process reference signer. Decrypts the keystore (password via no-echo prompt or
+/// `ZHIXING_KEYSTORE_PASSWORD`), binds the Unix socket (perms 600), and serves consensus /
+/// handshake signatures for the node, enforcing a persisted anti-double-sign high-water-mark.
+/// Blocks until killed; the key never leaves this process. Unix only.
+#[cfg(unix)]
+fn cmd_signer(args: &[String]) {
+    let ks_path = req_arg(args, "--keystore");
+    let socket = req_arg(args, "--socket");
+    let hwm = req_arg(args, "--hwm");
+
+    let json = std::fs::read_to_string(ks_path)
+        .unwrap_or_else(|e| fail_msg("read keystore", &format!("`{ks_path}`: {e}")));
+    let password = read_keystore_password(ks_path);
+    let seed = zhixing_node::keystore::decrypt_seed(&json, &password)
+        .unwrap_or_else(|e| fail_msg("decrypt keystore", &e.to_string()));
+    let kp = zhixing_node::Keypair::from_seed(seed);
+    println!(
+        "signer: pubkey {} listening on {socket} (hwm {hwm})",
+        zhixing_node::hash::hex(&kp.public())
+    );
+    if let Err(e) = zhixing_node::remote_signer::serve(
+        std::path::Path::new(socket),
+        kp,
+        std::path::Path::new(hwm),
+    ) {
+        fail_msg("signer", &e.to_string());
+    }
+}
+
+#[cfg(not(unix))]
+fn cmd_signer(_args: &[String]) {
+    fail_msg(
+        "signer",
+        "the remote signer requires a Unix domain socket (Unix only)",
+    );
+}
+
+/// M175: refuse to clobber an existing output file unless `--force` is given.
+/// A validator keystore (or seed) is irrecoverable once truncated, so the key
+/// tools treat an existing `--out` path as a stop rather than overwriting it.
+fn refuse_overwrite(path: &str, args: &[String]) {
+    if std::path::Path::new(path).exists() && !args.iter().any(|a| a == "--force") {
+        fail_msg(
+            "output",
+            &format!("`{path}` already exists (pass --force to overwrite)"),
+        );
+    }
+}
+
+/// M175: prompt (no-echo, with confirmation) for a NEW keystore encryption
+/// password; used by `encrypt-key` and `keygen --encrypt`, exits on mismatch.
+/// M210: falls back to `ZHIXING_KEYSTORE_PASSWORD` when set and
+/// non-empty — the same unattended path `node run` uses to *read* a keystore —
+/// so a testnet / CI script can mint encrypted keystores without a TTY. The
+/// env-var path skips the confirmation (there is no typo to catch) and trades
+/// `/proc/<pid>/environ` exposure for automation; interactive operators should
+/// prefer the prompt.
+fn prompt_new_password() -> String {
+    if let Ok(pw) = std::env::var("ZHIXING_KEYSTORE_PASSWORD") {
+        if !pw.is_empty() {
+            return pw;
+        }
+    }
+    let pw = rpassword::prompt_password("Enter encryption password: ")
+        .unwrap_or_else(|e| fail("read password", e));
+    if pw.is_empty() {
+        fail_msg("password", "empty password is not allowed");
+    }
+    let confirm = rpassword::prompt_password("Confirm password: ")
+        .unwrap_or_else(|e| fail("read password", e));
+    if pw != confirm {
+        fail_msg("password", "passwords do not match");
+    }
+    pw
+}
+
+/// M175: prompt once (no-echo) for an existing keystore's decryption password.
+/// Falls back to the `ZHIXING_KEYSTORE_PASSWORD` environment variable when set
+/// (systemd `EnvironmentFile` / CI), so an unattended daemon need not have a
+/// TTY. The env-var path trades `/proc/<pid>/environ` exposure for automation;
+/// interactive operators should prefer the prompt.
+fn read_keystore_password(path: &str) -> String {
+    read_keystore_password_from("ZHIXING_KEYSTORE_PASSWORD", path)
+}
+
+/// M180/M181: resolve a keystore password — the named environment variable if set
+/// (unattended: systemd `EnvironmentFile` / CI), else an interactive no-echo
+/// prompt. Shared by the active key (`ZHIXING_KEYSTORE_PASSWORD`) and the pending
+/// rotation key (`ZHIXING_PENDING_KEYSTORE_PASSWORD`), so both behave the same.
+fn read_keystore_password_from(env_var: &str, path: &str) -> String {
+    if let Ok(pw) = std::env::var(env_var) {
+        if !pw.is_empty() {
+            return pw;
+        }
+    }
+    rpassword::prompt_password(format!("Enter keystore password for {path}: "))
+        .unwrap_or_else(|e| fail("read keystore password", e))
 }
 
 /// End-to-end showcase on the production path: launch a small tokio testnet
@@ -4668,7 +4990,7 @@ fn cmd_localnet() {
     rt.block_on(async move {
         let mut nodes = Vec::new();
         for &id in &ids {
-            let node = daemon::Node::start(node_cfg(id), genesis.clone(), Some(kp(id)))
+            let node = daemon::Node::start(node_cfg(id), genesis.clone(), Some(kp(id)), None)
                 .await
                 .unwrap_or_else(|e| fail("start node", e));
             nodes.push((id, node));
@@ -4716,12 +5038,13 @@ fn cmd_localnet() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-fn cmd_status(dir: String) {
+fn cmd_status(args: &[String]) {
+    let dir = dir_arg(args);
+    let genesis = genesis_for_args(args);
     let path = format!("{dir}/blocks.log");
     let log = BlockLog::open(&path).unwrap_or_else(|e| fail("open log", e));
     let blocks = log.read_all().unwrap_or_else(|e| fail("read log", e));
-    let chain =
-        Chain::replay(demo_genesis(), &blocks).unwrap_or_else(|e| fail_chain("replay log", e));
+    let chain = Chain::replay(genesis, &blocks).unwrap_or_else(|e| fail_chain("replay log", e));
     println!("replayed {} block(s) from {path}", chain.state.height);
     print_summary(&chain);
 }
@@ -4748,7 +5071,16 @@ enum VerifyOutcome {
 /// every committed block is checked against its finality certificate (height + block hash
 /// bind + a real > 2/3 quorum under the height's active validator set). Pure helper (no I/O
 /// coupling to process exit) so it can be unit-tested.
+#[cfg(test)]
 fn verify_logs(dir: &str) -> VerifyOutcome {
+    verify_logs_with(dir, &demo_genesis())
+}
+
+/// M211: as [`verify_logs`], but against a caller-supplied genesis — so `node verify`
+/// can audit a *production* chain (whose validator keys/genesis differ from the demo),
+/// not only the built-in demo chain. Resolved from `--config`/`--genesis` by
+/// [`genesis_for_args`]; the demo wrapper above keeps the in-crate test callers simple.
+fn verify_logs_with(dir: &str, genesis: &Genesis) -> VerifyOutcome {
     let bpath = format!("{dir}/blocks.log");
     let cpath = format!("{dir}/certs.log");
     let blocks = match BlockLog::open(&bpath).and_then(|l| l.read_all()) {
@@ -4773,7 +5105,7 @@ fn verify_logs(dir: &str) -> VerifyOutcome {
     };
     let n = blocks.len();
     let m = certs.len();
-    match Chain::replay_verified(demo_genesis(), &blocks, &certs) {
+    match Chain::replay_verified(genesis.clone(), &blocks, &certs) {
         Ok(chain) => VerifyOutcome::Ok {
             blocks: n,
             certs: m,
@@ -4811,7 +5143,14 @@ impl std::fmt::Debug for SnapshotReplayError {
     }
 }
 
+#[cfg(test)]
 fn replay_for_snapshot(dir: &str) -> Result<Chain, SnapshotReplayError> {
+    replay_for_snapshot_with(dir, &demo_genesis())
+}
+
+/// M211: as [`replay_for_snapshot`], but against a caller-supplied genesis, so
+/// `node snapshot` can export a production chain's state (see [`verify_logs_with`]).
+fn replay_for_snapshot_with(dir: &str, genesis: &Genesis) -> Result<Chain, SnapshotReplayError> {
     let bpath = format!("{dir}/blocks.log");
     let cpath = format!("{dir}/certs.log");
     let blocks = BlockLog::open(&bpath)
@@ -4828,15 +5167,44 @@ fn replay_for_snapshot(dir: &str) -> Result<Chain, SnapshotReplayError> {
             path: cpath,
             err: e,
         })?;
-    Chain::replay_verified(demo_genesis(), &blocks, &certs).map_err(SnapshotReplayError::Replay)
+    Chain::replay_verified(genesis.clone(), &blocks, &certs).map_err(SnapshotReplayError::Replay)
+}
+
+/// M211: resolve the genesis an on-disk-chain command (`verify`/`snapshot`/`status`)
+/// should replay against. `--config FILE` (a node config, whose `genesis =` is loaded)
+/// is the production path; `--genesis FILE` points straight at a genesis TOML; with
+/// neither, falls back to the built-in **demo** genesis so the demo subcommands and
+/// their doctests keep working. A malformed config/genesis is a hard, explained exit —
+/// an operator pointing `verify` at the wrong genesis should hear about it, not get a
+/// confusing "invalid signature" from replay.
+fn genesis_for_args(args: &[String]) -> Genesis {
+    if let Some(cfg_path) = opt_arg(args, "--config") {
+        let cfg =
+            config::load_node_config(cfg_path).unwrap_or_else(|e| fail_msg("load node config", &e));
+        let gcfg =
+            config::load_genesis(&cfg.genesis).unwrap_or_else(|e| fail_msg("load genesis", &e));
+        return gcfg
+            .to_genesis()
+            .unwrap_or_else(|e| fail_msg("build genesis", &e));
+    }
+    if let Some(gpath) = opt_arg(args, "--genesis") {
+        let gcfg = config::load_genesis(gpath).unwrap_or_else(|e| fail_msg("load genesis", &e));
+        return gcfg
+            .to_genesis()
+            .unwrap_or_else(|e| fail_msg("build genesis", &e));
+    }
+    demo_genesis()
 }
 
 /// M128: `node verify --dir DIR` — the operator's finality audit. Replays `blocks.log` against
 /// `certs.log` and prints a one-line verdict. Exits **non-zero** on any integrity error
 /// (missing log, length mismatch, cert doesn't bind its block, < 2/3 quorum, …) so a
-/// monitor / CI hook can use the exit code.
-fn cmd_verify(dir: String) {
-    match verify_logs(&dir) {
+/// monitor / CI hook can use the exit code. M211: `--config`/`--genesis` select the chain's
+/// genesis (default: demo).
+fn cmd_verify(args: &[String]) {
+    let dir = dir_arg(args);
+    let genesis = genesis_for_args(args);
+    match verify_logs_with(&dir, &genesis) {
         VerifyOutcome::Ok {
             blocks,
             certs,
@@ -4862,8 +5230,11 @@ fn cmd_verify(dir: String) {
 /// replay) as a M131 snapshot blob. `--out -` writes to stdout for piping (e.g. to
 /// `gzip` or a network); otherwise the snapshot is written to `FILE`. Errors map to
 /// non-zero exit + stderr.
-fn cmd_snapshot(dir: String, out: String) {
-    let chain = match replay_for_snapshot(&dir) {
+fn cmd_snapshot(args: &[String]) {
+    let dir = dir_arg(args);
+    let out = req_arg(args, "--out").to_string();
+    let genesis = genesis_for_args(args);
+    let chain = match replay_for_snapshot_with(&dir, &genesis) {
         Ok(c) => c,
         Err(SnapshotReplayError::Io { what, path, err }) => {
             eprintln!("error: {what} ({path}): {err}");
@@ -4978,7 +5349,7 @@ fn check_snapshot_against_header(snapshot_bytes: &[u8], header_hex: &str) -> Che
             std::process::exit(1);
         }
     };
-    let header = match zhixing_node::codec::decode_header(&header_bytes) {
+    let header = match zhixing_node::codec::decode_header_any(&header_bytes) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("error: decode header: {e:?}");
@@ -5053,7 +5424,7 @@ fn cmd_check_snapshot(snapshot_path: String, header_hex: String) {
 /// M135: decode a lowercase/uppercase hex string to bytes; `None` on a non-hex or odd-length
 /// input. (The RPC header reads emit lowercase hex; we accept either case.)
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let bytes = s.as_bytes();
@@ -5220,6 +5591,7 @@ fn print_summary(chain: &Chain) {
     println!("supply           {} COG", cog(chain.state.supply));
     println!("treasury         {} COG", cog(chain.state.treasury));
     println!("graph nodes      {}", chain.state.graph.len());
+    println!("cNFTs            {}", chain.state.contributions.len());
     println!("supply conserved {}", chain.state.supply_conserved());
     println!("\naccounts:");
     for (id, a) in &chain.state.accounts {
@@ -5320,6 +5692,55 @@ fn demo_driver_seeds() -> std::collections::BTreeMap<u64, [u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M179 (doc-integrity guard): the `demo` chain's cert-signed STATE roots are
+    /// M181/M183: guard the demo chain's cert-signed STATE roots against silent
+    /// drift. `merkle_root` (accounts_root) is the wire-v1 value the READMEs cite
+    /// (`5312ecf6…ee8c6b`) and must stay put — a header-only wire bump (M171 B3 /
+    /// M179 B4) changes the block *hash* (demo `head`), not the state roots, for a
+    /// chain with no bridge/rotation state. `state_root` is re-baselined by M183
+    /// (`1db88ef6…`, cNFT fold) and again by M194 (`fc053560…`): folding the
+    /// governance proposal set + `next_proposal_id` into the digest legitimately
+    /// moved it (even an empty set adds length words). SEC-02 (`01c163ce…`)
+    /// re-baselined it once more by folding the execution params
+    /// (`base_emission_micro`/`decay_half_life_blocks`/`slash_bps`/ΔK) so a tampered
+    /// snapshot/genesis param can't match a cert-signed root. Proposals/params do NOT
+    /// enter `accounts_root`, so `merkle_root` is unchanged — pinning both catches an
+    /// accidental, undocumented change to demo *state*. The head (block hash) is
+    /// deliberately NOT pinned; it moves with wire bumps (M194 B6 adds two per-body
+    /// commitments) and with this state re-baseline.
+    #[test]
+    fn demo_chain_state_roots_match_the_documented_canon() {
+        let mut chain = Chain::new(demo_genesis());
+        for blk in demo_blocks(&chain) {
+            let mut blk = blk;
+            chain.commit(&mut blk).expect("demo block commits");
+        }
+        assert_eq!(
+            hex(&chain.state.state_root()),
+            "01c163cec782b5022db9993b822c1d0b9a1defb5c90875306a4073b2a98d296b"
+        );
+        assert_eq!(
+            hex(&chain.state.merkle_root()),
+            "5312ecf68856cfe031bc9e2478017170b15422f153ab260a4e81719f58ee8c6b"
+        );
+    }
+
+    #[test]
+    fn read_keystore_password_prefers_env() {
+        // M181: `read_keystore_password_from` returns the named env var when set
+        // (unattended path), without touching the TTY. Uses a test-unique var name
+        // so it never collides with the real ones under parallel test runs.
+        let var = "ZHIXING_TEST_PW_M181";
+        std::env::set_var(var, "s3cret");
+        assert_eq!(read_keystore_password_from(var, "/some/ks.json"), "s3cret");
+        std::env::remove_var(var);
+        // An empty env value is treated as unset (falls through to the prompt,
+        // which we don't exercise here — just assert the empty value isn't used).
+        std::env::set_var(var, "");
+        assert!(std::env::var(var).unwrap().is_empty());
+        std::env::remove_var(var);
+    }
 
     fn seed_for(id: u64) -> [u8; 32] {
         let mut s = [0u8; 32];
@@ -5943,6 +6364,95 @@ mod tests {
     }
 
     #[test]
+    fn check_config_ok_for_remote_signer_validator() {
+        // M219: an enabled `[validator]` with a `[validator.signer]` sub-table (no on-disk
+        // key) validates — the dry-run checks the socket structurally; the live connect +
+        // genesis-pubkey check happens at `node run`. Role names the remote signer.
+        let (_seed_hex, pub_hex) = keygen_derive(seed_for(1));
+        let vsec = "[validator]\nenabled = true\n[validator.signer]\nsocket = \"/run/zx/s.sock\"\n";
+        let (cpath, dir) =
+            write_check_config_fixture("remote-signer", &valid_genesis_body(&pub_hex), vsec);
+        let summary = check_config(&cpath).expect("valid remote-signer config");
+        assert!(
+            summary.contains("\nrole validator (remote signer)\n"),
+            "{summary}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // An empty socket is rejected by the dry-run.
+        let bad = "[validator]\nenabled = true\n[validator.signer]\nsocket = \"\"\n";
+        let (cpath2, dir2) =
+            write_check_config_fixture("remote-signer-bad", &valid_genesis_body(&pub_hex), bad);
+        assert!(check_config(&cpath2).is_err(), "empty socket must fail");
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn check_config_validates_encrypted_keystore_without_password() {
+        // M175: a `[validator]` pointing at an encrypted keystore is validated
+        // *structurally* by the dry-run — the file must exist and parse as a v3
+        // keystore — without decrypting (no password prompt in a dry-run). We
+        // generate a real keystore for the genesis validator's seed, point the
+        // config at it, and confirm the dry-run reports role "validator".
+        let seed = seed_for(1);
+        let (_seed_hex, pub_hex) = keygen_derive(seed);
+        let ks = zhixing_node::keystore::encrypt_seed(&seed, "dry-run-pw").unwrap();
+        let json = zhixing_node::keystore::to_json(&ks).unwrap();
+
+        let (cpath, dir) = write_check_config_fixture(
+            "ks-valid",
+            &valid_genesis_body(&pub_hex),
+            // placeholder; we rewrite the config below once we know the dir.
+            "",
+        );
+        let ks_path = dir.join("keystore.json");
+        std::fs::write(&ks_path, &json).unwrap();
+        // Rewrite node.toml to add the keystore validator section now that the
+        // keystore file exists at a known path.
+        let gpath = dir.join("genesis.toml");
+        let cfg = format!(
+            "genesis = \"{}\"\n[node]\nid = 1\nlisten = \"127.0.0.1:9021\"\ndata_dir = \"{}/data\"\n\
+             [validator]\nenabled = true\nencrypted_keystore_path = \"{}\"\n",
+            gpath.to_str().unwrap(),
+            dir.to_str().unwrap(),
+            ks_path.to_str().unwrap(),
+        );
+        std::fs::write(&cpath, cfg).unwrap();
+
+        let summary = check_config(&cpath).expect("keystore config validates structurally");
+        assert!(summary.contains("\nrole validator\n"), "{summary}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_config_surfaces_corrupt_keystore() {
+        // M175: a keystore file that is not valid v3 JSON ⇒ the dry-run returns
+        // an Err (KeystoreDecrypt) rather than silently passing.
+        let (_seed_hex, pub_hex) = keygen_derive(seed_for(1));
+        let (cpath, dir) =
+            write_check_config_fixture("ks-corrupt", &valid_genesis_body(&pub_hex), "");
+        let ks_path = dir.join("keystore.json");
+        std::fs::write(&ks_path, "{ not a keystore }").unwrap();
+        let gpath = dir.join("genesis.toml");
+        let cfg = format!(
+            "genesis = \"{}\"\n[node]\nid = 1\nlisten = \"127.0.0.1:9021\"\ndata_dir = \"{}/data\"\n\
+             [validator]\nenabled = true\nencrypted_keystore_path = \"{}\"\n",
+            gpath.to_str().unwrap(),
+            dir.to_str().unwrap(),
+            ks_path.to_str().unwrap(),
+        );
+        std::fs::write(&cpath, cfg).unwrap();
+        assert!(
+            matches!(
+                check_config(&cpath),
+                Err(config::ConfigError::KeystoreDecrypt { .. })
+            ),
+            "corrupt keystore must fail the dry-run"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn check_config_surfaces_bad_genesis() {
         // M96: a malformed genesis (non-hex pubkey) ⇒ Err, returned (not a panic/exit) so the
         // dry-run reports the typed error rather than failing at daemon start.
@@ -6237,6 +6747,8 @@ mod tests {
             accounts_root: [0u8; 32],
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
+            contributions_root: [0u8; 32],
+            unbonding_root: [0u8; 32],
             txs,
             validator_updates: vec![],
             stake_ops: vec![],
@@ -6245,6 +6757,9 @@ mod tests {
             bridge_headers: vec![],
             bridge_redeems: vec![],
             bridge_unbondings: vec![],
+            key_rotations: vec![],
+            gov_proposals: Vec::new(),
+            gov_votes: Vec::new(),
             proposer: 0,
         }
     }

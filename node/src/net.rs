@@ -49,7 +49,10 @@ use crate::light::ValidatorTracker;
 use crate::mempool::Mempool;
 use crate::merkle;
 use crate::validator::ValidatorSet;
-use crate::{Block, Chain, Genesis, Hash, SlashEvidence, StakeOp, SubmissionTx};
+use crate::{
+    Block, Chain, ChainError, Genesis, GovProposal, GovVote, Hash, KeyRotation, SlashEvidence,
+    StakeOp, SubmissionTx,
+};
 
 /// Maximum certified blocks returned in a single [`GossipMsg::Blocks`] batch — a
 /// lagging peer that needs more re-requests from the new height.
@@ -77,6 +80,18 @@ pub enum GossipMsg {
     /// admits it into a staking block. Full validation in
     /// `chain.commit.apply_stake_op`.
     StakeOp(StakeOp),
+    /// M179: gossip one signed account key-rotation op — same flood/dedup pattern
+    /// as `StakeOp`. Floods into every node's pending pool; the next proposer
+    /// admits it into a block. Full validation in `chain.commit.apply_key_rotation`
+    /// (signature by the current key, nonce, and the active-validator guard).
+    KeyRotation(KeyRotation),
+    /// M195: gossip one signed governance proposal — same flood/dedup pattern as
+    /// `KeyRotation`. Floods into every node's pending pool; the next proposer admits
+    /// it into a block (where `apply_gov_proposal` checks sig + nonce).
+    GovProposal(Box<GovProposal>),
+    /// M195: gossip one signed governance vote — same flood/dedup pattern. Admitted
+    /// into a block where `apply_gov_vote` checks sig + nonce + the open window.
+    GovVote(Box<GovVote>),
     /// "Send me cert-signed BLOCK HEADERS (no bodies) from this height onward."
     /// The light-sync analogue of `GetBlocks` (M22). A light client announces
     /// its height with `Status`; on seeing a peer ahead, it sends `GetHeaders`
@@ -205,6 +220,20 @@ pub enum GossipMsg {
 /// cap is a codec error ([`CodecError::TooManyItems`]). Bounds a hostile peer's
 /// book so decoding can't fan out unboundedly.
 pub const MAX_PEERS: usize = 1024;
+/// SEC-01 (re-verify): hard cap on each staged governance pool (proposals / votes). A
+/// full pool stops staging + re-flooding further gov ops — governance is low-volume, so
+/// this bounds memory/CPU under a gossip flood without affecting honest operation.
+pub const MAX_PENDING_GOV: usize = 4096;
+/// SEC-01 (round 3): per-account share of each governance pool. Together with the
+/// nonce window ([`crate::GOV_NONCE_LOOKAHEAD`]) this means one account can neither
+/// fill the pool with future-nonce ops nor crowd out other accounts' current-nonce
+/// ops — reaching `MAX_PENDING_GOV` takes `MAX_PENDING_GOV / 16` distinct accounts.
+pub const MAX_PENDING_GOV_PER_ACCOUNT: usize = 16;
+/// SEC-01 (re-verify): hard default bound (FIFO) for the governance / key-rotation dedup
+/// caches, applied at construction so they are never unbounded even when `[mempool]
+/// seen_cache` is left at its `0` (unbounded) default. Governance is low-volume, so a
+/// 64Ki-entry window is ample; the operator can still raise it via `seen_cache`.
+pub const DEFAULT_OP_SEEN_CAP: usize = 1 << 16;
 
 /// M24: maximum items in a single [`GossipMsg::GetProof`] / [`GossipMsg::Proof`]
 /// — over the cap is a codec error (`TooManyItems`). Keeps a single request
@@ -248,6 +277,12 @@ pub const TAG_PEERS: u8 = 17;
 pub const TAG_GETHEADERS_SETS: u8 = 18;
 /// M147: response to `GetHeadersWithSets` — `(header, next_validator_set)` pairs.
 pub const TAG_HEADERS_SETS: u8 = 19;
+/// M179: account key-rotation op gossip.
+pub const TAG_KEYROTATION: u8 = 20;
+/// M195: governance proposal op gossip.
+pub const TAG_GOVPROPOSAL: u8 = 21;
+/// M195: governance vote op gossip.
+pub const TAG_GOVVOTE: u8 = 22;
 
 /// M29: maximum items in a single heterogeneous batched
 /// request/response. Mirrors `MAX_PROOF_BATCH = 32` so the bus caps
@@ -255,6 +290,49 @@ pub const TAG_HEADERS_SETS: u8 = 19;
 /// bound, range cut bound, etc.) are enforced inside each
 /// `serve_*` helper as today.
 pub const MAX_BATCH_ITEMS: usize = 32;
+
+/// M212: how many recently-committed heights the per-node liveness tracker remembers.
+/// 1024 heights ≈ a generous observation window for an operator to spot a validator
+/// that has stopped signing. Bounded memory (a sliding window of id-sets).
+pub const LIVENESS_WINDOW: usize = 1024;
+
+/// M212: **local, observability-only** record of which validators have been signing
+/// recent commits, from THIS node's cert view. Each committed cert names its signer
+/// subset (`Commit::precommits`); we remember the last [`LIVENESS_WINDOW`] such sets so
+/// an operator can scrape, per current validator, how many of those heights it missed —
+/// the signal to remove a persistently-absent validator via a normal validator-set
+/// change (there is no automatic jailing/slashing).
+///
+/// Deliberately **not** consensus state: cert signer subsets are non-canonical (each
+/// node assembles any >2/3 subset), so this is never folded into `state_root` and never
+/// affects determinism, block validity, or the wire. Two honest nodes may report
+/// slightly different missed counts; that is expected and fine for observability.
+#[derive(Clone, Default)]
+struct LivenessTracker {
+    /// Signer id-set of each remembered height (most recent at the back), capped at
+    /// [`LIVENESS_WINDOW`].
+    recent: VecDeque<BTreeSet<u64>>,
+}
+
+impl LivenessTracker {
+    /// Remember one committed height's signer set, evicting the oldest past the window.
+    fn record(&mut self, signers: BTreeSet<u64>) {
+        self.recent.push_back(signers);
+        while self.recent.len() > LIVENESS_WINDOW {
+            self.recent.pop_front();
+        }
+    }
+
+    /// Committed heights currently remembered (the denominator for a miss rate).
+    fn samples(&self) -> usize {
+        self.recent.len()
+    }
+
+    /// How many remembered heights `id` did NOT sign.
+    fn missed(&self, id: u64) -> usize {
+        self.recent.iter().filter(|s| !s.contains(&id)).count()
+    }
+}
 
 /// M55: a flood-dedup hash set bounded to its `capacity` most-recent entries.
 /// Unlike the mempool's *reject-at-bound* policy (M54), a dedup set must keep
@@ -282,6 +360,18 @@ impl SeenSet {
         }
     }
 
+    /// SEC-01 (re-verify): a dedup set with a hard default bound, used for the governance
+    /// and key-rotation op caches. Unlike `new()` (unbounded unless the operator sets
+    /// `[mempool] seen_cache`), these are ALWAYS bounded so a signed-op flood can't grow
+    /// the cache without limit even on a default config. `set_capacity` can still raise it.
+    fn bounded(capacity: usize) -> Self {
+        SeenSet {
+            set: BTreeSet::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
     /// Set the per-set bound (`usize::MAX` ⇒ unbounded). Trims immediately if
     /// already over — at startup the set is empty so this is normally a no-op.
     fn set_capacity(&mut self, capacity: usize) {
@@ -306,6 +396,13 @@ impl SeenSet {
             }
         }
         is_new
+    }
+
+    /// SEC-01 (round 5): forget `h` so it can be re-admitted — used when a staged op
+    /// is evicted from a full pool (not consumed), so its owner can resubmit later.
+    /// The FIFO slot stays as a harmless tombstone (its eventual pop is a no-op).
+    fn remove(&mut self, h: &Hash) {
+        self.set.remove(h);
     }
 
     fn len(&self) -> usize {
@@ -360,13 +457,26 @@ pub struct GossipNode {
     seen_evidence: SeenSet,
     /// Content hashes of stake ops already seen — dedup for `StakeOp`.
     seen_stake_op: SeenSet,
+    /// M179: content hashes of key-rotation ops already seen — dedup for `KeyRotation`.
+    seen_key_rotation: SeenSet,
+    /// M195: content hashes of governance proposals / votes already seen — dedup.
+    seen_gov_proposal: SeenSet,
+    seen_gov_vote: SeenSet,
     /// Evidence staged to be carried by the next block this node proposes
     /// (drained by the driver via [`Self::take_pending_evidence`]).
     pending_evidence: Vec<SlashEvidence>,
     /// Stake ops staged to be carried by the next block this node proposes.
     pending_stake_ops: Vec<StakeOp>,
+    /// M179: key-rotation ops staged for the next block this node proposes.
+    pending_key_rotations: Vec<KeyRotation>,
+    /// M195: governance proposals / votes staged for the next block this node proposes.
+    pending_gov_proposals: Vec<GovProposal>,
+    pending_gov_votes: Vec<GovVote>,
     /// Known peer ids (iterated in sorted order for deterministic output).
     peers: BTreeSet<u64>,
+    /// M212: local liveness-observability window (NOT consensus state; see
+    /// [`LivenessTracker`]).
+    liveness: LivenessTracker,
 }
 
 impl GossipNode {
@@ -390,9 +500,16 @@ impl GossipNode {
             seen_tx: SeenSet::new(),
             seen_evidence: SeenSet::new(),
             seen_stake_op: SeenSet::new(),
+            seen_key_rotation: SeenSet::bounded(DEFAULT_OP_SEEN_CAP),
+            seen_gov_proposal: SeenSet::bounded(DEFAULT_OP_SEEN_CAP),
+            seen_gov_vote: SeenSet::bounded(DEFAULT_OP_SEEN_CAP),
             pending_evidence: Vec::new(),
             pending_stake_ops: Vec::new(),
+            pending_key_rotations: Vec::new(),
+            pending_gov_proposals: Vec::new(),
+            pending_gov_votes: Vec::new(),
             peers: peers.into_iter().filter(|&p| p != id).collect(),
+            liveness: LivenessTracker::default(),
         }
     }
 
@@ -428,9 +545,16 @@ impl GossipNode {
             seen_tx: SeenSet::new(),
             seen_evidence: SeenSet::new(),
             seen_stake_op: SeenSet::new(),
+            seen_key_rotation: SeenSet::bounded(DEFAULT_OP_SEEN_CAP),
+            seen_gov_proposal: SeenSet::bounded(DEFAULT_OP_SEEN_CAP),
+            seen_gov_vote: SeenSet::bounded(DEFAULT_OP_SEEN_CAP),
             pending_evidence: Vec::new(),
             pending_stake_ops: Vec::new(),
+            pending_key_rotations: Vec::new(),
+            pending_gov_proposals: Vec::new(),
+            pending_gov_votes: Vec::new(),
             peers: peers.into_iter().filter(|&p| p != id).collect(),
+            liveness: LivenessTracker::default(),
         }
     }
 
@@ -512,6 +636,38 @@ impl GossipNode {
         &self.pending_stake_ops
     }
 
+    /// M179: key-rotation ops staged for the next proposed block (read-only view).
+    pub fn pending_key_rotations(&self) -> &[KeyRotation] {
+        &self.pending_key_rotations
+    }
+
+    /// M195: governance proposals / votes staged for the next proposed block.
+    pub fn pending_gov_proposals(&self) -> &[GovProposal] {
+        &self.pending_gov_proposals
+    }
+    pub fn pending_gov_votes(&self) -> &[GovVote] {
+        &self.pending_gov_votes
+    }
+
+    /// M212: local liveness-observability snapshot — `(window_samples, [(validator_id,
+    /// missed_commits)])` for every **current** validator, sorted by id. `window_samples`
+    /// is the number of recently-committed heights remembered (the miss-rate denominator);
+    /// `missed_commits` is how many of those this node did not see the validator sign.
+    /// Observability only (this node's cert view) — never consensus state. See
+    /// [`LivenessTracker`].
+    pub fn liveness_report(&self) -> (usize, Vec<(u64, usize)>) {
+        let mut per_val: Vec<(u64, usize)> = self
+            .chain
+            .state
+            .validators
+            .validators()
+            .iter()
+            .map(|v| (v.id, self.liveness.missed(v.id)))
+            .collect();
+        per_val.sort_by_key(|&(id, _)| id);
+        (self.liveness.samples(), per_val)
+    }
+
     /// M35: is there any block-worthy pending work — mempool txs or staged
     /// block-level ops (stake ops / slashing evidence)? Used by the daemon to
     /// suppress empty heartbeat blocks when `create_empty_blocks=false`.
@@ -523,6 +679,9 @@ impl GossipNode {
         !self.mempool.is_empty()
             || !self.pending_stake_ops.is_empty()
             || !self.pending_evidence.is_empty()
+            || !self.pending_key_rotations.is_empty()
+            || !self.pending_gov_proposals.is_empty()
+            || !self.pending_gov_votes.is_empty()
     }
 
     /// Drain staged evidence, transferring it to a block builder (e.g. a
@@ -536,6 +695,19 @@ impl GossipNode {
     /// Drain staged stake ops, transferring them to a block builder.
     pub fn take_pending_stake_ops(&mut self) -> Vec<StakeOp> {
         std::mem::take(&mut self.pending_stake_ops)
+    }
+
+    /// M179: drain staged key-rotation ops, transferring them to a block builder.
+    pub fn take_pending_key_rotations(&mut self) -> Vec<KeyRotation> {
+        std::mem::take(&mut self.pending_key_rotations)
+    }
+
+    /// M195: drain staged governance proposals / votes, transferring them to a builder.
+    pub fn take_pending_gov_proposals(&mut self) -> Vec<GovProposal> {
+        std::mem::take(&mut self.pending_gov_proposals)
+    }
+    pub fn take_pending_gov_votes(&mut self) -> Vec<GovVote> {
+        std::mem::take(&mut self.pending_gov_votes)
     }
 
     /// Preload an already-certified chain (e.g. a seed node handing out history).
@@ -609,6 +781,19 @@ impl GossipNode {
                         crate::light::ProofEntry::GraphNode {
                             node_id: n.node_id,
                             graph_node: n,
+                            proof: p,
+                        }
+                    })
+                })
+            }
+            crate::light::ProofKind::Cnft => {
+                // M185: cNFTs are addressed by their cognitive-graph node_id and
+                // proven against the dedicated `contributions_root`.
+                self.chain.state.cnft_proof(id).and_then(|p| {
+                    self.chain.state.contributions.get(&id).cloned().map(|c| {
+                        crate::light::ProofEntry::Cnft {
+                            node_id: id,
+                            cnft: c,
                             proof: p,
                         }
                     })
@@ -1189,6 +1374,59 @@ impl GossipNode {
             self.pending_stake_ops
                 .retain(|op| !committed.contains(&op.hash()));
         }
+        if !block.key_rotations.is_empty() {
+            let committed: std::collections::HashSet<[u8; 32]> =
+                block.key_rotations.iter().map(|op| op.hash()).collect();
+            self.pending_key_rotations
+                .retain(|op| !committed.contains(&op.hash()));
+        }
+        // SEC-01: drop committed governance ops from the pending pools so this node
+        // never re-proposes an already-applied proposal/vote (whose nonce is now
+        // consumed) at the next height.
+        if !block.gov_proposals.is_empty() {
+            let committed: std::collections::HashSet<[u8; 32]> =
+                block.gov_proposals.iter().map(|op| op.hash()).collect();
+            self.pending_gov_proposals
+                .retain(|op| !committed.contains(&op.hash()));
+        }
+        if !block.gov_votes.is_empty() {
+            let committed: std::collections::HashSet<[u8; 32]> =
+                block.gov_votes.iter().map(|op| op.hash()).collect();
+            self.pending_gov_votes
+                .retain(|op| !committed.contains(&op.hash()));
+        }
+        // SEC-01 (round 3): the block just applied may have advanced account nonces
+        // (via any op type) or matured proposals, so staged gov ops that can now never
+        // apply are dropped here instead of holding pool slots until eviction. Cheap:
+        // nonce-window / proposal-open checks only, no signature work.
+        {
+            let state = &self.chain.state;
+            self.pending_gov_proposals
+                .retain(|op| state.gov_proposal_not_stale(op));
+            self.pending_gov_votes
+                .retain(|op| state.gov_vote_not_stale(op));
+            // SEC-01 (round 5): a key rotation in this block replaced the account's
+            // pubkey, so its queued ops signed by the OLD key are still inside the nonce
+            // window (rotation bumps the nonce by one) yet can never verify at apply.
+            // Re-run full admissibility (signature included) for just those accounts —
+            // bounded by their quota, so the signature work is small.
+            if !block.key_rotations.is_empty() {
+                let rotated: std::collections::HashSet<u64> =
+                    block.key_rotations.iter().map(|r| r.account).collect();
+                self.pending_gov_proposals.retain(|op| {
+                    !rotated.contains(&op.proposer) || state.gov_proposal_admissible(op).is_ok()
+                });
+                self.pending_gov_votes.retain(|op| {
+                    !rotated.contains(&op.voter) || state.gov_vote_admissible(op).is_ok()
+                });
+            }
+        }
+        // M212: record which validators signed this height's commit, from THIS node's
+        // cert view, for local liveness observability (see `LivenessTracker`). Pure
+        // local metric — NOT folded into state_root (cert signer subsets are
+        // non-canonical), so it never affects determinism or the chain.
+        let signers: BTreeSet<u64> = cert.precommits.iter().map(|v| v.validator).collect();
+        self.liveness.record(signers);
         self.blocks.push(block);
         self.certs.push(cert);
         true
@@ -1219,6 +1457,8 @@ impl GossipNode {
                 accounts_root: [0u8; 32],
                 graph_root: [0u8; 32],
                 bridge_root: [0u8; 32],
+                contributions_root: [0u8; 32],
+                unbonding_root: [0u8; 32],
                 txs: Vec::new(),
                 validator_updates: Vec::new(),
                 stake_ops: Vec::new(),
@@ -1227,9 +1467,23 @@ impl GossipNode {
                 bridge_headers: Vec::new(),
                 bridge_redeems: Vec::new(),
                 bridge_unbondings: Vec::new(),
+                key_rotations: Vec::new(),
+                gov_proposals: Vec::new(),
+                gov_votes: Vec::new(),
             });
         candidate.stake_ops = self.pending_stake_ops.clone();
         candidate.slashing_evidence = self.pending_evidence.clone();
+        candidate.key_rotations = self.pending_key_rotations.clone();
+        // SEC-01: include only governance ops that apply cleanly against current state
+        // (in block order), so a stale/invalid staged op can't make the whole candidate
+        // unproposable and stall production.
+        let (gp, gv) = self.chain.state.filter_applicable_gov(
+            self.chain.state.height + 1,
+            &self.pending_gov_proposals,
+            &self.pending_gov_votes,
+        );
+        candidate.gov_proposals = gp;
+        candidate.gov_votes = gv;
         // M122: this node is the proposer of the block it builds — credit its own
         // validator id so the tx fees route to it. Only a block actually elected and
         // committed keeps this; a losing candidate is discarded.
@@ -1296,6 +1550,11 @@ impl GossipNode {
         self.seen_tx.set_capacity(capacity);
         self.seen_evidence.set_capacity(capacity);
         self.seen_stake_op.set_capacity(capacity);
+        // SEC-01 (re-verify): the governance dedup sets were previously unbounded, so a
+        // peer could grow them without limit. Bound them with the same policy.
+        self.seen_key_rotation.set_capacity(capacity);
+        self.seen_gov_proposal.set_capacity(capacity);
+        self.seen_gov_vote.set_capacity(capacity);
     }
 
     /// M55: current number of entries in the tx dedup set (the one under flood
@@ -1351,6 +1610,188 @@ impl GossipNode {
         self.broadcast(GossipMsg::StakeOp(op), None)
     }
 
+    /// M179: submit a locally-originated key-rotation op: stage it for the next
+    /// block and flood it to peers. As with stake ops, there is nothing to
+    /// validate structurally here — the signature (by the account's current
+    /// key), nonce, and active-validator guard are checked at apply time in
+    /// `chain.commit.apply_key_rotation`, which rolls back the whole block on
+    /// any failure.
+    pub fn submit_local_key_rotation(&mut self, op: KeyRotation) -> Vec<(u64, GossipMsg)> {
+        let h = op.hash();
+        self.seen_key_rotation.insert(h);
+        self.pending_key_rotations.push(op.clone());
+        self.broadcast(GossipMsg::KeyRotation(op), None)
+    }
+
+    /// M195: stage a locally-created governance proposal and flood it. Goes through
+    /// the same admission as gossip ingress ([`Self::admit_gov_proposal`]): the
+    /// structured `Err` tells the caller (RPC) exactly why the op was NOT staged.
+    pub fn submit_local_gov_proposal(
+        &mut self,
+        op: GovProposal,
+    ) -> Result<Vec<(u64, GossipMsg)>, ChainError> {
+        self.admit_gov_proposal(&op)?;
+        Ok(self.broadcast(GossipMsg::GovProposal(Box::new(op)), None))
+    }
+
+    /// M195: stage a locally-created governance vote and flood it (see
+    /// [`Self::submit_local_gov_proposal`]).
+    pub fn submit_local_gov_vote(
+        &mut self,
+        op: GovVote,
+    ) -> Result<Vec<(u64, GossipMsg)>, ChainError> {
+        self.admit_gov_vote(&op)?;
+        Ok(self.broadcast(GossipMsg::GovVote(Box::new(op)), None))
+    }
+
+    /// SEC-01 (round 3): the single admission path into the governance proposal pool,
+    /// shared by gossip ingress and local/RPC submission so the two can't drift.
+    /// Order matters: validity (sig / param / nonce window) → per-account quota →
+    /// global pool cap → dedup → stage. Capacity is checked BEFORE the dedup insert
+    /// so a full pool never consumes a `seen` slot for an op that was not staged.
+    ///
+    /// SEC-01 (round 5): a **current-nonce** op (immediately applicable) never loses
+    /// its slot to parked future-nonce ops: at quota it evicts this account's
+    /// furthest-future op, at the global cap it evicts the pool's furthest-future op
+    /// ([`Self::evict_furthest_future_gov_proposal`]). Only when nothing is evictable
+    /// (the pool holds nothing but current-nonce ops) does the hard cap reject it —
+    /// so many accounts parking future-nonce ops can't starve governance.
+    fn admit_gov_proposal(&mut self, op: &GovProposal) -> Result<(), ChainError> {
+        self.chain.state.gov_proposal_admissible(op)?;
+        // Admissibility proved the account exists and `op.nonce >= acct.nonce`.
+        let current = self
+            .chain
+            .state
+            .accounts
+            .get(&op.proposer)
+            .is_some_and(|a| a.nonce == op.nonce);
+        let mine = self
+            .pending_gov_proposals
+            .iter()
+            .filter(|p| p.proposer == op.proposer)
+            .count();
+        if mine >= MAX_PENDING_GOV_PER_ACCOUNT
+            && !(current && self.evict_furthest_future_gov_proposal(Some(op.proposer)))
+        {
+            return Err(ChainError::GovAccountQuotaExceeded {
+                account: op.proposer,
+                limit: MAX_PENDING_GOV_PER_ACCOUNT,
+            });
+        }
+        if self.pending_gov_proposals.len() >= MAX_PENDING_GOV
+            && !(current && self.evict_furthest_future_gov_proposal(None))
+        {
+            return Err(ChainError::GovPoolFull);
+        }
+        if !self.seen_gov_proposal.insert(op.hash()) {
+            return Err(ChainError::GovAlreadySeen);
+        }
+        self.pending_gov_proposals.push(op.clone());
+        Ok(())
+    }
+
+    /// SEC-01 (round 3/5): as [`Self::admit_gov_proposal`], for the vote pool.
+    fn admit_gov_vote(&mut self, op: &GovVote) -> Result<(), ChainError> {
+        self.chain.state.gov_vote_admissible(op)?;
+        let current = self
+            .chain
+            .state
+            .accounts
+            .get(&op.voter)
+            .is_some_and(|a| a.nonce == op.nonce);
+        let mine = self
+            .pending_gov_votes
+            .iter()
+            .filter(|v| v.voter == op.voter)
+            .count();
+        if mine >= MAX_PENDING_GOV_PER_ACCOUNT
+            && !(current && self.evict_furthest_future_gov_vote(Some(op.voter)))
+        {
+            return Err(ChainError::GovAccountQuotaExceeded {
+                account: op.voter,
+                limit: MAX_PENDING_GOV_PER_ACCOUNT,
+            });
+        }
+        if self.pending_gov_votes.len() >= MAX_PENDING_GOV
+            && !(current && self.evict_furthest_future_gov_vote(None))
+        {
+            return Err(ChainError::GovPoolFull);
+        }
+        if !self.seen_gov_vote.insert(op.hash()) {
+            return Err(ChainError::GovAlreadySeen);
+        }
+        self.pending_gov_votes.push(op.clone());
+        Ok(())
+    }
+
+    /// SEC-01 (round 5): drop the staged proposal (optionally restricted to `account`)
+    /// whose nonce is furthest ahead of its account's current nonce — the one least
+    /// likely to apply soon; ties go to the oldest. Its hash is forgotten by the dedup
+    /// cache so the owner can resubmit once there is room. `false` if every candidate
+    /// is at its current nonce (nothing is "parked", so nothing is evictable).
+    fn evict_furthest_future_gov_proposal(&mut self, account: Option<u64>) -> bool {
+        let state = &self.chain.state;
+        let victim = self
+            .pending_gov_proposals
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| account.is_none_or(|a| p.proposer == a))
+            .filter_map(|(i, p)| {
+                let cur = state.accounts.get(&p.proposer)?.nonce;
+                (p.nonce > cur).then_some((p.nonce - cur, i))
+            })
+            // max distance; `max_by_key` takes the LAST max, so negate the index to
+            // prefer the oldest (lowest index) on ties.
+            .max_by_key(|&(d, i)| (d, std::cmp::Reverse(i)))
+            .map(|(_, i)| i);
+        match victim {
+            Some(i) => {
+                let gone = self.pending_gov_proposals.remove(i);
+                self.seen_gov_proposal.remove(&gone.hash());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// SEC-01 (round 5): as [`Self::evict_furthest_future_gov_proposal`], for votes.
+    fn evict_furthest_future_gov_vote(&mut self, account: Option<u64>) -> bool {
+        let state = &self.chain.state;
+        let victim = self
+            .pending_gov_votes
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| account.is_none_or(|a| v.voter == a))
+            .filter_map(|(i, v)| {
+                let cur = state.accounts.get(&v.voter)?.nonce;
+                (v.nonce > cur).then_some((v.nonce - cur, i))
+            })
+            .max_by_key(|&(d, i)| (d, std::cmp::Reverse(i)))
+            .map(|(_, i)| i);
+        match victim {
+            Some(i) => {
+                let gone = self.pending_gov_votes.remove(i);
+                self.seen_gov_vote.remove(&gone.hash());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Test-only: push a vote straight into the pending pool, bypassing admission —
+    /// models a pool poisoned by any means (e.g. an op that was valid when staged and
+    /// went stale) for the "poisoned pool must not stall production" guard.
+    #[cfg(test)]
+    pub(crate) fn inject_pending_gov_vote(&mut self, op: GovVote) {
+        self.pending_gov_votes.push(op);
+    }
+
+    /// Test-only: size of the governance-proposal dedup cache.
+    #[cfg(test)]
+    pub(crate) fn seen_gov_proposal_len(&self) -> usize {
+        self.seen_gov_proposal.len()
+    }
+
     /// The gossip a node emits to announce its current height (anti-entropy tick).
     pub fn announce(&self) -> Vec<(u64, GossipMsg)> {
         self.broadcast(
@@ -1393,6 +1834,9 @@ impl GossipNode {
             GossipMsg::Tx(tx) => self.on_tx(from, tx),
             GossipMsg::Evidence(ev) => self.on_evidence(from, ev),
             GossipMsg::StakeOp(op) => self.on_stake_op(from, op),
+            GossipMsg::KeyRotation(op) => self.on_key_rotation(from, op),
+            GossipMsg::GovProposal(op) => self.on_gov_proposal(from, *op),
+            GossipMsg::GovVote(op) => self.on_gov_vote(from, *op),
             // M22: a full node answers `GetHeaders` with its retained
             // cert-signed headers. If we receive `Headers(...)` directly
             // (e.g. from a peer that pushes), drop them — full nodes don't
@@ -1565,6 +2009,34 @@ impl GossipNode {
         self.broadcast(GossipMsg::StakeOp(op), Some(from))
     }
 
+    fn on_key_rotation(&mut self, from: u64, op: KeyRotation) -> Vec<(u64, GossipMsg)> {
+        if !self.seen_key_rotation.insert(op.hash()) {
+            return Vec::new(); // already flooded through us
+        }
+        // stage; signature / nonce / active-validator checks live in apply_key_rotation
+        self.pending_key_rotations.push(op.clone());
+        self.broadcast(GossipMsg::KeyRotation(op), Some(from))
+    }
+
+    /// M195: dedup + stage + re-flood a gossiped governance proposal. Admission (and
+    /// its ordering — validate before touching the dedup cache, capacity before the
+    /// dedup insert) lives in [`Self::admit_gov_proposal`], shared with local submit.
+    /// A rejected or duplicate op is silently dropped: neither staged nor re-flooded.
+    fn on_gov_proposal(&mut self, from: u64, op: GovProposal) -> Vec<(u64, GossipMsg)> {
+        if self.admit_gov_proposal(&op).is_err() {
+            return Vec::new();
+        }
+        self.broadcast(GossipMsg::GovProposal(Box::new(op)), Some(from))
+    }
+
+    /// M195: dedup + stage + re-flood a gossiped governance vote.
+    fn on_gov_vote(&mut self, from: u64, op: GovVote) -> Vec<(u64, GossipMsg)> {
+        if self.admit_gov_vote(&op).is_err() {
+            return Vec::new();
+        }
+        self.broadcast(GossipMsg::GovVote(Box::new(op)), Some(from))
+    }
+
     /// Address `msg` to every peer, optionally excluding one (the sender), in
     /// sorted order for deterministic output.
     fn broadcast(&self, msg: GossipMsg, except: Option<u64>) -> Vec<(u64, GossipMsg)> {
@@ -1634,6 +2106,38 @@ impl Network {
     /// Submit a locally-originated stake op at node `id` and flood it.
     pub fn submit_stake_op(&mut self, id: u64, op: StakeOp) {
         let out = self.nodes.get_mut(&id).unwrap().submit_local_stake_op(op);
+        self.enqueue(id, out);
+    }
+
+    /// M179: submit a locally-originated key-rotation op at node `id` and flood it.
+    pub fn submit_key_rotation(&mut self, id: u64, op: KeyRotation) {
+        let out = self
+            .nodes
+            .get_mut(&id)
+            .unwrap()
+            .submit_local_key_rotation(op);
+        self.enqueue(id, out);
+    }
+
+    /// M195: submit a governance proposal / vote at `id` and flood it. Panics if the
+    /// op is not admitted (test-bus helper; tests that exercise rejection call
+    /// `submit_local_gov_*` on the node directly).
+    pub fn submit_gov_proposal(&mut self, id: u64, op: GovProposal) {
+        let out = self
+            .nodes
+            .get_mut(&id)
+            .unwrap()
+            .submit_local_gov_proposal(op)
+            .expect("gov proposal admitted");
+        self.enqueue(id, out);
+    }
+    pub fn submit_gov_vote(&mut self, id: u64, op: GovVote) {
+        let out = self
+            .nodes
+            .get_mut(&id)
+            .unwrap()
+            .submit_local_gov_vote(op)
+            .expect("gov vote admitted");
         self.enqueue(id, out);
     }
 
@@ -2000,6 +2504,11 @@ impl LightGossipNode {
             | GossipMsg::Tx(_)
             | GossipMsg::Evidence(_)
             | GossipMsg::StakeOp(_)
+            // M179: key rotations are a full-node block concern; light clients ignore.
+            | GossipMsg::KeyRotation(_)
+            // M195: governance ops are a full-node block concern; light clients ignore.
+            | GossipMsg::GovProposal(_)
+            | GossipMsg::GovVote(_)
             // M33: consensus is an Actor concern; light clients never vote.
             | GossipMsg::Consensus(_)
             // M39: peer discovery is an Actor concern; the pure core does no I/O.
@@ -2237,6 +2746,18 @@ pub fn encode_gossip(m: &GossipMsg) -> Vec<u8> {
             out.push(TAG_STAKEOP);
             put_bytes(&mut out, &encode_stakeop(op));
         }
+        GossipMsg::KeyRotation(op) => {
+            out.push(TAG_KEYROTATION);
+            put_bytes(&mut out, &crate::codec::encode_key_rotation(op));
+        }
+        GossipMsg::GovProposal(op) => {
+            out.push(TAG_GOVPROPOSAL);
+            put_bytes(&mut out, &crate::codec::encode_gov_proposal(op));
+        }
+        GossipMsg::GovVote(op) => {
+            out.push(TAG_GOVVOTE);
+            put_bytes(&mut out, &crate::codec::encode_gov_vote(op));
+        }
         GossipMsg::GetHeaders { from } => {
             out.push(TAG_GETHEADERS);
             out.extend_from_slice(&from.to_be_bytes());
@@ -2374,7 +2895,7 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
             if n > MAX_BATCH as u64 {
                 return Err(CodecError::TooManyItems(n));
             }
-            let mut batch = Vec::with_capacity(n as usize);
+            let mut batch = Vec::with_capacity(crate::codec::prealloc_usize(n as usize));
             for _ in 0..n {
                 let block = decode_block(take_bytes(&mut rest)?)?;
                 let commit = decode_commit(take_bytes(&mut rest)?)?;
@@ -2385,6 +2906,15 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
         TAG_TX => GossipMsg::Tx(decode_tx(take_bytes(&mut rest)?)?),
         TAG_EVIDENCE => GossipMsg::Evidence(decode_evidence(take_bytes(&mut rest)?)?),
         TAG_STAKEOP => GossipMsg::StakeOp(decode_stakeop(take_bytes(&mut rest)?)?),
+        TAG_KEYROTATION => {
+            GossipMsg::KeyRotation(crate::codec::decode_key_rotation(take_bytes(&mut rest)?)?)
+        }
+        TAG_GOVPROPOSAL => GossipMsg::GovProposal(Box::new(crate::codec::decode_gov_proposal(
+            take_bytes(&mut rest)?,
+        )?)),
+        TAG_GOVVOTE => GossipMsg::GovVote(Box::new(crate::codec::decode_gov_vote(take_bytes(
+            &mut rest,
+        )?)?)),
         TAG_GETHEADERS => GossipMsg::GetHeaders {
             from: take_u64(&mut rest)?,
         },
@@ -2393,7 +2923,7 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
             if n > MAX_BATCH as u64 {
                 return Err(CodecError::TooManyItems(n));
             }
-            let mut batch = Vec::with_capacity(n as usize);
+            let mut batch = Vec::with_capacity(crate::codec::prealloc_usize(n as usize));
             for _ in 0..n {
                 batch.push(decode_certified_header(take_bytes(&mut rest)?)?);
             }
@@ -2405,7 +2935,7 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
             if n as usize > MAX_PROOF_BATCH {
                 return Err(CodecError::TooManyItems(n as u64));
             }
-            let mut items = Vec::with_capacity(n as usize);
+            let mut items = Vec::with_capacity(crate::codec::prealloc_usize(n as usize));
             for _ in 0..n {
                 let kind_byte = rest.first().copied().ok_or(CodecError::UnexpectedEof)?;
                 rest = &rest[1..];
@@ -2420,7 +2950,7 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
             if n as usize > MAX_PROOF_BATCH {
                 return Err(CodecError::TooManyItems(n as u64));
             }
-            let mut items = Vec::with_capacity(n as usize);
+            let mut items = Vec::with_capacity(crate::codec::prealloc_usize(n as usize));
             for _ in 0..n {
                 let present = rest.first().copied().ok_or(CodecError::UnexpectedEof)?;
                 rest = &rest[1..];
@@ -2461,7 +2991,7 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
             if n as usize > MAX_BATCH_ITEMS {
                 return Err(CodecError::TooManyItems(n as u64));
             }
-            let mut items = Vec::with_capacity(n as usize);
+            let mut items = Vec::with_capacity(crate::codec::prealloc_usize(n as usize));
             for _ in 0..n {
                 let kind = crate::codec::decode_batch_response_kind(
                     rest.first().copied().ok_or(CodecError::UnexpectedEof)?,
@@ -2515,7 +3045,7 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
             if n as usize > MAX_PEERS {
                 return Err(CodecError::TooManyItems(n as u64));
             }
-            let mut entries = Vec::with_capacity(n as usize);
+            let mut entries = Vec::with_capacity(crate::codec::prealloc_usize(n as usize));
             for _ in 0..n {
                 let id = take_u64(&mut rest)?;
                 let addr = String::from_utf8_lossy(take_bytes(&mut rest)?).into_owned();
@@ -2532,7 +3062,7 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
             if n > MAX_BATCH as u64 {
                 return Err(CodecError::TooManyItems(n));
             }
-            let mut batch = Vec::with_capacity(n as usize);
+            let mut batch = Vec::with_capacity(crate::codec::prealloc_usize(n as usize));
             for _ in 0..n {
                 let ch = decode_certified_header(take_bytes(&mut rest)?)?;
                 // M150: 1 presence byte, then the set when present.
@@ -2597,7 +3127,7 @@ pub fn encode_diff_envelope(env: &crate::light::DiffEnvelope) -> Vec<u8> {
 pub fn decode_diff_envelope(buf: &[u8]) -> Result<crate::light::DiffEnvelope, CodecError> {
     let mut p = buf;
     let n_added = take_u32(&mut p)? as usize;
-    let mut added = Vec::with_capacity(n_added);
+    let mut added = Vec::with_capacity(crate::codec::prealloc_usize(n_added));
     for _ in 0..n_added {
         let gn = crate::codec::decode_graph_node(take_bytes(&mut p)?)?;
         let proof = crate::codec::decode_proof(take_bytes(&mut p)?)?;
@@ -2609,7 +3139,7 @@ pub fn decode_diff_envelope(buf: &[u8]) -> Result<crate::light::DiffEnvelope, Co
         });
     }
     let n_dropped = take_u32(&mut p)? as usize;
-    let mut dropped = Vec::with_capacity(n_dropped);
+    let mut dropped = Vec::with_capacity(crate::codec::prealloc_usize(n_dropped));
     for _ in 0..n_dropped {
         let gn = crate::codec::decode_graph_node(take_bytes(&mut p)?)?;
         let proof = crate::codec::decode_proof(take_bytes(&mut p)?)?;
@@ -2769,7 +3299,7 @@ pub fn decode_batch_request(buf: &[u8]) -> Result<Vec<crate::light::BatchItem>, 
     if n > MAX_BATCH_ITEMS {
         return Err(CodecError::TooManyItems(n as u64));
     }
-    let mut items = Vec::with_capacity(n);
+    let mut items = Vec::with_capacity(crate::codec::prealloc_usize(n));
     for _ in 0..n {
         let kind = crate::codec::decode_batch_response_kind(
             rest.first().copied().ok_or(CodecError::UnexpectedEof)?,
@@ -2855,7 +3385,7 @@ pub fn decode_batch_envelope(
     if n > MAX_BATCH_ITEMS {
         return Err(CodecError::TooManyItems(n as u64));
     }
-    let mut items = Vec::with_capacity(n);
+    let mut items = Vec::with_capacity(crate::codec::prealloc_usize(n));
     for _ in 0..n {
         let kind = crate::codec::decode_batch_response_kind(
             p.first().copied().ok_or(CodecError::UnexpectedEof)?,
@@ -2927,7 +3457,7 @@ fn encode_validator_set(out: &mut Vec<u8>, vs: &crate::validator::ValidatorSet) 
 
 fn decode_validator_set(p: &mut &[u8]) -> Result<crate::validator::ValidatorSet, CodecError> {
     let n = take_u32(p)? as usize;
-    let mut vs = Vec::with_capacity(n);
+    let mut vs = Vec::with_capacity(crate::codec::prealloc_usize(n));
     for _ in 0..n {
         vs.push(crate::codec::decode_validator(take_bytes(p)?)?);
     }
@@ -2956,7 +3486,7 @@ pub fn encode_knn_claim(c: &crate::light::KnnClaim) -> Vec<u8> {
 pub fn decode_knn_claim(buf: &[u8]) -> Result<crate::light::KnnClaim, CodecError> {
     let mut p = buf;
     let n = take_u32(&mut p)? as usize;
-    let mut neighbours = Vec::with_capacity(n);
+    let mut neighbours = Vec::with_capacity(crate::codec::prealloc_usize(n));
     for _ in 0..n {
         let gn = crate::codec::decode_graph_node(take_bytes(&mut p)?)?;
         let proof = crate::codec::decode_proof(take_bytes(&mut p)?)?;
@@ -2995,7 +3525,7 @@ pub fn encode_range_claim(c: &crate::light::RangeClaim) -> Vec<u8> {
 pub fn decode_range_claim(buf: &[u8]) -> Result<crate::light::RangeClaim, CodecError> {
     let mut p = buf;
     let n = take_u32(&mut p)? as usize;
-    let mut nodes = Vec::with_capacity(n);
+    let mut nodes = Vec::with_capacity(crate::codec::prealloc_usize(n));
     for _ in 0..n {
         let gn = crate::codec::decode_graph_node(take_bytes(&mut p)?)?;
         let proof = crate::codec::decode_proof(take_bytes(&mut p)?)?;
@@ -3107,6 +3637,7 @@ mod tests {
             seed_nodes: vec![(unit(0), 0)],
             params: DeltaKParams::default(),
             base_emission_micro: 8 * MICRO,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: [21u64, 22, 23, 24]
@@ -3290,6 +3821,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn gov_op_gossip_wire_round_trips() {
+        // M195: GovProposal / GovVote survive encode_gossip → decode_gossip.
+        let prop = crate::GovProposal {
+            proposer: 3,
+            param: crate::GovParam::DecayHalfLife(7),
+            voting_period: 20,
+            nonce: 2,
+            signature: [5u8; 64],
+        };
+        let bytes = encode_gossip(&GossipMsg::GovProposal(Box::new(prop.clone())));
+        match decode_gossip(&bytes) {
+            Ok(GossipMsg::GovProposal(back)) => assert_eq!(*back, prop),
+            other => panic!("expected GovProposal, got {other:?}"),
+        }
+        let vote = crate::GovVote {
+            proposal_id: 9,
+            voter: 4,
+            approve: false,
+            nonce: 0,
+            signature: [6u8; 64],
+        };
+        let vb = encode_gossip(&GossipMsg::GovVote(Box::new(vote.clone())));
+        match decode_gossip(&vb) {
+            Ok(GossipMsg::GovVote(back)) => assert_eq!(*back, vote),
+            other => panic!("expected GovVote, got {other:?}"),
+        }
+    }
+
     /// Build a real cert-signed `LockEnvelope` for round-trip testing. We
     /// spin up a single-validator chain, stage one lock, and serve it via
     /// `GossipNode::serve_lock` — same shape as the production path, just
@@ -3309,6 +3869,7 @@ mod tests {
             seed_nodes: vec![],
             params: DeltaKParams::default(),
             base_emission_micro: 0,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
@@ -3358,6 +3919,7 @@ mod tests {
             seed_nodes: vec![],
             params: DeltaKParams::default(),
             base_emission_micro: 0,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
@@ -3490,6 +4052,69 @@ mod tests {
         let out = fresh.on_message(1, GossipMsg::Blocks(batch));
         assert!(out.is_empty());
         assert_eq!(fresh.height(), 1);
+    }
+
+    #[test]
+    fn liveness_tracker_counts_missed_and_evicts() {
+        // M212: the per-node liveness window counts, per validator, how many remembered
+        // heights it did NOT sign, and evicts past LIVENESS_WINDOW.
+        let mut lt = LivenessTracker::default();
+        assert_eq!(lt.samples(), 0);
+        lt.record(BTreeSet::from([21, 22, 23])); // 24 absent
+        lt.record(BTreeSet::from([21, 22, 23, 24])); // all present
+        lt.record(BTreeSet::from([21, 22])); // 23, 24 absent
+        assert_eq!(lt.samples(), 3);
+        assert_eq!(lt.missed(21), 0);
+        assert_eq!(lt.missed(23), 1);
+        assert_eq!(lt.missed(24), 2);
+        // a validator never seen misses every remembered height
+        assert_eq!(lt.missed(99), 3);
+        // the window evicts oldest past the cap
+        for _ in 0..LIVENESS_WINDOW {
+            lt.record(BTreeSet::from([21]));
+        }
+        assert_eq!(lt.samples(), LIVENESS_WINDOW);
+    }
+
+    #[test]
+    fn liveness_report_tracks_an_absent_validator_from_cert_view() {
+        // M212: end-to-end — applying certified blocks feeds the liveness window, and
+        // `liveness_report` reflects exactly who signed each height's cert (this node's
+        // view). With a 4-validator set every cert carries quorum (3), so one validator
+        // is absent each height; the report must count those absences. Pure local
+        // observability — not consensus state.
+        let (blocks, certs) = certified_chain(2);
+        assert!(certs.len() >= 2);
+        let signers: Vec<BTreeSet<u64>> = certs[..2]
+            .iter()
+            .map(|c| c.precommits.iter().map(|v| v.validator).collect())
+            .collect();
+        assert!(
+            signers.iter().all(|s| s.len() >= 3),
+            "each cert clears quorum"
+        );
+
+        let mut node = GossipNode::new(2, genesis(), 8, [1]);
+        assert!(node.apply_certified(blocks[0].clone(), certs[0].clone()));
+        assert!(node.apply_certified(blocks[1].clone(), certs[1].clone()));
+
+        let (samples, missed) = node.liveness_report();
+        assert_eq!(samples, 2, "two committed heights remembered");
+        // report covers exactly the current validator set, sorted by id
+        assert_eq!(
+            missed.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+            vec![21, 22, 23, 24]
+        );
+        // each validator's missed count == the heights whose cert it was absent from
+        for &(id, m) in &missed {
+            let expected = signers.iter().filter(|s| !s.contains(&id)).count();
+            assert_eq!(m, expected, "validator {id} missed count");
+        }
+        // quorum < full set, so at least one validator shows an observed miss
+        assert!(
+            missed.iter().any(|&(_, m)| m > 0),
+            "an absent validator is visible"
+        );
     }
 
     #[test]
@@ -3803,6 +4428,540 @@ mod tests {
             assert_eq!(pending.len(), 1, "node {id} staged one stake op");
             assert_eq!(pending[0].hash(), h);
         }
+    }
+
+    #[test]
+    fn key_rotation_gossip_reaches_every_node_and_dedups() {
+        // M179: a locally-submitted key rotation floods to every node's pending
+        // pool (one copy each), and a duplicate does not re-flood.
+        let ids = [1u64, 2, 3];
+        let nodes: Vec<GossipNode> = ids
+            .iter()
+            .map(|&id| GossipNode::new(id, genesis(), 16, ids.iter().copied()))
+            .collect();
+        let mut net = Network::new(nodes);
+
+        let op = KeyRotation {
+            account: 1,
+            new_pubkey: kp(99).public(),
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let h = op.hash();
+        net.submit_key_rotation(1, op.clone());
+        net.run();
+        for id in ids {
+            let pending = net.node(id).pending_key_rotations();
+            assert_eq!(pending.len(), 1, "node {id} staged one rotation");
+            assert_eq!(pending[0].hash(), h);
+        }
+
+        // A re-flood from a peer (receive path) is deduped: node 2 already saw
+        // this rotation, so re-delivering it stages nothing new and emits nothing.
+        let out = net
+            .node_mut(2)
+            .on_message(1, GossipMsg::KeyRotation(op.clone()));
+        assert!(out.is_empty(), "a seen rotation is not re-flooded");
+        assert_eq!(
+            net.node(2).pending_key_rotations().len(),
+            1,
+            "node 2 did not re-stage the duplicate rotation"
+        );
+    }
+
+    #[test]
+    fn gov_op_gossip_reaches_every_node_and_dedups() {
+        // M195/SEC-01: an admissible proposal floods to every node's pending pool (one
+        // copy each) and a duplicate does not re-flood. (Votes require a *committed*
+        // proposal to be admissible — see `gov_gossip_rejects_inadmissible_ops` — so
+        // the flood/dedup mechanic is exercised here with two distinct proposals.)
+        let ids = [1u64, 2, 3];
+        let nodes: Vec<GossipNode> = ids
+            .iter()
+            .map(|&id| GossipNode::new(id, genesis(), 16, ids.iter().copied()))
+            .collect();
+        let mut net = Network::new(nodes);
+
+        let p1 = crate::GovProposal {
+            proposer: 1,
+            param: crate::GovParam::BaseEmission(42),
+            voting_period: 10,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let p2 = crate::GovProposal {
+            proposer: 2,
+            param: crate::GovParam::SlashBps(5000),
+            voting_period: 10,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(2));
+        let h1 = p1.hash();
+        let h2 = p2.hash();
+        net.submit_gov_proposal(1, p1.clone());
+        net.submit_gov_proposal(2, p2.clone());
+        net.run();
+        for id in ids {
+            let pending = net.node(id).pending_gov_proposals();
+            assert_eq!(pending.len(), 2, "node {id} has both proposals");
+            let hashes: std::collections::HashSet<_> = pending.iter().map(|p| p.hash()).collect();
+            assert!(
+                hashes.contains(&h1) && hashes.contains(&h2),
+                "node {id} both"
+            );
+        }
+
+        // Re-delivering a seen proposal stages nothing and emits nothing.
+        let out = net
+            .node_mut(2)
+            .on_message(1, GossipMsg::GovProposal(Box::new(p1)));
+        assert!(out.is_empty(), "a seen proposal is not re-flooded");
+        assert_eq!(net.node(2).pending_gov_proposals().len(), 2);
+    }
+
+    #[test]
+    fn gov_gossip_rejects_inadmissible_ops() {
+        // SEC-01: invalid governance gossip is neither staged nor re-flooded, so a
+        // poisoned op can't pollute the candidate pool or amplify across the mesh.
+        let ids = [1u64, 2];
+        let nodes: Vec<GossipNode> = ids
+            .iter()
+            .map(|&id| GossipNode::new(id, genesis(), 16, ids.iter().copied()))
+            .collect();
+        let mut net = Network::new(nodes);
+
+        // Bad signature (kp(2) signing account 1's proposal).
+        let bad_sig = crate::GovProposal {
+            proposer: 1,
+            param: crate::GovParam::BaseEmission(42),
+            voting_period: 10,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(2));
+        let out = net
+            .node_mut(2)
+            .on_message(1, GossipMsg::GovProposal(Box::new(bad_sig)));
+        assert!(out.is_empty(), "bad-sig proposal not re-flooded");
+        assert_eq!(net.node(2).pending_gov_proposals().len(), 0, "not staged");
+
+        // Out-of-range param (slash_bps > 10000).
+        let bad_param = crate::GovProposal {
+            proposer: 1,
+            param: crate::GovParam::SlashBps(20_000),
+            voting_period: 10,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        net.node_mut(2)
+            .on_message(1, GossipMsg::GovProposal(Box::new(bad_param)));
+        assert_eq!(
+            net.node(2).pending_gov_proposals().len(),
+            0,
+            "out-of-range not staged"
+        );
+
+        // Vote for a nonexistent proposal (a real vote's id is only known post-commit).
+        let orphan_vote = crate::GovVote {
+            proposal_id: 999,
+            voter: 1,
+            approve: true,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        net.node_mut(2)
+            .on_message(1, GossipMsg::GovVote(Box::new(orphan_vote)));
+        assert_eq!(
+            net.node(2).pending_gov_votes().len(),
+            0,
+            "orphan vote not staged"
+        );
+    }
+
+    #[test]
+    fn poisoned_gov_pool_does_not_stall_candidate_production() {
+        // SEC-01 core: even if a stale/invalid gov op is in the pending pool (injected
+        // here via the test-only hook — modelling an op that was valid when admitted
+        // and went stale after), build_candidate must still produce a sealable block —
+        // the invalid op is filtered out, not allowed to stall.
+        let mut node = GossipNode::new(1, genesis(), 16, [1]);
+        let bogus = crate::GovVote {
+            proposal_id: 999, // no such committed proposal
+            voter: 1,
+            approve: true,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        node.inject_pending_gov_vote(bogus);
+        assert_eq!(node.pending_gov_votes().len(), 1, "op is in the pool");
+        let cand = node.build_candidate(1.0);
+        assert!(cand.is_some(), "poisoned pool must not stall production");
+        assert!(
+            cand.unwrap().gov_votes.is_empty(),
+            "the stale vote is filtered out of the candidate"
+        );
+    }
+
+    #[test]
+    fn bounded_seen_set_evicts_oldest() {
+        // SEC-01 (re-verify): the governance dedup caches use `SeenSet::bounded` so they
+        // are capped by default (not `usize::MAX`), independent of `[mempool] seen_cache`.
+        let mut s = SeenSet::bounded(2);
+        assert!(s.insert([1u8; 32]));
+        assert!(s.insert([2u8; 32]));
+        assert!(s.insert([3u8; 32])); // evicts [1]
+        assert_eq!(s.len(), 2);
+        assert!(s.insert([1u8; 32]), "[1] was evicted, so it is new again");
+    }
+
+    /// A proposal from `proposer` at `nonce`; `period` varies the content hash.
+    fn gov_prop(proposer: u64, nonce: u64, period: u64) -> crate::GovProposal {
+        crate::GovProposal {
+            proposer,
+            param: crate::GovParam::BaseEmission(1),
+            voting_period: period,
+            nonce,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(proposer))
+    }
+
+    /// `genesis()` with accounts `1..=n` (enough distinct accounts to fill a pool
+    /// under the per-account quota).
+    fn genesis_with_accounts(n: u64) -> Genesis {
+        let mut g = genesis();
+        g.accounts = (1..=n)
+            .map(|id| (id, 30 * MICRO, kp(id).public()))
+            .collect();
+        g
+    }
+
+    #[test]
+    fn gov_pending_pool_cap_holds_on_local_and_full_pool_does_not_grow_dedup() {
+        // SEC-01 (round 3): the pending pool is hard-capped on BOTH the local-submit and
+        // gossip paths; a full pool is a structured `GovPoolFull` (not a silent drop or a
+        // misleading success) and does not consume a dedup slot. Reaching the cap needs
+        // MAX_PENDING_GOV / MAX_PENDING_GOV_PER_ACCOUNT distinct accounts, each staging
+        // its full quota of future-nonce (within-window) ops.
+        let fillers = (MAX_PENDING_GOV / MAX_PENDING_GOV_PER_ACCOUNT) as u64;
+        let mut node = GossipNode::new(1, genesis_with_accounts(fillers + 2), 16, [1]);
+        for acct in 1..=fillers {
+            for i in 0..MAX_PENDING_GOV_PER_ACCOUNT as u64 {
+                // nonces 1..=8 (ahead of the current 0, inside the window), two periods
+                let op = gov_prop(acct, 1 + i % crate::GOV_NONCE_LOOKAHEAD, 100 + i);
+                node.submit_local_gov_proposal(op).expect("within caps");
+            }
+        }
+        assert_eq!(node.pending_gov_proposals().len(), MAX_PENDING_GOV);
+        let seen_full = node.seen_gov_proposal_len();
+
+        // Local submit of a FUTURE-nonce op from an untouched account: explicitly
+        // refused as PoolFull (never silently dropped), pool and seen unchanged. (A
+        // current-nonce op would instead evict a parked one — see
+        // `current_nonce_gov_op_evicts_parked_future_op_when_pool_full`.)
+        let r = node.submit_local_gov_proposal(gov_prop(fillers + 1, 1, 100));
+        assert!(matches!(r, Err(ChainError::GovPoolFull)), "got {r:?}");
+        assert_eq!(node.pending_gov_proposals().len(), MAX_PENDING_GOV);
+        assert_eq!(
+            node.seen_gov_proposal_len(),
+            seen_full,
+            "no seen slot consumed"
+        );
+
+        // Gossip ingress of a NEW valid future-nonce op when the pool is full: dropped,
+        // not re-flooded, and (capacity check precedes the dedup insert) the seen cache
+        // does not grow.
+        let gossiped = gov_prop(fillers + 2, 1, 100);
+        let out = node.on_message(1, GossipMsg::GovProposal(Box::new(gossiped)));
+        assert!(out.is_empty(), "full pool drops gossiped op");
+        assert_eq!(node.pending_gov_proposals().len(), MAX_PENDING_GOV);
+        assert_eq!(
+            node.seen_gov_proposal_len(),
+            seen_full,
+            "no seen slot consumed"
+        );
+    }
+
+    #[test]
+    fn gov_admission_bounds_nonce_window_and_per_account_quota() {
+        // SEC-01 (round 3): one account can neither park ops arbitrarily far ahead
+        // (nonce window) nor hold more than its quota of pool slots; both are structured
+        // rejections, and another account's current-nonce op is still admitted.
+        let mut node = GossipNode::new(1, genesis(), 16, [1]);
+        // Inside the window: nonces 0..=GOV_NONCE_LOOKAHEAD are all admitted.
+        for n in 0..=crate::GOV_NONCE_LOOKAHEAD {
+            node.submit_local_gov_proposal(gov_prop(1, n, 100))
+                .expect("inside the nonce window");
+        }
+        // One past the window → NonceTooFarAhead, not staged.
+        let r = node.submit_local_gov_proposal(gov_prop(1, crate::GOV_NONCE_LOOKAHEAD + 1, 100));
+        assert!(
+            matches!(r, Err(ChainError::NonceTooFarAhead { account: 1, .. })),
+            "got {r:?}"
+        );
+        // Re-submitting a staged op → GovAlreadySeen, not staged twice.
+        let r = node.submit_local_gov_proposal(gov_prop(1, 0, 100));
+        assert!(matches!(r, Err(ChainError::GovAlreadySeen)), "got {r:?}");
+        // Fill the rest of account 1's quota with distinct hashes at the current nonce.
+        let mut period = 101;
+        while node.pending_gov_proposals().len() < MAX_PENDING_GOV_PER_ACCOUNT {
+            node.submit_local_gov_proposal(gov_prop(1, 0, period))
+                .expect("inside the quota");
+            period += 1;
+        }
+        let r = node.submit_local_gov_proposal(gov_prop(1, 1, 999));
+        assert!(
+            matches!(
+                r,
+                Err(ChainError::GovAccountQuotaExceeded {
+                    account: 1,
+                    limit: MAX_PENDING_GOV_PER_ACCOUNT
+                })
+            ),
+            "got {r:?}"
+        );
+        let seen_before = node.seen_gov_proposal_len();
+        // Account 1 at quota does not crowd out account 2's current-nonce op.
+        node.submit_local_gov_proposal(gov_prop(2, 0, 100))
+            .expect("another account is still admitted");
+        assert_eq!(node.seen_gov_proposal_len(), seen_before + 1);
+        // Gossip ingress of an over-quota op: dropped without consuming a seen slot.
+        let out = node.on_message(1, GossipMsg::GovProposal(Box::new(gov_prop(1, 2, 5000))));
+        assert!(out.is_empty());
+        assert_eq!(node.seen_gov_proposal_len(), seen_before + 1);
+        assert_eq!(
+            node.pending_gov_proposals().len(),
+            MAX_PENDING_GOV_PER_ACCOUNT + 1
+        );
+    }
+
+    #[test]
+    fn stale_gov_ops_are_pruned_on_commit() {
+        // SEC-01 (round 3): a staged op whose nonce was consumed by a *different* op in
+        // a committed block, or a vote whose proposal has closed, can never apply — so
+        // apply_certified prunes it instead of letting it hold a pool slot indefinitely.
+        let ids = [1u64, 2, 3, 21, 22, 23, 24];
+        let seeds: BTreeMap<u64, [u8; 32]> = ids.iter().map(|&id| (id, seed(id))).collect();
+        let mut driver = ChainDriver::new(genesis(), seeds, 4);
+        let mut node = GossipNode::new(1, genesis(), 16, [1]);
+
+        // The node stages account 1's nonce-0 proposal; the network commits a DIFFERENT
+        // nonce-0 proposal from account 1 (short voting window for the vote half below).
+        node.submit_local_gov_proposal(gov_prop(1, 0, 100))
+            .expect("admitted");
+        driver.stage_gov_proposal(gov_prop(1, 0, 2));
+        driver.produce(1.0, &BTreeSet::new()).unwrap();
+        let (b1, c1) = (driver.blocks()[0].clone(), driver.certificates()[0].clone());
+        assert!(node.apply_certified(b1, c1));
+        assert!(
+            node.pending_gov_proposals().is_empty(),
+            "nonce-0 proposal is stale once account 1's nonce advanced"
+        );
+        // ...and the same nonce is now refused at admission as stale.
+        let r = node.submit_local_gov_proposal(gov_prop(1, 0, 7));
+        assert!(
+            matches!(
+                r,
+                Err(ChainError::BadNonce {
+                    account: 1,
+                    expected: 1,
+                    got: 0
+                })
+            ),
+            "got {r:?}"
+        );
+
+        // Vote half: the committed proposal (period 2, registered at h=1) is open for
+        // h=2, so a vote is admitted now — and pruned once h=2 commits (closed at h=3).
+        let pid = *node
+            .chain
+            .state
+            .proposals
+            .keys()
+            .next()
+            .expect("proposal registered");
+        let vote = crate::GovVote {
+            proposal_id: pid,
+            voter: 2,
+            approve: true,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(2));
+        node.submit_local_gov_vote(vote)
+            .expect("proposal still open");
+        assert_eq!(node.pending_gov_votes().len(), 1);
+        // h=2 needs content for the driver to emit a block: account 1's next proposal.
+        driver.stage_gov_proposal(gov_prop(1, 1, 50));
+        driver.produce(2.0, &BTreeSet::new()).unwrap();
+        let (b2, c2) = (driver.blocks()[1].clone(), driver.certificates()[1].clone());
+        assert!(node.apply_certified(b2, c2));
+        assert!(
+            node.pending_gov_votes().is_empty(),
+            "vote on a closed proposal is pruned"
+        );
+    }
+
+    #[test]
+    fn current_nonce_gov_op_evicts_parked_future_op_when_pool_full() {
+        // SEC-01 (round 5): many accounts parking within-window future-nonce ops can
+        // fill the pool, and empty blocks never advance their nonces — so a full pool
+        // must not starve immediately-applicable (current-nonce) ops. A current-nonce
+        // op evicts the furthest-future parked op (globally, or its own at quota); the
+        // evicted op's hash is forgotten so its owner can resubmit; a future-nonce op
+        // still gets the hard `GovPoolFull`.
+        let fillers = (MAX_PENDING_GOV / MAX_PENDING_GOV_PER_ACCOUNT) as u64;
+        let mut node = GossipNode::new(1, genesis_with_accounts(fillers + 1), 16, [1]);
+        for acct in 1..=fillers {
+            for i in 0..MAX_PENDING_GOV_PER_ACCOUNT as u64 {
+                let op = gov_prop(acct, 1 + i % crate::GOV_NONCE_LOOKAHEAD, 100 + i);
+                node.submit_local_gov_proposal(op).expect("within caps");
+            }
+        }
+        assert_eq!(node.pending_gov_proposals().len(), MAX_PENDING_GOV);
+        // Number of furthest-future (nonce 8) parked ops: two per filler account.
+        let far = |node: &GossipNode| {
+            node.pending_gov_proposals()
+                .iter()
+                .filter(|p| p.nonce == crate::GOV_NONCE_LOOKAHEAD)
+                .count()
+        };
+        assert_eq!(far(&node), fillers as usize * 2);
+
+        // (a) An untouched account's current-nonce op is admitted into the full pool by
+        // evicting exactly one parked op — a furthest-future one; the pool stays at cap.
+        let cur = gov_prop(fillers + 1, 0, 100);
+        node.submit_local_gov_proposal(cur.clone())
+            .expect("current nonce takes priority over parked future ops");
+        let pool = node.pending_gov_proposals();
+        assert_eq!(pool.len(), MAX_PENDING_GOV, "still at the hard cap");
+        assert!(pool.iter().any(|p| p.hash() == cur.hash()), "staged");
+        assert_eq!(
+            far(&node),
+            fillers as usize * 2 - 1,
+            "the victim was a furthest-future (nonce 8) op"
+        );
+        // Ties go to the oldest: account 1's first nonce-8 op (period 107). Resubmitting
+        // it is refused by the (still full) pool cap — NOT as `GovAlreadySeen`, proving
+        // eviction forgot its hash so the owner can resubmit once there is room.
+        let r = node.submit_local_gov_proposal(gov_prop(1, 8, 107));
+        assert!(matches!(r, Err(ChainError::GovPoolFull)), "got {r:?}");
+
+        // (b) A FUTURE-nonce op from an account with spare quota still hits the hard
+        // cap: priority is only for immediately-applicable ops.
+        let r = node.submit_local_gov_proposal(gov_prop(fillers + 1, 1, 100));
+        assert!(matches!(r, Err(ChainError::GovPoolFull)), "got {r:?}");
+
+        // (c) Per-account path, pool NOT full: account 1 parks its whole quota (two ops
+        // at nonce 8); its current-nonce op evicts its own furthest-future op, oldest on
+        // ties, and the quota count is unchanged.
+        let mut node = GossipNode::new(1, genesis(), 16, [1]);
+        for i in 0..MAX_PENDING_GOV_PER_ACCOUNT as u64 {
+            node.submit_local_gov_proposal(gov_prop(
+                1,
+                1 + i % crate::GOV_NONCE_LOOKAHEAD,
+                100 + i,
+            ))
+            .expect("within quota");
+        }
+        assert_eq!(far(&node), 2);
+        node.submit_local_gov_proposal(gov_prop(1, 0, 777))
+            .expect("current nonce evicts this account's furthest parked op");
+        let mine: Vec<_> = node
+            .pending_gov_proposals()
+            .iter()
+            .filter(|p| p.proposer == 1)
+            .collect();
+        assert_eq!(mine.len(), MAX_PENDING_GOV_PER_ACCOUNT, "quota unchanged");
+        assert!(mine.iter().any(|p| p.nonce == 0), "current-nonce op staged");
+        assert_eq!(far(&node), 1, "one nonce-8 op evicted");
+        // The victim (older nonce-8 op, period 107) is refused by quota on resubmit —
+        // not `GovAlreadySeen`.
+        let r = node.submit_local_gov_proposal(gov_prop(1, 8, 107));
+        assert!(
+            matches!(
+                r,
+                Err(ChainError::GovAccountQuotaExceeded { account: 1, .. })
+            ),
+            "got {r:?}"
+        );
+
+        // (d) With nothing parked (a pool of only current-nonce ops) the hard cap holds
+        // even for a current-nonce op — eviction never drops an applicable op.
+        let mut node = GossipNode::new(1, genesis_with_accounts(fillers + 1), 16, [1]);
+        for acct in 1..=fillers {
+            for i in 0..MAX_PENDING_GOV_PER_ACCOUNT as u64 {
+                node.submit_local_gov_proposal(gov_prop(acct, 0, 100 + i))
+                    .expect("within caps");
+            }
+        }
+        let r = node.submit_local_gov_proposal(gov_prop(fillers + 1, 0, 100));
+        assert!(matches!(r, Err(ChainError::GovPoolFull)), "got {r:?}");
+        assert_eq!(node.pending_gov_proposals().len(), MAX_PENDING_GOV);
+    }
+
+    #[test]
+    fn key_rotation_purges_pending_gov_ops_signed_by_old_key() {
+        // SEC-01 (round 5): after a committed key rotation, the account's parked ops
+        // signed by the OLD key are still inside the nonce window (rotation consumed
+        // just one nonce) but can never verify at apply — they must not keep holding
+        // the account's quota. Other accounts' ops are untouched.
+        let ids = [1u64, 2, 3, 21, 22, 23, 24];
+        let seeds: BTreeMap<u64, [u8; 32]> = ids.iter().map(|&id| (id, seed(id))).collect();
+        let mut driver = ChainDriver::new(genesis(), seeds, 4);
+        let mut node = GossipNode::new(1, genesis(), 16, [1]);
+
+        for n in 1..=3 {
+            node.submit_local_gov_proposal(gov_prop(1, n, 100))
+                .expect("inside the window");
+        }
+        node.submit_local_gov_proposal(gov_prop(2, 1, 100))
+            .expect("control op from another account");
+        assert_eq!(node.pending_gov_proposals().len(), 4);
+
+        // The network commits account 1's rotation to kp(99) at nonce 0.
+        let rot = KeyRotation {
+            account: 1,
+            new_pubkey: kp(99).public(),
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        driver.stage_key_rotation(rot);
+        driver.produce(1.0, &BTreeSet::new()).unwrap();
+        let (b1, c1) = (driver.blocks()[0].clone(), driver.certificates()[0].clone());
+        assert!(node.apply_certified(b1, c1));
+        assert_eq!(
+            node.chain.state.accounts.get(&1).map(|a| a.nonce),
+            Some(1),
+            "rotation consumed nonce 0, so nonces 1..=3 are still inside the window"
+        );
+        let pool = node.pending_gov_proposals();
+        assert!(
+            pool.iter().all(|p| p.proposer != 1),
+            "old-key ops purged despite being inside the nonce window"
+        );
+        assert_eq!(pool.len(), 1, "account 2's op survives");
+
+        // Old key at the new current nonce → BadSignature; new key → admitted.
+        let r = node.submit_local_gov_proposal(gov_prop(1, 1, 100));
+        assert!(matches!(r, Err(ChainError::BadSignature(1))), "got {r:?}");
+        let fresh = crate::GovProposal {
+            proposer: 1,
+            param: crate::GovParam::BaseEmission(1),
+            voting_period: 100,
+            nonce: 1,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(99));
+        node.submit_local_gov_proposal(fresh)
+            .expect("op signed by the rotated-in key is admitted");
     }
 
     /// End-to-end: gossip an evidence through the network to a node, drain
@@ -4326,30 +5485,34 @@ mod tests {
 
     #[test]
     fn header_gossip_shrinks_the_wire_payload_vs_full_blocks() {
-        // The whole point of M22: a header-only gossip batch is smaller than a
-        // block batch because bodies (txs, stake ops, evidence) are not carried.
+        // The whole point of M22: a header-only gossip item omits the bodies
+        // (txs, stake ops, evidence, …), so for a block that actually carries a
+        // body it is smaller than shipping the full block + cert. M179 (B4 wire)
+        // grew the header by one 32-byte body commitment (eight total = 256 B of
+        // commitments), so the saving only materializes once a block's raw body
+        // exceeds that commitment overhead — which it does for any real block.
+        // We therefore assert the invariant on the single block that carries the
+        // transactions (3 txs ≈ 600 B of body ≫ 256 B of commitments), rather
+        // than summing over a chain padded with empty heartbeat blocks whose
+        // commitments would dominate their (empty) bodies.
         let (blocks, certs) = certified_chain(3);
-        let full_batch: Vec<(Block, Commit)> =
-            blocks.iter().cloned().zip(certs.iter().cloned()).collect();
-        let header_batch: Vec<CertifiedHeader> = blocks
-            .iter()
-            .zip(certs.iter())
-            .map(|(b, c)| CertifiedHeader::from_certified(b, c))
-            .collect();
+        // Put three real txs into one block so the body unambiguously exceeds the
+        // 8×32 B of header commitments (one tx ≈ 200 B, so three ≈ 600 B ≫ 256 B).
+        // The mempool spreads txs across blocks, so we stuff one block directly;
+        // the cert is identical on both sides of the inequality and cancels out,
+        // so any cert works for a pure size comparison.
+        let mut b = blocks[0].clone();
+        b.txs = vec![tx(1, 1, 1), tx(2, 2, 2), tx(3, 3, 3)];
+        let c = &certs[0];
 
-        let full_bytes: usize = full_batch
-            .iter()
-            .map(|(b, c)| encode_block(b).len() + encode_commit(c).len())
-            .sum();
-        let header_bytes: usize = header_batch
-            .iter()
-            .map(|ch| encode_certified_header(ch).len())
-            .sum();
+        let full_bytes = encode_block(&b).len() + encode_commit(c).len();
+        let header_bytes = encode_certified_header(&CertifiedHeader::from_certified(&b, c)).len();
 
         assert!(
             header_bytes < full_bytes,
-            "header-only payload ({header_bytes} B) must be strictly smaller than full-block payload ({full_bytes} B) — \
-             bodies were never carried over the wire"
+            "header-only item ({header_bytes} B) must be strictly smaller than the full \
+             block+cert ({full_bytes} B) for a block with a body — bodies are never carried \
+             in header gossip"
         );
     }
 
@@ -4562,6 +5725,7 @@ mod tests {
         let header = crate::codec::BlockHeader::from_block(last_block);
         let account_root = &full.chain.state.merkle_root();
         let validator_root = &full.chain.state.validators.merkle_root();
+        let contributions_root = &full.chain.state.contributions_merkle_root();
 
         for (i, e) in entries.iter().enumerate() {
             let entry = e
@@ -4573,6 +5737,7 @@ mod tests {
                 | crate::light::ProofEntry::Reviewer { .. }
                 | crate::light::ProofEntry::GraphNode { .. } => account_root,
                 crate::light::ProofEntry::Validator { .. } => validator_root,
+                crate::light::ProofEntry::Cnft { .. } => contributions_root,
             };
             assert!(
                 crate::merkle::verify(root, &leaf, entry.proof()),
@@ -4585,6 +5750,7 @@ mod tests {
                 | crate::light::ProofEntry::Reviewer { .. }
                 | crate::light::ProofEntry::GraphNode { .. } => &header.accounts_root,
                 crate::light::ProofEntry::Validator { .. } => &header.next_validators_root,
+                crate::light::ProofEntry::Cnft { .. } => &header.contributions_root,
             };
             assert_eq!(root, header_root, "entry {i}: local root vs header root");
         }
@@ -4902,6 +6068,72 @@ mod tests {
         }
     }
 
+    /// M186: a full node serves a `ProofEntry::Cnft` in response to a `GetProof`
+    /// for `ProofKind::Cnft` — the serve-side path behind `GET /cnft/{id}/proof`.
+    /// The entry verifies against the chain's `contributions_root` (M185), which
+    /// the cert-signed header commits to.
+    #[test]
+    fn full_node_serves_a_cnft_proof_in_response_to_get_proof() {
+        let (blocks, certs) = certified_chain(2);
+        let mut full = GossipNode::new(1, genesis(), 8, [1]);
+        full.load_certified(&blocks, &certs);
+
+        // The two accepted submissions in `certified_chain(2)` each mint a cNFT.
+        assert!(
+            !full.chain.state.contributions.is_empty(),
+            "accepted submissions must mint cNFTs"
+        );
+        let (node_id, expected_cnft) = {
+            let (id, c) = full.chain.state.contributions.iter().next().unwrap();
+            (*id, c.clone())
+        };
+
+        let request = GossipMsg::GetProof {
+            items: vec![(crate::light::ProofKind::Cnft, node_id)],
+        };
+        let mut out = full.on_message(99, request);
+        let (_dst, msg) = out.pop().unwrap();
+        let entries = match msg {
+            GossipMsg::Proof { items } => items,
+            other => panic!("expected Proof, got {other:?}"),
+        };
+        assert_eq!(entries.len(), 1);
+        let entry = entries[0].as_ref().expect("cNFT proof must be Some");
+        match entry {
+            crate::light::ProofEntry::Cnft {
+                node_id: nid, cnft, ..
+            } => {
+                assert_eq!(*nid, node_id);
+                assert_eq!(*cnft, expected_cnft);
+            }
+            other => panic!("expected Cnft, got {other:?}"),
+        }
+
+        // Verifies locally against the cert-signed `contributions_root`.
+        let last_block = blocks.last().unwrap();
+        let header = crate::codec::BlockHeader::from_block(last_block);
+        let leaf = crate::merkle::leaf_hash(&entry.leaf());
+        let root = &full.chain.state.contributions_merkle_root();
+        assert!(
+            crate::merkle::verify(root, &leaf, entry.proof()),
+            "cNFT proof must verify against contributions_root"
+        );
+        assert_eq!(root.as_slice(), header.contributions_root.as_slice());
+
+        // An unknown node_id yields a verified `None` slot.
+        let miss = GossipMsg::GetProof {
+            items: vec![(crate::light::ProofKind::Cnft, node_id + 9999)],
+        };
+        let mut out2 = full.on_message(99, miss);
+        let (_d, m2) = out2.pop().unwrap();
+        if let GossipMsg::Proof { items } = m2 {
+            assert_eq!(items.len(), 1);
+            assert!(items[0].is_none(), "unknown cNFT id must be a None slot");
+        } else {
+            panic!("expected Proof");
+        }
+    }
+
     /// M25: mixing GraphNode into a batched `GetProof` alongside Account +
     /// Reviewer + Validator must still work — same bus, same dispatcher.
     /// Mirrors `full_node_serves_a_batch_of_proofs_in_response_to_get_proof`
@@ -4938,6 +6170,7 @@ mod tests {
         let header = crate::codec::BlockHeader::from_block(last_block);
         let account_root = &full.chain.state.merkle_root();
         let validator_root = &full.chain.state.validators.merkle_root();
+        let contributions_root = &full.chain.state.contributions_merkle_root();
         for (i, e) in entries.iter().enumerate() {
             let entry = e.as_ref().unwrap();
             let leaf = crate::merkle::leaf_hash(&entry.leaf());
@@ -4946,6 +6179,7 @@ mod tests {
                 | crate::light::ProofEntry::Reviewer { .. }
                 | crate::light::ProofEntry::GraphNode { .. } => account_root,
                 crate::light::ProofEntry::Validator { .. } => validator_root,
+                crate::light::ProofEntry::Cnft { .. } => contributions_root,
             };
             assert!(
                 crate::merkle::verify(root, &leaf, entry.proof()),
@@ -4957,6 +6191,7 @@ mod tests {
                 | crate::light::ProofEntry::Reviewer { .. }
                 | crate::light::ProofEntry::GraphNode { .. } => &header.accounts_root,
                 crate::light::ProofEntry::Validator { .. } => &header.next_validators_root,
+                crate::light::ProofEntry::Cnft { .. } => &header.contributions_root,
             };
             assert_eq!(
                 root.as_slice(),

@@ -227,6 +227,8 @@ mod tests {
             accounts_root: [0u8; 32],
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
+            contributions_root: [0u8; 32],
+            unbonding_root: [0u8; 32],
             txs: vec![SubmissionTx {
                 author: 1,
                 embedding: emb,
@@ -250,6 +252,9 @@ mod tests {
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
             bridge_unbondings: Vec::new(),
+            key_rotations: Vec::new(),
+            gov_proposals: Vec::new(),
+            gov_votes: Vec::new(),
             proposer: 0,
         }
     }

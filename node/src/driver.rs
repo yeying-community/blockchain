@@ -24,8 +24,8 @@ use crate::mempool::Mempool;
 use crate::round::Sim;
 use crate::validator::ValidatorUpdate;
 use crate::{
-    Block, BridgeHeader, BridgeLock, BridgeRedeem, Chain, ChainError, Genesis, Hash, Keypair,
-    SlashEvidence, StakeOp, SubmissionTx,
+    Block, BridgeHeader, BridgeLock, BridgeRedeem, Chain, ChainError, Genesis, GovProposal,
+    GovVote, Hash, KeyRotation, Keypair, SlashEvidence, StakeOp, SubmissionTx,
 };
 
 #[derive(Debug)]
@@ -77,6 +77,10 @@ pub struct ChainDriver {
     pending_updates: Vec<ValidatorUpdate>,
     /// Bond/unbond ops staged to ride along in the next produced block.
     pending_stake_ops: Vec<StakeOp>,
+    /// M179: account key-rotation ops staged for the next produced block.
+    pending_key_rotations: Vec<KeyRotation>,
+    pending_gov_proposals: Vec<GovProposal>,
+    pending_gov_votes: Vec<GovVote>,
     /// Equivocation evidence staged to ride along in the next produced block.
     pending_slashing_evidence: Vec<SlashEvidence>,
     /// M30: cross-chain bridge locks staged to ride along in the next produced
@@ -103,6 +107,9 @@ impl ChainDriver {
             seeds,
             pending_updates: Vec::new(),
             pending_stake_ops: Vec::new(),
+            pending_key_rotations: Vec::new(),
+            pending_gov_proposals: Vec::new(),
+            pending_gov_votes: Vec::new(),
             pending_slashing_evidence: Vec::new(),
             pending_bridge_locks: Vec::new(),
             pending_bridge_headers: Vec::new(),
@@ -140,6 +147,9 @@ impl ChainDriver {
             seeds,
             pending_updates: Vec::new(),
             pending_stake_ops: Vec::new(),
+            pending_key_rotations: Vec::new(),
+            pending_gov_proposals: Vec::new(),
+            pending_gov_votes: Vec::new(),
             pending_slashing_evidence: Vec::new(),
             pending_bridge_locks: Vec::new(),
             pending_bridge_headers: Vec::new(),
@@ -161,6 +171,21 @@ impl ChainDriver {
     /// change is certified by the *current* set and takes effect next height.
     pub fn stage_stake_op(&mut self, op: StakeOp) {
         self.pending_stake_ops.push(op);
+    }
+
+    /// M179: stage a signed account key-rotation op for the next produced block.
+    /// Validated at apply time (`apply_key_rotation`): signature by the account's
+    /// current key, strict nonce, and the active-validator guard.
+    pub fn stage_key_rotation(&mut self, op: KeyRotation) {
+        self.pending_key_rotations.push(op);
+    }
+
+    /// M195: stage a governance proposal / vote for the next produced block.
+    pub fn stage_gov_proposal(&mut self, op: GovProposal) {
+        self.pending_gov_proposals.push(op);
+    }
+    pub fn stage_gov_vote(&mut self, op: GovVote) {
+        self.pending_gov_votes.push(op);
     }
 
     /// Stage equivocation evidence to be carried by the next block. The offender
@@ -244,7 +269,10 @@ impl ChainDriver {
                 || !self.pending_slashing_evidence.is_empty()
                 || !self.pending_bridge_locks.is_empty()
                 || !self.pending_bridge_headers.is_empty()
-                || !self.pending_bridge_redeems.is_empty() =>
+                || !self.pending_bridge_redeems.is_empty()
+                || !self.pending_key_rotations.is_empty()
+                || !self.pending_gov_proposals.is_empty()
+                || !self.pending_gov_votes.is_empty() =>
             {
                 Block {
                     height: self.chain.state.height + 1,
@@ -258,6 +286,8 @@ impl ChainDriver {
                     accounts_root: [0u8; 32],
                     graph_root: [0u8; 32],
                     bridge_root: [0u8; 32],
+                    contributions_root: [0u8; 32],
+                    unbonding_root: [0u8; 32],
                     txs: Vec::new(),
                     validator_updates: Vec::new(),
                     stake_ops: Vec::new(),
@@ -266,6 +296,9 @@ impl ChainDriver {
                     bridge_headers: Vec::new(),
                     bridge_redeems: Vec::new(),
                     bridge_unbondings: Vec::new(),
+                    key_rotations: Vec::new(),
+                    gov_proposals: Vec::new(),
+                    gov_votes: Vec::new(),
                 }
             }
             None => return Ok(None),
@@ -276,6 +309,9 @@ impl ChainDriver {
         candidate.bridge_locks = self.pending_bridge_locks.clone();
         candidate.bridge_headers = self.pending_bridge_headers.clone();
         candidate.bridge_redeems = self.pending_bridge_redeems.clone();
+        candidate.key_rotations = self.pending_key_rotations.clone();
+        candidate.gov_proposals = self.pending_gov_proposals.clone();
+        candidate.gov_votes = self.pending_gov_votes.clone();
         // M122: credit this block's fees to its producer — the round-0 elected
         // proposer for this height (the driver's happy path commits at round 0).
         // Set before `seal` so it is folded into the cert-signed header hash.
@@ -327,6 +363,9 @@ impl ChainDriver {
         self.pending_bridge_locks.clear();
         self.pending_bridge_headers.clear();
         self.pending_bridge_redeems.clear();
+        self.pending_key_rotations.clear();
+        self.pending_gov_proposals.clear();
+        self.pending_gov_votes.clear();
         self.blocks.push(candidate);
         self.certs.push(commit.clone());
         Ok(Some(commit))
@@ -397,6 +436,7 @@ mod tests {
             seed_nodes: vec![(unit(0), 0)],
             params: DeltaKParams::default(),
             base_emission_micro: 8 * MICRO,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: [21u64, 22, 23, 24]

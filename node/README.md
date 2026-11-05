@@ -21,6 +21,7 @@ cargo run --release --bin node -- gossip           # P2P：反熵同步（新节
 cargo run --release --bin node -- light            # 轻客户端：只凭创世+(块,证书)对，逐高度跟随验证人集，不执行交易
 cargo run --release --bin node -- vprove           # 验证人 Merkle 证明：对 cert 签名的区块头证明单个验证人在下一集合中；伪造叶被拒
 cargo run --release --bin node -- staking          # 质押：绑定 $COG 获得验证人权重；解绑经时间锁提款到期返还
+cargo run --release --bin node -- rotate-key       # M179：账户密钥轮换——自认证 KeyRotation op 换账户 ed25519 密钥（旧密钥签、nonce 防重放）；当前验证人被拒（须先解绑）
 cargo run --release --bin node -- slashing         # 罚没：验证人双签 → 提交证据 → 绑定质押罚没入 treasury、移出验证人集
 cargo run --release --bin node -- certs  --dir DIR # 证书落盘：产出认证链→落盘 blocks/certs→重放复验最终性
 cargo run --release --bin node -- mirror-unbond    # M172：共识级跨链解绑镜像——A 解绑 → B 跟随 A 的头并 ingest BridgeUnbond 把同一解绑条目拼入 B 自己的队列，两链成熟各自返还
@@ -28,6 +29,7 @@ cargo run --release --bin node -- localnet         # M33：进程内 tokio 测�
 cargo run --release --bin node -- run  --config F  # M33：联网 tokio 守护进程（TCP P2P gossip + 分布式 BFT 投票）
 cargo run --release --bin node -- submit-tx --config F --tx F  # M53：向运行中守护进程的 [rpc] 入口提交 codec 编码交易
 cargo run --release --bin node -- encode-tx --key-file F --out F --author N …  # M56：离线装配+签名一条交易到 submit-tx 文件
+cargo run --release --bin node -- encrypt-key --out F              # M175：把现有 seed/助记词加密成 Web3SS v3 keystore（scrypt+AES-128-CTR，交互式输入密码）
 cargo run --release --bin node -- status --dir DIR # 重放区块日志并打印状态
 cargo test --release                               # 421 项单元测试（见下）
 ```
@@ -1392,6 +1394,356 @@ M165 保留 3 端点（`/unbonding`/`/stake-ops`/`/evidence`）为 `next=` 是�
 - **不碰** 共识/codec/wire（`UnbondingEntry::hash` 纯本地）/分页基础原语；localnet 头仍 wire v1 `a045426e…3b87bc`。
 - **测试（+1 → 631）**：新 `unbonding_entry_hash_is_stable_and_collision_safe`（4 断言：clone 等、改任一字段 hash 不同、32 字节长）；扩展 `rpc_unbonding_list_over_tcp`/`rpc_stake_ops_list_over_tcp`/`rpc_evidence_list_over_tcp` in-process 测改 `next`→`cursor`。
 - **已知边界**：`UnbondingEntry` 字段顺序（account/amount/mature_height）+ LE 字节序 = hash 格式的隐性契约；改字段顺序或加字段 = 改 hash 格式 = 旧 cursor 解析失败（文档说明）。`encode_unbonding` 真正的 codec 入口（若未来要把 UnbondingEntry 入 wire/快照/跨链）属后续篮子。
+
+## cNFT 认知贡献证书（Milestone 183 · 白皮书路线图 Phase 2）
+
+白皮书 §6.1 代币模型定义四种代币（$COG / $WATT / $FLOP / cNFT），节点已实现 $COG（ΔK 增发）。本轮做 **cNFT（认知贡献证书）**——"记录具体贡献，不可分割，按贡献铸造"（白皮书 §6.1 表 + Phase 2「cNFT 记录贡献者」）。
+
+**问题**：`apply_tx` 接受一笔提交时铸 $COG + 往认知图谱加一个 `GraphNode{node_id, embedding, domain}`，但图节点**不绑定贡献者**，账户只有聚合计数（`accepted`/`earned_total`）。没有"谁贡献了哪一笔"的链上记录。
+
+- **`Cnft { contributor, domain, reward_micro, height }`**（`lib.rs`）：一笔被接受提交的证书。`ChainState.contributions: BTreeMap<u64, Cnft>` 键为该次接受产生的认知图谱 `node_id`（`graph.add` 返回值，一次接受 = 一个图节点 = 一张 cNFT）。Append-only（照 `bridge_locks`）。
+- **铸造**（`apply_tx` 接受分支）：原先 `self.graph.add(...)` 的返回 id 被丢弃，现接住它并 `contributions.insert(node_id, Cnft{ contributor: tx.author, domain: tx.domain, reward_micro: reward, height: self.height + 1 })`。`self.height` 在 `apply_block_inner` 末尾才 bump，故 apply_tx 期间 `+1` 即本块将提交的高度。拒绝分支（ΔK=0）不铸。
+- **认证**（`state_root`）：折入 `contributions`（`node_id ‖ contributor ‖ domain ‖ reward_micro ‖ height`，BTreeMap 有序 ⇒ 规范字节）——cNFT 成为认证的共识状态，快照同步节点可验证完整集合。**不**入 `merkle_root`（accounts_root）：cNFT 的 typed SPV 证明留作后续。
+- **快照**（`codec.rs`）：`encode_snapshot`/`decode_snapshot` 加 contributions 段，`SNAPSHOT_VERSION` 2→3（旧 v2 被严格版本校验拒，重新 snap——pre-production）。
+- **非转让（soulbound）by construction**：没有转移 op，只铸不移；`contributor` 永久绑定。
+- **查询**：`ChainState::cnft(node_id) -> Option<&Cnft>`；`print_summary`/`demo` 显示 cNFT 总数（demo 4 图节点 = 1 创世种子 + 3 接受提交 → 3 张 cNFT；创世种子不是贡献，验证 cNFT 只跟贡献走）。
+- **无 wire 变更**：cNFT 是派生状态（由已接受提交确定性铸出），不经区块携带——不动 Block/BlockHeader/encode_block/gossip。
+- **state_root re-baseline**（加共识状态的预期代价，同 M122 性质）：有接受提交的链 state_root 移位——demo state_root `64184dab…`→`1db88ef6…2f28cc`、demo head→`db176f2d…`、localnet 头 `33cb2506…`→`e88b8b2d…`（均因 state_root 变→header 变）。**demo `merkle_root 5312ecf6…ee8c6b` 不变**（cNFT 不入 accounts_root）；`$COG` 增发/`supply_conserved` 不变（cNFT 纯加记录）。
+- **测试（+3 → 689）**：`accept_mints_a_cnft_and_reject_does_not`（接受铸 1、记四字段、按 node_id 可查；近重复拒绝不铸）+ `state_root_covers_contributions`（改 cNFT 集合改 state_root、merkle_root 不变）+ `snapshot_round_trips_contributions`（v3 encode→decode 保真 + state_root 复算一致）；M181 demo 守卫测更新为新 state_root（merkle_root 不变即证 cNFT 未入 accounts_root）。
+- **已知边界 / 非目标**：不做 typed SPV 证明（`ProofEntry::Cnft` / RPC 查询端点——像 reviewer 的 SPV 在 M24 才补，本轮 state_root 承诺 + 按 id 查询）；不做 $WATT/$FLOP/time_decay（其他路线图项）；不改 $COG 增发公式（经济不变）。
+
+## cNFT 目录 `GET /cnfts`（Milestone 184 · 白皮书路线图 Phase 2）
+
+M183 把 cNFT 落为认证共识状态 + 库内按 id 的 `cnft(id)` 查询，但**没有网络读面**——客户端无从发现链上有哪些 cNFT。M184 补上：`GET /cnfts`——soulbound 认知贡献证书的明文（未验证）目录，`/reviewers`（M85）的读兄弟。每条记 `node_id`（认知图谱节点）+ `contributor` + `domain` + `reward_micro` + `height`。无单读兄弟（暂不设 `/cnft/{id}`）。**无状态/共识/wire/codec 变更**（纯读面；demo/localnet 头与 state_root 不变）。
+
+- **路由**：`enum GetRoute` 加 `Cnfts`；`route_get` 在 `/reviewers` 臂之后加精确臂 `"/cnfts" => GetRoute::Cnfts`。无 `/cnft/` 单读前缀，故 `/cnfts/`（尾斜杠）简单回落 `Health`（与 `/reviewers/`、`/bonds/` 同）。`/routes` 发现索引补 `/cnfts`（漂移守卫 `advertised_exact_routes_resolve`/`routes_index_lists_endpoints` 自动覆盖）。
+- **查询命令**：`Cmd::QueryCnfts { reply: oneshot::Sender<Vec<(u64, Cnft)>> }`；actor handler 快照 `state.contributions` 为 node_id 有序 `Vec<(u64, Cnft)>`（`BTreeMap` 迭代即有序）。
+- **渲染**：与 M84–M86 复用 `EntityView` 不同（cNFT 非 merkle 证明实体，且避免与 typed-proof 机器耦合），新增一对**独立**列表渲染器：`format_cnft_listing`（grep 友好 `node_id=… contributor=… domain=… reward_micro=… height=…` 行，空集 ⇒ `""`）/`json_cnft_listing`（JSON 对象数组，u64 字段为字符串合房规范，空集 ⇒ `[]`）。
+- **分页**：复用既有分页栈——`?cursor=<node_id>`（稳定单调游标空间）/`?offset`/`?limit` + `format_page_cursor`/`json_page_cursor` + `key_after`/`last_key`/`effective_limit`，逐字复用 `total`/`next` 信封 + `Accept`/`Accept-Charset` 协商，照抄 `/reviewers` handler 臂。
+- **测试（+2 → 691）**：新纯 `route_get_parses_cnfts`（`/cnfts` ⇒ `Cnfts`、`/cnfts/` ⇒ `Health`）+ 新纯 `cnft_listing_renders`（空集 ⇒ `""`/`[]`；两条 cNFT 断言精确文本 `key=value` 行与 JSON 数组逐字节）；`/routes` 漂移守卫自动覆盖新路由。
+- **已知边界 / 非目标**：不做 typed SPV 证明（`ProofEntry::Cnft` 的设计分叉——折 cNFT 入 accounts_root 重基线 vs 新 `contributions_root` 头承诺=wire bump——留待用户定向）；不做 `/cnft/{id}` 单读（本轮只做目录发现）。
+
+## cNFT typed SPV 证明（Milestone 185 · wire B4→B5 · 白皮书路线图 Phase 2）
+
+M183 把 cNFT 落为认证共识状态（折入 `state_root`），M184 加明文目录 `GET /cnfts`——但客户端还不能**零信任验证**「某张 cNFT 确在链上」：`state_root` 只是整块状态的 flat digest（证的是"链是否诚实"），要开**单条 cNFT 的包含证明**得有一棵 cNFT 专属 Merkle 树 + 一条 cert 签名的承诺根。**用户在分叉上选定**「新 `contributions_root`（wire bump B5）」而非「折入 accounts_root」——cNFT 自成证明域，与账户树解耦，代价是一次全头 re-baseline。
+
+- **leaf + 根 + 证明**（`lib.rs`，照抄 `bridge_*` 模式，同为 append-only `BTreeMap<u64,_>` keyed-by-id）：`Cnft::merkle_leaf(node_id)`（`node_id ‖ contributor ‖ domain ‖ reward_micro ‖ height`，36 字节，与 `state_root` fold 同字节序）+ `ChainState::contributions_merkle_root()`（按 node_id 排序的 Merkle 根）+ `cnft_proof(node_id) -> Option<merkle::Proof>` + `contributions_merkle_root_for_genesis(g)`（空集空树根）。
+- **第六条状态根**（`Block` / `codec::BlockHeader` 加 `contributions_root: Hash`）：置于 `bridge_root` 之后的**前缀根区**（与 `state_root`/`accounts_root`/`graph_root`/`bridge_root` 并列），**不是**尾部 per-body 承诺——所以这是 B5 **硬 wire 破**（前缀布局变，同 M179 B4 全头 re-baseline 性质，非 M171/M179 的前缀稳定尾追加）。`Chain::seal`/`commit` 走 trial 盖根 + `== [0;32]` 自动兜底，`apply_block_inner` 多一条 `ContributionsRootMismatch` 强制度（seal-then-enforce，同 `bridge_root`）。
+- **codec**：`encode_block`/`encode_header` 在 `bridge_root` 后 `e.raw(&contributions_root)`；`decode_block`/`decode_header` 对称读；`from_block`/`to_block` 搬运；`decode_certified_header` 固定前缀 **220→252 字节**、n_updates u64 偏移 **212→244**、`header_len = 252 + n_updates*48 + 256`（8 条 per-body 尾承诺不变）。
+- **SPV**（`light.rs` / `net.rs`）：`ProofKind::Cnft = 4`（wire tag 4，`decode_proof_entry` leaf 长 36）+ `ProofEntry::Cnft { node_id, cnft, proof }`（`kind()`/`id()`/`proof()`/`leaf()` 各补一臂）；`ValidatorTracker::verify_proof_against_header` 把 cNFT 路由到 `header.contributions_root`——**第三类根目标**（前两类：Account/Reviewer/GraphNode→accounts_root、Validator→next_validators_root）；gossip `GetProof` 经 `GossipNode::serve_inclusion` 的 `ProofKind::Cnft` 臂已能服务 cNFT 证明（`cnft_proof` + `contributions.get(&id)`）。
+- **re-baseline**：每块头 +32 字节 ⇒ **所有 head 移位**（demo head `db176f2d…`→`1766b97e…76e56a`、genesis head `c4903e7a…dd6c2d`；localnet 跨节点动态一致测仍绿）。**`state_root 1db88ef6…` 与 `merkle_root 5312ecf6…` 不变**（M185 不新增 state 摘要，只加头承诺；contributions 自 M183 已折入 state_root）——demo 守卫测 `demo_chain_state_roots_match_the_documented_canon` 只断言这两根，故**无需改**。
+- **测试（+5 → 696）**：`lib` `cnft_proof_verifies_against_header_contributions_root`（接受提交铸 cNFT → 包含证明对 `b.contributions_root` 验证通过；未知 id → `None`）+ `contributions_root_mismatch_is_rejected_on_apply`（seal 后只篡 `contributions_root` → `ContributionsRootMismatch`）；`codec` `cnft_proof_entry_round_trip`（tag=4 + 36 字节 leaf + 证明，encode→decode 逐字节）；`light` `verify_proof_against_header_accepts_a_cnft_proof`（端到端 driver + cert 签名头）+ `..._rejects_a_tampered_cnft`（改 `reward_micro` → 验证器本地重算 leaf 拒之 `MembershipProofInvalid`，prover 的 leaf 不被信任）。
+- **已知边界 / 非目标**：HTTP `/cnft/{id}/proof` 便捷端点**不在本轮**——gossip `GetProof` 已覆盖轻客户端（SPV 的权威传输），HTTP 便捷读留作后续（像 M184 之于 M183 的读面补齐）；不做 time_decay / $WATT / $FLOP；旧 B4 快照/区块与 B5 不兼容（pre-production，协调升级 + 重新 snap）。
+
+## cNFT 证明 HTTP 读端点 `GET /cnft/{id}/proof`（Milestone 186 · 白皮书路线图 Phase 2）
+
+M185 把 cNFT SPV 的 wire 根（`contributions_root`）+ 证明类型（`ProofEntry::Cnft`）+ gossip `serve_inclusion` + 验证器全备齐，但 **HTTP 钱包还没有便捷读**——只能走 gossip `GetProof`（轻客户端的权威传输）。M186 补上 HTTP 收官：`GET /cnft/{id}/proof`——cNFT 的可验证读，返回 `{certified_header, proof_entry}`（cert 签名头 + `ProofEntry::Cnft`），客户端本地重算 leaf 并对 `header.contributions_root` 验证。**无状态/共识/wire/codec 变更**（纯 HTTP 读面；demo/localnet 头与 state_root 不变）。
+
+- **仅 `/proof` 形**：cNFT 无 `/cnft/{id}` 明文单读——明文视图是 M184 的 `/cnfts` 目录，故 `/cnft/` 前缀臂只认 `{id}/proof`，bare id（无 `/proof`）或非数字 id ⇒ 404。同 `/bridge/lock/{id}/proof` 的 proof-only 形状（而非 reviewer/validator/graph 的 `entity_route` 双形）。
+- **几乎零新代码**：route_get 加 `/cnft/` 前缀臂 → 复用既有 **kind-agnostic** `GetRoute::Proof(ProofKind::Cnft, id)` 整条处理链：`Cmd::QueryInclusion { kind, id }` → `node.inclusion` → `GossipNode::serve_inclusion`（M185 已加 `ProofKind::Cnft` 臂：`cnft_proof` + `contributions.get(&id)`）→ `format_account_proof`/`json_account_proof` → `json_proof_entry`（M185 已加 `ProofEntry::Cnft` 臂）。未知 id → 404（`proof_kind_label(Cnft)` = `"cnft"`）。`/routes` 加 `/cnft/{id}/proof` 模板（漂移守卫自动覆盖）。
+- **测试（+2 → 698）**：新纯 `route_get_parses_cnft_proof`（`/cnft/5/proof` ⇒ `Proof(Cnft, 5)`；`/cnft/5`、`/cnft/x/proof`、`/cnft//proof` ⇒ `NotFound`）+ `net` `full_node_serves_a_cnft_proof_in_response_to_get_proof`（`certified_chain(2)` 两笔接受铸 cNFT → `GossipMsg::GetProof{Cnft}` 返回 `ProofEntry::Cnft` 对 `contributions_root` 验证通过且等于 `header.contributions_root`；未知 id ⇒ 已验证的 `None` 槽——正面覆盖 M185 的 `serve_inclusion` Cnft 臂）。
+- **已知边界 / 非目标**：不做 `/cnft/{id}` 明文单读（`/cnfts` 已是明文视图）；不做 time_decay / $WATT / $FLOP。
+
+## 增发时间衰减因子 time_decay（Milestone 187 · 白皮书 §6.2 增发公式收官）
+
+白皮书 §6.2 定义 $COG 增发 = `base_emission × impact(ΔK) × time_decay`，节点此前只实现前两因子（`apply_tx` 里 `reward = base_emission_micro × ΔK`）。M187 补上**最后一因子 time_decay**——早期（引导期）贡献权重高、随链龄按半衰期衰减，激励"尽早贡献"。
+
+- **治理常量**：`decay_half_life_blocks: u64`（`Genesis` + `ChainState`，与 `base_emission_micro` 同级的政策旋钮）。**默认 `0` = 禁用**（衰减因子恒 `1.0`）——不 opt-in 的链铸量与此前**逐字节一致**，demo 仍设 `0`，**canon 不变**（demo state_root/head、localnet 头均不动）。
+- **纯函数** `time_decay_factor(height, half_life) -> f64`（`lib.rs`）：`half_life == 0 ⇒ 1.0`；否则 `0.5^(height / half_life)`——height 0 时 1.0，一个半衰期 0.5，两个 0.25。两整数的 f64，跨节点确定（与既有 `base × ΔK` 舍入同再现性类）。
+- **铸造**（`apply_tx` 接受分支）：`reward = round(base_emission_micro × ΔK × time_decay_factor(self.height + 1, decay_half_life_blocks))`。衰减按**本块提交高度**（`self.height + 1`，与 cNFT `height` 字段一致）度量；**ΔK 引擎完全不受影响**（衰减是增发侧的后乘因子，不改 novelty/impact 计算）。拒绝分支不涉及。
+- **暴露**：`/params` 读端点 + `ParamsView` 加 `decay_half_life_blocks`（命名与既有 ΔK 时鲜度参数 `decay` 区分）；`format_params`/`json_params` 各加一字段。config `GenesisConfig.decay_half_life_blocks`（`#[serde(default)]` ⇒ TOML 缺省 0）。
+- **快照**：`SNAPSHOT_VERSION` 3→4（`encode/decode_snapshot` 多序列化这个常量，紧跟 `base_emission_micro`）；旧 v3 快照被严格版本校验拒，重新 snap（pre-production）。
+- **不变量**：供应守恒不受影响（衰减后的 `reward` 同时 credit `balance` 与 `supply`）；`state_root`/head **不变**——`decay_half_life_blocks` 是常量，**不折入** `state_root`（同 `base_emission_micro`），只有某链把它设为非零时才会改铸量→余额→state_root。
+- **测试（+2 → 700）**：`time_decay_factor_halves_each_half_life`（0 禁用；height 0→1.0；一/两个半衰期→0.5/0.25；半期内单调递减）+ `emission_time_decay_reduces_mint_with_chain_age`（禁用链 mint == `base × ΔK`；`half_life=4` 的链对同一提交 ΔK 相同但 mint **严格更小** = `round(base × ΔK × 0.5^(1/4))`；供应仍守恒）。
+- **已知边界 / 非目标**：$WATT / $FLOP（需预言机/oracle）；评议人治理 DAO；主网 genesis 是否启用衰减及半衰期取值是**政策决定**（留给上线前），本轮只落机制 + 默认关。
+
+## 共识路径浮点确定性 · libm（Milestone 188 · 生产就绪评估 #1）
+
+生产就绪评估把**浮点非确定性**列为唯一能让诚实节点自发分叉的隐患：共识路径 `compute_delta_k → dk → reward → round() → state_root`，两个跑不同 CPU/libm 的验证人若某个超越函数差一个 ULP，`reward` 可能差 1 → state_root 分叉 → 链停摆。M188 把它钉死。
+
+- **先实查缩小面**：共识路径里**只有两个**非确定性超越调用——`engine/src/lib.rs` 的 ΔK freshness `(-p.decay*age).exp()` 与 M187 `node/src/lib.rs` 的 `0.5_f64.powf(height/half_life)`。其余 `.sqrt()`（cosine 相似度、复制方差、agreement）是 **IEEE-754 正确舍入**（所有合规平台位级一致）→ 本就确定；Rust 默认不做 FMA 收缩且无 `mul_add` → 无 `a*b+c` 收缩歧义；`.cos()`/`.ln()` 仅在 `bench.rs`（非共识）。所以无需重写引擎，只改这两处。
+- **方案（用户选定）**：纯 Rust `libm` crate（MUSL libm 移植）。同一份 Rust 代码编到任何目标都走相同运算 → **位级可复现**；而 std 的 `f32::exp`/`f64::powf` 可能委托平台 libm，跨目标差 ULP。`engine`：`(-p.decay*age).exp()` → `libm::expf(...)`；`node`：`0.5_f64.powf(x)` → `libm::pow(0.5, x)`。两 crate 各加 `libm = { version = "0.2", default-features = false }`（no_std、零传递依赖）。**代价**：engine 不再"零依赖"——用户已接受（libm 极小、无传递依赖、业界标配）。
+- **canon 不变（无 re-baseline）**：demo 有接受提交→走 freshness `exp`，但 `reward` 的 `round()` 吸收了 std↔libm 在 demo 输入上的亚-ULP 差异——实测 `demo_chain_state_roots_match_the_documented_canon`（state_root `1db88ef6…`、merkle_root `5312ecf6…`）**仍绿**，localnet 头不变。time_decay 的 `pow` 在 demo 默认关（half_life 0）故不触发。
+- **测试（+1 → 701 node / +1 → 11 engine）**：`node` `time_decay_factor_is_bit_deterministic`（钉死 `pow(0.5,1/4)` = `0x3feae89f995ad3ae`、`pow(0.5,3/7)` = `0x3fe7c6a1f29e2ce6` 的 `.to_bits()`；整数指幂 `0.5^(10/10)`=0.5、`0.5^(20/10)`=0.25 仍精确）+ `engine` `freshness_exp_is_bit_deterministic`（钉死 `libm::expf(-0.3)` = `0x3f3da644`）。这两个**确定性锚点**：任何回退到 std `exp`/`powf`、或 libm 大版本改了结果，都会立刻失败并提示。
+- **已知边界 / 非目标**：std 基础算术 + `.sqrt()` 本就 IEEE 确定性，不动；**多架构交叉验证 CI**（在 aarch64/x86_64 上跑同一向量断言位级一致）是生产评估 **#3** 的一部分，另行；外部审计是 **#2**。本轮只消除共识数学的平台依赖。
+
+## CI 门禁 + codec 鲁棒性 + 跨架构确定性（Milestone 189 · 生产就绪评估 #3）
+
+生产就绪评估 **#3**：仓库此前**无 CI、无依赖审计、无 fuzz**，而手写 codec 解析来自网络/磁盘的攻击者可控字节，是典型的高危面。M189 一次把这三样落地。
+
+- **CI（`.github/workflows/ci.yml`）**：`engine`/`node` 是独立 crate（无 workspace），每步在两个目录各跑。
+  - **跨架构矩阵**：`test` job 跑 `ubuntu-latest`(x86_64) + `macos-latest`(arm64)。这把 M188 的 `*_is_bit_deterministic` 位锚点**跨架构验证**——若 libm 的 `exp`/`pow` 在 arm64 与 x86_64 产出不同位（正是会让共识分叉的那种差异），CI 立刻红。这是 M188 "确定性"从"单机断言"升级为"跨架构保证"的闭环。
+  - **门禁**：`cargo fmt --check` + `cargo test`（node `--test-threads=1` 避 RPC 端口冲突）+ `RUSTFLAGS=-D warnings`（把编译器告警升为错误）。
+  - **advisory（非阻塞）**：`clippy`（14 条既有风格 lint——`is_multiple_of`/needless-ref 等 + 个别有意的 too-many-args/large-const-array——留待专门清理里程碑）；`cargo-audit`（依赖漏洞，待确认干净基线后去掉 `continue-on-error` 升为门禁）。
+- **`-D warnings` 配套清理**：为让门禁真实通过，清掉两个编译器确认的死 import（`daemon.rs` 的 `config::SnapshotBootConfig`——同作用域已有全限定用法；`light.rs` `alt_genesis` 的 `validator::Validator`——该函数只用元组）。engine + node 现以 `-D warnings` 干净编译（本地实测）。
+- **codec 鲁棒性测（fuzz-lite）**：`decoders_reject_adversarial_bytes_without_panicking`（`codec.rs`）——纯 std 的确定性 xorshift64\* PRNG（无 dep、无 nightly，CI 每架构都跑），用空/单字节/多种长度随机/**伪造超长 length-prefix**（`u64::MAX`、`1<<40`、`MAX_ITEMS+1`，置于头部及深处）轰击 **14 个公开 `decode_*` 入口**（block、header、certified_header、snapshot、commit、consensus_msg、validator_set、tx、proof_entry、proof、account、bridge_lock、key_rotation、gossip）。断言：**永不 panic**（越界/溢出）、**永不**因伪造计数无界分配（正面验证 M174 的 `Dec::count()` `MAX_ITEMS` 上限）——只返回 `Ok`/`Err`。跑到结尾 = 无 panic。
+- **测试（+1 → 702）**：上面的 fuzz-lite 测（M188 的两个位锚点在 M189 的跨架构矩阵里获得真正的多架构执行）。
+- **已知边界 / 非目标**：GitHub Actions 与 nightly `cargo-fuzz` 无法在本地环境验证——CI 在 GitHub 上跑；其底层命令（`fmt --check`、`test`、`-D warnings` 编译）已本地逐一验证通过。深度 `cargo-fuzz` 持久语料、clippy 14 lint 清理、`cargo-audit` 升门禁、CI 缓存调优均另行。生产评估剩余项：**#2** 外部审计（排期长，宜并行启动）、#4 wire 版本协商、#5 SIGTERM、#6 治理、#7 经济参数校准。
+
+## SIGTERM 优雅关闭（Milestone 190 · 生产就绪评估 #5）
+
+部署硬伤：`node run` / `node light-run` 此前只用 `tokio::signal::ctrl_c()` 等关闭，而那只捕 **SIGINT**（Ctrl-C）。Docker（`docker stop`）、Kubernetes（Pod 终止）、systemd（`systemctl stop`）停服发的都是 **SIGTERM**——会被忽略，进程挂到宽限期结束后被 `SIGKILL` 强杀（非优雅、日志里只看到被杀、给运维错误信号）。
+
+- **`wait_for_shutdown_signal()`**（`daemon.rs`，跨平台）：Unix 上 `tokio::select!` 同时等 `signal(SignalKind::terminate())`（SIGTERM）与 `signal(SignalKind::interrupt())`（SIGINT），哪个先到就返回其名字（`"SIGTERM"`/`"SIGINT"`）写进关闭日志；`#[cfg(not(unix))]` 回退 `ctrl_c()`（SIGTERM 在非 Unix 不存在）。
+- **两个入口**（`run` 全节点 + `light_run` 轻节点）改用它：`let sig = wait_for_shutdown_signal().await?; info!("{sig} received — shutting down …")`。
+- **为何干净返回即优雅**：节点 teardown 本就平凡——`blocks.log`/`certs.log` 逐条 fsync（无内存写缓冲要 flush），轻节点无盘上状态。所以捕获信号后从 run 循环干净返回、drop actor/监听器，即完成优雅退出；无需主动 drain。
+- **为何无自动化测试**：在进程内触发真实信号验证是**竞态**的——tokio 的信号 handler 必须在 `raise()` 之前注册好，否则 SIGTERM 直接杀掉整个测试二进制（所有测试连带失败）。这与 M182「消除 flaky 测试」的方向冲突，得不偿失。故本轮只靠 `-D warnings` 干净编译 + 标准 `tokio::signal::unix` API 作保证，不引入不稳定的信号测。tokio 的 `signal` feature 本就已启用。
+- **已知边界 / 非目标**：连接优雅排空 / 主动 drain（teardown 平凡，暂不需要）；Windows 的 `CTRL_CLOSE_EVENT`/`CTRL_SHUTDOWN_EVENT` 等额外控制台信号（部署目标是 Unix 容器）。
+
+## clippy 清零 + CI clippy 升为门禁（Milestone 191 · 收尾 M189）
+
+M189 建了 CI，但因为有 ~19 条既有 clippy lint，把 clippy 步设成了 advisory（非阻塞）。M191 清零后把它升成硬门禁，让"CI 绿 = 代码干净"名副其实。
+
+- **自动修（`cargo clippy --fix`）**：机械类——`is_multiple_of` ×5（`x % n == 0` → `x.is_multiple_of(n)`）、needless-ref、doc 列表缩进、`const BIP39_WORDLIST: [&str; 2048]` → `static`（查表常量，static 更合适且行为等价）、`ValidatorKeyConfig` 的手写 `impl Default` → `#[derive(Default)]`。**核对**：被删的手写 `default()` 每个字段都等于其类型默认值（`enabled: false`、其余 `None`），所以 derive 产出逐字节一致，纯共识无关的 config 结构，安全。
+- **带理由的 `#[allow]`（有意保留的写法）**：`codec::to_block`（从 8 个 canonical 体向量重组区块，`too_many_arguments` 对它无意义——塞进结构体只是搬运 arity）；`merkle` 测试里的 `for i in 0..n`（`i` 同时喂 `t.proof(i)`、`data[i]`、`bad_key == i`，range 循环比 enumerate 清晰）；两个 `config` 测试的 `field_reassign_with_default`（测试里 `let mut c = Default::default(); c.field = …` 比多字段 struct-update 更易读）。
+- **doc 注释**：两处 `///` 行首的 `+`（`+ signature)` / `+ signature hex)`）被 clippy 当成 markdown 列表项 → 改成逗号，消除 `doc_lazy_continuation`。
+- **结果**：engine + node 现 `cargo clippy --all-targets -- -D warnings` **全绿**（本地实测）。CI 的 clippy 步去掉 `continue-on-error`、加 `-- -D warnings`，成为与 fmt/test 并列的硬门禁。
+- **纯清理**：无行为变更、无测试增减（仍 702），全套测试 + `cargo fmt --check` 仍绿。
+- **已知边界 / 非目标**：`cargo-audit` 仍 advisory（待确认干净漏洞基线后另行升门禁）；深度 `cargo-fuzz` 持久语料另行。
+
+## P2P 协议版本协商（Milestone 192 · 生产就绪评估 #4）
+
+生产就绪评估 #4：wire 代际（B2…B5）此前是**无协商的协调式硬断**——两个版本不一致的节点连上后会**静默互相 mis-parse** 帧（解出垃圾 → 无诊断地断开），运维只看到"连上又断"，查不出是版本问题。M192 让不兼容**显式、可观测地**拒绝，并立起未来升级要用的版本字段。
+
+- **`PROTOCOL_VERSION: u32`（`daemon.rs`，起始 `1`）**：每次**任何** wire 破坏（block/header/gossip/snapshot 编码、握手布局…）都须自增。这是以前 "B2…B5" 那些隐式代际的显式化。
+- **`negotiate_version(rd, wr)`**：在**每条 peer 连接的最前 4 字节**（BE u32，id/auth 握手之前）交换——写自己的版本、读对端的，不等即返回 `io::ErrorKind::InvalidData`。4 字节写入落在 socket/TLS 缓冲里，write-then-read 不会死锁（同 `write_hello` 的成熟模式）。注入点是 `handle_conn` 里**明文路径（`write_hello`/`read_hello`）与认证路径（`auth_handshake`）的汇合处**，故两条路径都先过版本门；失败以 `warn!` 记日志后 drop。
+- **为何严格相等、而非 min/max 区间协商**：codec 同一时刻只讲**一个** wire 代际，无法解码更旧/更新 peer 的帧——所以"协商一个共同版本"是表演（协商出来也解不了）。诚实契约：同版本→继续，异版本→干净拒绝。真正的滚动升级（多 wire 解码器并存）是它的前提，不在本轮。
+- **安全注记**：`require_peer_auth` 开时，版本交换在认证握手**之前**，MITM 可篡改这 4 字节——但篡改只会导致**拒连**（绝不降级到弱密码），最坏是等价于"剪断网线"的 DoS。把协商版本折进 auth transcript（`AUTH_DOMAIN` v1→v2）以侦测篡改是后续加固。TLS 开时版本交换本就在加密通道内。
+- **一次性破坏**：加这 4 字节交换本身是一次握手 wire 破坏（旧节点不发 → 被新节点拒）——这正是**引导**未来协商的那一次破；此后每次 wire 破坏都是干净拒连而非 mis-parse。
+- **测试（+2 → 704）**：`version_negotiation_accepts_matching_peers`（同版本，双向 `tokio::io::duplex` 两端均 Ok）+ `version_negotiation_rejects_mismatch`（冒充者报 `PROTOCOL_VERSION + 1` → 本端 `InvalidData` 拒，且本端确实对外 announce 了真实版本）。两测纯内存 duplex，无 socket/端口（不引入 M182 那类 flaky）。localnet/daemon 集成测经 `handle_conn` 实跑双向协商、仍收敛同一 head。
+- **已知边界 / 非目标**：min/max 区间协商 + 多 wire 解码器并存（真·滚动升级，需先能"多讲 wire"）；把版本折进 auth transcript 的防篡改；RPC 版本化（HTTP，走路径/头，不经此握手）。
+
+## 混合治理核心：双门槛 tally + 参数执行（Milestone 193 · 生产就绪评估 #6 第一片）
+
+白皮书「评议人治理 DAO」。**用户定**投票权为**混合双门槛**（验证人质押 + 评议人声誉都要过），首期开放全部 4 组参数。这是本系列**最大的功能**，故分片交付；M193 落**纯共识核心**——类型 + tally + 执行——**完全不接线**（无区块携带、无 wire、无 re-baseline），先把最危险的"双门槛判定 + 参数应用"逻辑在隔离中做对、测透。
+
+- **关键设计 · 评议人非 keyed 实体**：genesis `reviewers` 只有 `(id, reputation)`，**没有 pubkey**——评议人无法直接签名投票。解法：一票由投票者的**账户**密钥认证（M194 做签名），而**一个账户同时携带两种权重**——质押权重 `bonds[id]`（非验证人则 0）+ 声誉权重 `reviewers[id]`（非评议人则 0）。于是"混合"统一在账户/密钥之下，无需给评议人新增密钥体系。
+- **类型**（`lib.rs`）：`GovParam`（`BaseEmission(u64)` / `SlashBps(u32)` / `DecayHalfLife(u64)`——穷尽 enum，M195 扩到 `DeltaKParams` 浮点字段，这是唯一扩展点）+ `Proposal { id, param, created_height, voting_period, votes: BTreeMap<u64, bool> }`（votes 按账户 id 键，同账户改票是 last-write-wins）。
+- **`ChainState::gov_tally(&proposal) -> bool`**：**两边都过才通过**——
+  - 质押侧：`yes_stake` 严格 **> 2/3** 总 bonded（`yes_stake * 3 > 2 * bonded`，`GOV_STAKE_QUORUM_*`；对齐 BFT 的 >2/3，使**治理集 == 安全集**）；
+  - 声誉侧：`yes_reputation` 严格 **> 1/2** 总声誉（`yes_rep * 2.0 > total_rep`）；
+  - 空选区（无 bonded 或无评议人）**永不过门**，所以不可能单边或零参与通过。
+- **确定性**：`total_reputation()` 按 `BTreeMap`（id 有序）求和 f32，IEEE-754 加法、无超越函数 → 每节点同值（与 M188 的确定性纪律一致）。质押侧用 u128 整数算，无浮点。
+- **`apply_gov_param(&mut self, &GovParam)`**：穷尽 match 改对应标量，加参数即编译期强制补分支。
+- **纯逻辑**：`gov_tally` 只读、`apply_gov_param` 只改既有字段——**无新 `ChainState` 字段、无 `state_root` 变更、无 snapshot bump、无 wire 变更、无 re-baseline**。proposals 的持久存储与区块携带是 M194。
+- **测试（+6 → 710）**：双门槛需两边同过；只一边同意则拒（全质押零声誉 / 全声誉零质押各一例）；`严格 2/3` 边界（恰好 2/3 不过、3/4 过）；空选区（无质押 / 无评议人）均不过；`apply_gov_param` 改三标量各一；投票 last-write-wins（翻票即翻结果）。
+- **分片路线**：**M194** 接线——`gov_proposals`/`gov_votes` 区块 vec（wire **B6**）+ 投票/提案 ed25519 签名认证 + `ChainState.proposals` 入 `state_root`/snapshot + 过期高度 tally 调度 + gossip tag；**M195** `GovParam` 扩 `DeltaKParams` 字段（含 usize/f32 混合字段的寻址）。
+- **已知边界 / 非目标（本片）**：区块携带 / 签名认证 / 过期 tally 自动执行 / gossip 传播 / `DeltaKParams` 参数——都在后续片。
+
+## 治理接线：区块携带 + 过期自动执行（Milestone 194 · 生产就绪评估 #6 第二片 · wire B5→B6）
+
+M193 落了纯治理核心（tally + 执行）。M194 把它**接进共识**——提案与投票成为区块携带的 op，到期自动结算。这是 ~M179 量级的 wire-bump 里程碑。
+
+- **两个区块 op**（`lib.rs`）：`GovProposal { proposer, param, voting_period, nonce, signature }`（链在 apply 时从 `next_proposal_id` 分配单调 id——提案者不预知 id，同 bridge lock）+ `GovVote { proposal_id, voter, approve, nonce, signature }`。均 ed25519 签名 + **严格 nonce 反重放**（`== acct.nonce`，复用 `SubmissionTx`/`KeyRotation` 纪律）；nonce 还给同一投票者的 re-vote **定序**（apply 顺序 last-write-wins，旧票重放因 nonce 已推进而被拒）。
+- **状态**：`Block` 加 `gov_proposals`/`gov_votes` 两 vec；`ChainState` 加 `proposals: BTreeMap<u64, Proposal>` + `next_proposal_id`，**折入 `state_root`**（proposal/vote 状态成为认证共识状态，快照同步节点同样 tally）。
+- **apply 流程**（`apply_block_inner`，key_rotations 之后）：`apply_gov_proposal`（注册，`created_height = 本块高度`）→ `apply_gov_vote`（查提案存在且 `height < created+voting_period`，否则 `UnknownProposal`/`ProposalClosed`；记 `votes[voter]=approve`）→ 块末（height 推进后、承诺校验前）`resolve_matured_proposals(height)`：对到期提案跑 M193 `gov_tally` 双门槛，过则 `apply_gov_param` 执行、**无论过否都移除**。执行在根校验前，故 `state_root` 反映执行后的参数 + 收缩的提案集。参数变更下一块生效（同 validator-update 的跨高度纪律）。
+- **wire B6**（`codec.rs`）：`gov_proposals`/`gov_votes` 作**第 9/10 条尾部 per-body 承诺**（前缀稳定，B5 reader 读到 key_rotations 即止——同 M171/M179 尾追加）；`BlockHeader` 加 `gov_proposals_commitment`/`gov_votes_commitment`；`decode_certified_header` 尾承诺 256→320 字节（固定前缀 252 **不变**，因 gov 是尾承诺非前缀根）；`encode/decode_block`、`encode/decode_header`、`from_block`（算两承诺）/`to_block`（+2 参数）同步；新 `encode_gov_param`/`govproposal_signing_bytes`/`encode_gov_proposal`/`encode_gov_vote` 等 codec + `Enc::u8`。
+- **snapshot**：`SNAPSHOT_VERSION` 4→5（序列化 `proposals` + `next_proposal_id`，紧随 contributions）；旧 v4 被拒，重新 snap。
+- **re-baseline**：proposals 折入 digest（**空集也加长度字**）→ demo `state_root` `1db88ef6…`→`fc0535603e23bc9ce1ff7a18850ca63b5355d3ac80c642bd765717ed02d391ca`；每块头 +2 承诺 → demo/localnet head 移位（demo head 现 `9b9683f5…`）；**`merkle_root 5312ecf6…` 不变**（proposals 不入账户树）——`demo_chain_state_roots_match_the_documented_canon` 更新 state_root。
+- **测试（+7 → 717）**：`lib` `governance_end_to_end_passes_and_executes`（propose h1 → vote h2 → 到期 h3 执行、提案移除）+ `governance_fails_without_both_quorums`（零票→不改但仍移除）+ `gov_vote_rejects_unknown_and_closed_proposal`（`UnknownProposal`/`ProposalClosed`）+ `governance_bad_nonce_and_signature_rejected` + `state_root_covers_proposals`（折入改根、merkle_root 不变）；`codec` `gov_proposal_and_vote_round_trip`（含 `GovParam` 三 tag + 签名 vs signing-bytes）+ `snapshot_round_trips_proposals`（v5 保真 + state_root 复算）。
+- **已知边界 / 非目标（本片）**：gossip 传播（`TAG_GOVPROPOSAL`/`TAG_GOVVOTE` flood/dedup）+ daemon/driver 暂存池 + RPC 读端点（本轮 ops 经**区块同步**或测试构造入块；mempool 式预传播是 M195）；`DeltaKParams` 参数寻址（M196）。
+
+## 治理 gossip 传播 + 暂存池（Milestone 195 · 生产就绪评估 #6 第三片）
+
+M194 的 gov op 此前只经**区块同步**传播——只有本地持有该 op 的提议人能把它放进块。M195 加**预传播**：任意节点收到的提案/投票 flood 到全网每个节点的暂存池，于是任意提议人都能把它纳入下一块。照抄 M179 key-rotation 的 flood/dedup 模式（成熟且对称）。
+
+- **gossip 消息**（`net.rs`）：`GossipMsg::GovProposal(Box<GovProposal>)` / `GovVote(Box<GovVote>)`（Box 避免撑大 enum）+ wire tag `TAG_GOVPROPOSAL = 21` / `TAG_GOVVOTE = 22`；`encode_gossip`/`decode_gossip` 对应分支（复用 M194 的 `encode_gov_proposal`/`decode_gov_vote` 等）。
+- **`GossipNode`**：`seen_gov_proposal`/`seen_gov_vote`（内容哈希 `SeenSet` 去重）+ `pending_gov_proposals`/`pending_gov_votes` 暂存池；getters + `take_pending_gov_*`（排空给 block builder）+ `has_pending_work` 纳入。`submit_local_gov_*`（本地发起：记 seen + 暂存 + 向所有 peer flood）；`on_gov_*`（收到：内容哈希去重——已见则不再 flood——否则暂存 + 向除来源外的 peer 再 flood）。`build_candidate` 把两暂存池 clone 进下一候选块。
+- **`LightGossipNode`**：这两类归为"全节点块务"忽略（同 key rotation——轻客户端不投票/不出块）。
+- **`ChainDriver`**（`driver.rs`）：对称加 `pending_gov_proposals`/`pending_gov_votes` + `stage_gov_proposal`/`stage_gov_vote` + produce 纳入 + has-pending 守卫 + 提交后清空（离线/demo 出块路径）。
+- **daemon**：对入站 gov gossip 经既有 `on_message` 委托，自动去重 + 再 flood（与 key rotation 完全同路径，无需新 Cmd 分支）。
+- **测试（+2 → 719）**：`gov_op_gossip_reaches_every_node_and_dedups`（在 3 节点 `Network` 上 `submit_gov_proposal` + `submit_gov_vote` → `run` 到静默 → 每节点暂存恰一份且哈希相符；对端重投已见 op → 返回空、不再暂存）+ `gov_op_gossip_wire_round_trips`（两类 op 经 `encode_gossip`→`decode_gossip` 保真）。
+- **已知边界 / 非目标（本片）**：RPC/CLI **发起** gov op（当前经 `submit_local_gov_*` 程序化发起 + 区块同步；HTTP 提交与 `GET /proposals` 查询端点另行，像 M184 之于 M183 的读面）；daemon 专用 Cmd（入站 flood 已自动，发起端点才需要）；`DeltaKParams` 参数（M196）。
+
+## 治理扩至 DeltaKParams 参数（Milestone 196 · 生产就绪评估 #6 第四片）
+
+M193–M195 把治理做到 3 个标量旋钮（`base_emission_micro` / `slash_bps` / `decay_half_life_blocks`）。M196 补齐**第 4 组**——ΔK 引擎的 9 个字段——兑现 M193 选定的「全部 4 组参数」。
+
+- **`DeltaKParam` 子枚举**（`lib.rs`）：每字段一个变体，**保留原生类型**——7 个 `f32`（`TauDup`/`CCap`/`Lam`/`BonusMax`/`Decay`/`FreshMin`/`DeltaKMin`）+ 2 个 `usize`（`NReviewMin`/`NMin`，在 wire 与 `state_root` digest 上以 `u64` 走）。`GovParam` 加 `DeltaK(DeltaKParam)` 变体（tag 3）。
+- **执行**：`apply_gov_param` 加穷尽 `DeltaK` 臂，改 `self.params.<field>`（usize 由 u64 cast）——加字段即编译期强制补分支。
+- **codec**：`enc/dec_gov_param` 加 `tag 3 ‖ 字段子-tag(0–8) ‖ 原生值`（f32 旋钮 / u64 计数）。
+- **无 wire 变更、无 re-baseline**：`GovParam` 本就是 tag 编码，`DeltaK` 是**新增** tag——现有 B6 上还没有任何 DeltaK 提案，加新 enum 值纯加性（旧值的编码逐字节不变 → demo state_root/head 不动）。`GovParam` 因内含 f32 去掉 `Eq` 派生（改 `PartialEq`）。
+- **确定性**：治理设定的 f32 值存进 proposal、折入 `state_root`（f32 位确定）；应用后进入 `compute_delta_k`（M188 的 libm 路径），仍确定。
+- **测试（+2 → 721）**：`apply_gov_param_sets_each_deltak_field`（9 字段逐一可治）+ `governance_executes_a_deltak_change_end_to_end`（DeltaK 提案过混合双门槛 → 改 `params.delta_k_min`）；`codec` round-trip 扩覆盖 DeltaK 的三类 tag（f32 旋钮 + u64 计数）。
+- **里程碑收束**：至此 M193 选定的「**混合双门槛 + 全部 4 组参数**」治理目标**全部兑现**——提案/投票可全网 gossip 预传播（M195）、区块携带（M194）、到期按质押>2/3 且声誉>1/2 自动执行（M193），可改 4 组全部参数（M196）。
+- **已知边界 / 非目标**：RPC/CLI **发起** gov op（`GET /proposals` 查询 + HTTP 提交端点另行，像 M184 之于 M183 的读/写面）。
+
+## 治理读面 `GET /proposals`（Milestone 197 · 生产就绪评估 #6 收尾·读面）
+
+治理此前对 HTTP 钱包不可见——客户端无从查链上有哪些提案、票数如何。M197 补上读面：`GET /proposals`——活跃提案的明文目录，M194 链上治理状态的读兄弟。照抄 M184 `/cnfts` 模式（纯读、无状态/共识/wire 变更，demo/localnet 头与 state_root 不变）。
+
+- **路由**：`enum GetRoute` 加 `Proposals`；route_get `"/proposals"` 精确臂（无 `/proposal/` 单读前缀，`/proposals/` 落 `Health`）。`/routes` 发现索引补 `/proposals`（漂移守卫自动覆盖）。
+- **查询**：`Cmd::QueryProposals { reply: oneshot::Sender<Vec<Proposal>> }`；actor 快照 `state.proposals` 为 id 有序 `Vec<Proposal>`（`BTreeMap::values()` 即有序）。
+- **渲染**：`format_proposal_listing`（grep 友好 `id= param= value= created_height= voting_period= votes= yes=` 行）/`json_proposal_listing`（JSON 对象数组）。新 `gov_param_describe(&GovParam) -> (param_name, value)`：标量映射为 `base_emission_micro`/`slash_bps`/`decay_half_life_blocks`，DeltaK 旋钮命名空间化为 `deltak.<field>`（`deltak.lam` 等）；f32 值走 `json_f32` 使 text 与 JSON **逐字节一致**。`votes`/`yes` 给原始票数（加权双门槛在到期时由 `gov_tally` 算）。
+- **分页**：复用既有分页栈——`?cursor=<proposal_id>`/`?offset`/`?limit` + `format_page_cursor`/`json_page_cursor`，照抄 `/cnfts` handler 臂。
+- **测试（+2 → 723）**：`route_get_parses_proposals`（`/proposals` ⇒ `Proposals`、`/proposals/` ⇒ `Health`）+ `proposal_listing_renders`（空目录 ⇒ `""`/`[]`；一个标量提案 + 一个 DeltaK 提案的 text `key=value` 行与 JSON 逐字节，含 `votes=3 yes=2` 票数）；`/routes` 漂移守卫自动覆盖。
+- **已知边界 / 非目标**：HTTP `POST` **发起** gov op（写面，需 tx-submission 式 POST 处理器 + daemon 发起 Cmd + flood，另行）；`/proposal/{id}` 单读（`/proposals` 已是明文视图）。
+
+## P0 安全审计修复 SEC-01..07（Milestone 202–204）
+
+依据 [`docs/audits/P0-SECURITY-REVIEW-2026-11.md`](../docs/audits/P0-SECURITY-REVIEW-2026-11.md)（1 严重 + 3 高 + 3 中），全部修复,每项附回归测试。
+
+- **SEC-03（严重·BFT quorum 溢出）** `validator.rs`：`quorum()` 改在 `u128` 算 `floor(2T/3)+1`，`total_power()` 改 `saturating_add`。total=2^63 时旧 `u64` 的 `2*total` 回绕为 0 → quorum 塌成 1 → <1/3 权重可认证冲突区块、破坏最终性。测试 `quorum_does_not_overflow_at_large_power`。
+- **SEC-02（高·state_root 未承诺执行参数）** `lib.rs state_root()`：折入 `base_emission_micro`/`decay_half_life_blocks`/`slash_bps` + 9 个 ΔK 字段。否则被篡改参数的快照/创世仍匹配 cert 签名根 → 节点同块异参执行而分叉。测试 `state_root_covers_execution_params`；demo state_root re-baseline `fc053560…`→`01c163ce…`（merkle_root 不变）。
+- **SEC-04（高·治理参数无范围校验）** `lib.rs`：新 `validate_gov_param`/`validate_consensus_params`（`slash_bps≤10000`、`base_emission` 上限、ΔK 浮点 `is_finite`+域、计数 `≤10000`），在 `apply_gov_proposal`（注册）+ 创世（`config` `BadGenesis`）强制。否则 `slash_bps=20000` 令拒绝交易 `slash>stake` 回绕、破坏供应守恒。测试 `gov_param_validation_rejects_unsafe_values` + `..._rejected_at_registration`。
+- **SEC-06（中·预分配过大）** `codec.rs`：新 `prealloc`/`prealloc_usize` 把解码列表的 `with_capacity` 封顶 `PREALLOC_CAP=1024`（计数仍受 `MAX_ITEMS` 限）。否则短帧声明百万项可预留 ~176MB。codec 19 处 + net 14 处改走 prealloc。测试 `prealloc_caps_reservation`。
+- **SEC-07（中·TLS 依赖公告）**：`rustls 0.23.46`/`rustls-webpki 0.103.16`/`tokio 1.54.1`（审计建议修复版）；CI `cargo-audit` 去 `continue-on-error` 升为**门禁**。
+- **SEC-01（高·无效治理 gossip 污染候选池、持续阻断出块）** `lib.rs`+`net.rs`：三处防线——(A) gossip 入池校验 `on_gov_proposal`/`on_gov_vote` 调 `gov_proposal_admissible`/`gov_vote_admissible`（账户/签名/参数域；投票还查提案存在且在窗口），不合格既不暂存也不 flood;(B) `build_candidate` 用 `filter_applicable_gov` 在 trial clone 上按区块序试应用、只纳入干净 op——stale/invalid op 被丢出本候选而非让整块 seal 失败,中毒池再不能停摆出块;(C) `apply_certified` 提交后清理已提交 gov op（避免重提已消费 nonce）。测试 `gov_gossip_rejects_inadmissible_ops`、`poisoned_gov_pool_does_not_stall_candidate_production`。
+- **SEC-05（中·BridgeUnbond 用错承诺树,wire B6→B7）** `lib.rs`+`codec.rs`：此前 unbond 证明对 `bridge_root`（锁树）验证,正常源链无法生成可验证证明（测试靠伪造头 patch `bridge_root`+re-cert）。新增独立 cert 签名的 **`unbonding_root`**（源链 unbonding 队列 Merkle 根）：`ChainState::unbonding_merkle_root`/`unbonding_proof`/`..._for_genesis`，`Block`/`BlockHeader` 加字段（前缀根 → B7 硬断,`decode_certified_header` 前缀 252→284、n_updates 偏移 244→276），seal/commit 盖根 + apply `UnbondingRootMismatch`；`apply_bridge_unbond` 改对 `source_header.unbonding_root` 验证。demo/测试与 `mirror-unbond` CLI 改用**正常 seal 的真实头**（删去死代码 `rebuild_cert_after_bridge_root_patch`）。`unbonding_root` 是头承诺非 state_root 字段 → demo state_root 不变,仅 head re-baseline。测试 `unbonding_root_mismatch_is_rejected_on_apply`，`bridge_unbond_mirrors_to_dest_and_matures` 现为真实端到端（无伪造）。
+- **结果**：node **732**（675 lib + 57 bin）全套绿、clippy `-D warnings` 干净、`cargo-audit` 已为门禁。SECURITY.md §审计状态 记录本轮。
+
+## 治理写面：HTTP 发起 gov op（Milestone 198 · 生产就绪评估 #6 收尾·写面）
+
+M197 让钱包能**查**提案（`GET /proposals`）；M198 让钱包能**发起**——治理对 HTTP 钱包彻底打通。新增 `POST /gov/proposal` / `POST /gov/vote`：body 为 raw codec 编码的 op，节点验签后暂存 + flood，回 `{"hash":…}`。照抄 tx-submission 路径。
+
+- **actor Cmd**：`Cmd::SubmitGovProposal` / `SubmitGovVote`（`daemon.rs`）。handler 查提交者账户（`state.accounts.get`）+ `verify` 签名——**提交时即拒绝 garbage，不污染 gossip**（比 M179 key-rotation 的"提交不验、apply 才验"更严）；sig ok 则 `submit_local_gov_*`（M195）暂存 + `actor.route` flood，回 op hash。nonce / 窗口 / 双门槛仍在 **apply 时**查（提交时账户 nonce 可能因其他 pending op 而"超前"，不宜在提交时硬查）。未知账户 → `UnknownAccount`，坏签名 → `BadSignature`。
+- **Node 句柄**：`submit_gov_proposal` / `submit_gov_vote`（回 `Option<Result<Hash, ChainError>>`）+ `proposals`（包 `Cmd::QueryProposals`，读句柄）。
+- **serve POST**：在 tx 解码**之前**分 `/gov/proposal` / `/gov/vote` 两路——解码失败 400、坏签名/未知账户 422、成功 200 + `{"hash":…}`。两端点在既有 **bearer-auth 门之后**（写面受保护，与 tx 提交同级；`/batch`/`/validate`/`GET` 仍公开）。
+- **无状态/共识/wire 变更**（纯 ingress 读写面；demo/localnet 头与 state_root 不变）。
+- **测试（+1 → 724）**：`submit_gov_proposal_stages_registers_and_rejects_bad_sig`（单验证人进程内经 `Node::submit_gov_proposal` 提交合法提案 → 轮询 `proposals()` 直到其被出块注册；错误签名者的提案 → `BadSignature`，不入池）。非 socket，不引入 flaky。
+- **里程碑收束 · 治理读写全通**：`GET /proposals` 查（M197）+ `POST /gov/{proposal,vote}` 发起（M198）+ gossip 预传播（M195）+ 区块携带（M194）+ 到期双门槛执行（M193）+ 全 4 组参数（M196）。
+- **已知边界 / 非目标**：`/proposal/{id}` 单读（`/proposals` 已是明文视图）；CLI 子命令（HTTP 已足够，运维可 `curl`）。
+
+## pending keystore 交互式密码提示（Milestone 181）
+
+收尾 M180 留的小口：M180 的 pending 加密 keystore 只从 `ZHIXING_PENDING_KEYSTORE_PASSWORD` 读密码，缺失即硬失败——与活跃 keystore（M175 `read_keystore_password`：env 优先、否则交互 no-echo 提示）不一致。
+
+- **`read_keystore_password_from(env_var, path)`**（`main.rs`）：把 M175 的 `read_keystore_password` 泛化——先读指定的环境变量（无人值守），否则 `rpassword` no-echo 交互提示。`read_keystore_password` 变成 `read_keystore_password_from("ZHIXING_KEYSTORE_PASSWORD", path)` 的薄封装；活跃键与 pending 键共用同一套逻辑。
+- `cmd_run` 的 pending-key 解析改调 `read_keystore_password_from("ZHIXING_PENDING_KEYSTORE_PASSWORD", path)`——env 优先，否则交互提示，不再硬失败。
+- 纯 CLI 收尾：无 wire / 共识 / config 结构变更，localnet/demo 头不动。
+- **测试（+1 → 686）**：`read_keystore_password_prefers_env`（env 设置时返回其值、不碰 TTY；用测试专用 env 名 `ZHIXING_TEST_PW_M181` 避并行冲突）。交互 no-echo 分支需 TTY，不在自动化测试里走（与 M175 的 `encrypt-key`/`run` 提示同样情况）。
+
+## 活跃验证人密钥轮换 + 守护进程自动交接（Milestone 180）
+
+M179 刻意排除活跃验证人（`apply_key_rotation` 以 `CannotRotateActiveValidator` 拒绝），因为验证人轮换涉及守护进程签名密钥在高度边界的交接定时难题。M180 合上这个篮子：允许活跃验证人轮换，守护进程**自动交接**签名密钥（用户选"自动交接"，非"运维重启"）。**纯逻辑，无 wire 变更**——`KeyRotation` op 与 B4 布局 M179 已定；localnet/demo 头不动（`33cb2506…`/`a186d72d…`），demo state 根守卫测仍绿。
+
+**链上**（`lib.rs`）：
+- `apply_key_rotation` **删除**活跃验证人守卫（保留当前密钥签名 / 严格 nonce / 拒 no-op）。删 `ChainError::CannotRotateActiveValidator`。
+- `apply_block_inner` 的 key_rotations 循环：轮换账户若是当前验证人（`self.validators.get(account).is_some()`）则 `touched.insert(account)`，使验证人集经既有 `touched → validators.apply_updates` 机制在**下一高度**重派生——power 不变（来自 `bonds`）、pubkey = 新 `account.pubkey`。轮换块在高度 N 由**旧** set（旧 pubkey）认证；新 set 在 N+1 生效。
+
+**守护进程自动交接**（`daemon.rs`）——无状态不变量"签名密钥必须等于活跃 set 里本节点 id 的 pubkey"：
+- `Actor` 加 `pending_kp: Option<Keypair>`（预置的待生效新密钥）。
+- 纯决策 helper（可单测，不建 Actor）：`fn resolve_signing_key(current: PubKey, pending: Option<PubKey>, expected: Option<PubKey>) -> SigningKeyDecision`，三态 `Keep`/`Adopt`/`Stale`。`expected` = set 里本节点 id 的 pubkey（`None` = 不在 set）。current==expected 或不在 set → `Keep`；current≠expected 且 pending==expected → `Adopt`；否则 `Stale`。
+- `reconcile_signing_key` 在**每次 commit 后**调用（`on_decided` 自决路径 + `Cmd::Inbound` 同步 commit 路径，都在下一高度 `start_height` 之前）：`Adopt` 则 `self.kp = pending_kp.take()` + `info!`；`Stale` 则 `warn!` 并保留旧键——该验证人漏投票直到运维用新键重启（**仅局部活性缺口，不影响安全、不停摆全网**）；`Keep` 无操作。这个不变量天然覆盖自决/同步两条 commit 路径，不依赖追踪具体轮换高度，故不会漏检。
+- `Node::start` / `daemon::run` 加 `pending_key: Option<Keypair>` 参（光节点传 `None`）。
+
+**配置**（`config.rs`）：`ValidatorKeyConfig` 加 `#[serde(default)] pub pending: Option<Box<ValidatorKeyConfig>>`——嵌套同类型，**零重复**复用现有 `keypair()`/`keypair_with_password()`（pending 键可经 seed_hex / mnemonic / 加密 keystore 任一来源）；嵌套的 `enabled` 忽略。`cmd_run` 解析之：pending 加密 keystore 的密码走 `ZHIXING_PENDING_KEYSTORE_PASSWORD` 环境变量（无人值守；交互式提示留后续）。缺 `[validator.pending]` ⇒ `None` ⇒ 行为与 M179 逐字节一致。
+
+**演示**：`node rotate-key` 原"活跃验证人被拒"段改为——账户 bond 成为验证人 → 轮换其键 → 断言下一高度 set 的该 id pubkey 变新键、power 不变。守护进程自动交接是分布式行为，不在单进程 demo 里演（由 daemon 测覆盖）。
+
+**运维流程**（活跃验证人轮换）：① `keygen`/`encrypt-key` 生成新密钥；② 配置 `[validator.pending]` 指向新密钥（+ 必要时设 `ZHIXING_PENDING_KEYSTORE_PASSWORD`）并热加载/重启守护进程使其持有 pending 键；③ 用**当前**密钥签一个 `KeyRotation`（`new_pubkey` = 新密钥公钥）提交上链；④ 轮换 commit 后，守护进程在下一高度自动把签名密钥切到新键，无漏投票。若步骤②漏做，该验证人在轮换生效后漏投票（warn），补上 pending 键/重启即恢复。
+
+**测试（+2 → 685）**：`resolve_signing_key_three_way_decision`（`daemon.rs`——Keep/Adopt/Stale 七例，含不在 set→Keep、无/错 pending→Stale）+ `pending_validator_key_parses_and_resolves`（`config.rs`——嵌套 `[validator.pending]` 解析 + keypair 解析 + 缺省 None）；M179 的 `key_rotation_rejects_active_validator` 改为 `key_rotation_of_a_validator_rederives_the_set`（bond→轮换→set 新 pubkey、power 不变）。既有 localnet/daemon 集成测在每次 commit 走 `reconcile_signing_key`（无轮换时 no-op `Keep`）、全绿即证 hook 对正常路径无害。
+
+**已知边界 / 非目标**：pending keystore 的交互式 no-echo 密码提示留作后续（无人值守走 env）；一次只排一个 pending 键；不做轮换撤销（提交即生效）；pending 键缺失/不匹配 **降级而非崩溃**（漏投票 + warn，重启可恢复）——这是自动交接的安全网；不解耦 operator/consensus 密钥（Cosmos 式，用户选了耦合模型）。
+
+## 账户密钥轮换（Milestone 179 · KeyRotation, B4 wire）
+
+审计前预备的最后一块大的。此前账户/验证人的 ed25519 密钥一旦设定就无法更换——密钥泄露或例行轮换都没有链上手段。本轮加一个自认证、nonce 防重放、共识强制的 `KeyRotation` op。
+
+**架构（与用户确认）**：
+- **耦合模型**：验证人 pubkey = 账户 pubkey（`apply_block_inner` 从 `account.pubkey` 派生验证人集条目），所以轮换账户密钥即轮换验证人身份——无需给 `Validator` 加独立共识密钥字段（避免更大的 wire 改动）。
+- **安全 MVP，不含活跃验证人**：`apply_key_rotation` 拒绝轮换**当前在验证人集里**的账户（`self.validators.get(account).is_some()` → `CannotRotateActiveValidator`）。这彻底绕开"轮换在高度 N 由旧集认证、新密钥下一高度生效、守护进程须在高度边界切换签名密钥"的交接定时难题。活跃验证人要轮换：先 unbond（移出集）、轮换、再 bond。活跃验证人实时轮换 + 守护进程自动交接留作后续。
+
+**`KeyRotation { account, new_pubkey, nonce, signature }`**（`lib.rs`，仿 `StakeOp`）：`signed(kp)` 用账户**当前**密钥签 `keyrotation_signing_bytes`（`{account, new_pubkey, nonce}`）。`apply_key_rotation` 顺序校验全先于变更：账户存在（`UnknownAccount`）→ 签名对**当前** pubkey 验证（`BadSignature`）→ `nonce == account.nonce`（`BadNonce`，复用账户 nonce，与 `SubmissionTx` 同纪律）→ 拒活跃验证人（`CannotRotateActiveValidator`）→ 拒 no-op（`new_pubkey == 当前` → `KeyRotationNoop`）→ 变更 `account.pubkey` + `nonce += 1`。
+
+**state_root 无新字段**：轮换的*效果*（pubkey + nonce）已在 `Account::merkle_leaf` 折进 `state_root`/`accounts_root`；op 本身经头部 `key_rotations_commitment`（cert-signed）承诺，与 txs/stake_ops 同纪律。
+
+**B4 wire bump**（M171 B3 以来首次 Block 布局变更，仿 M171 形状）：
+- `Block.key_rotations: Vec<KeyRotation>`（第 8 个 body op vec，`bridge_unbondings` 之后，尾部追加前缀稳定；B3 解码器读 B4 块在此 `UnexpectedEof`，B4 读 B3 读 `n=0` 继续）。
+- `BlockHeader.key_rotations_commitment`（第 8 个 per-body 承诺，尾部追加）；`encode/decode_header` 各 +32 字节，`from_block` 算之，`decode_certified_header` 固定尾 `224`→`256`。
+- `encode_key_rotation`/`decode_key_rotation` + `keyrotation_signing_bytes`（`codec.rs`，仿 `encode_stakeop`）。布局 `u64 account ‖ 32 new_pubkey ‖ u64 nonce ‖ 64 signature`。
+- `apply_block_inner` 在所有其他 op（txs/stake_ops/evidence/bridge）之后应用 `key_rotations`，保证同块 tx/stake_op（用旧密钥签）先于轮换生效、互不干扰。
+- ~28 处 `Block`/`BlockHeader` 字面量补字段（逐行脚本插入匹配缩进，非正则改字段——避 M171 正则误伤 `[0x..; 32]` 的教训）。
+
+**gossip**（`net.rs`，仿 `GossipMsg::StakeOp` tag 5）：`GossipMsg::KeyRotation` + `TAG_KEYROTATION = 20` + `encode/decode_gossip` 臂 + `seen_key_rotation` dedup + `pending_key_rotations` 池 + `submit_local_key_rotation` / `on_key_rotation` / `take_pending_key_rotations` + `build_candidate` 纳入 + 提交后 prune + `has_pending_work` 纳入。
+
+**驱动 + CLI**：`ChainDriver::stage_key_rotation` + produce/clear（`driver.rs`）。`node rotate-key`（`main.rs`）进程内 demo：账户 #1 轮换 → 旧密钥作废（后续用旧密钥签的轮换被 `BadSignature` 拒）→ 新密钥可再轮换 → bond 账户 #2 后轮换它被 `CannotRotateActiveValidator` 拒。
+
+**head 移动**：B4 新头部承诺槽改变 header hash（即使 `key_rotations` 空），localnet 头 `1215aa75…` → **`33cb2506…a6a426`**（与 M171 同性质的显式 wire bump；4 验证人仍收敛同一头）。
+
+**测试（+6 → 682）**：`codec` `key_rotation_round_trip`（往返 + trailing 拒 + 截断 `UnexpectedEof`）；`lib` 4（`key_rotation_swaps_the_account_key_and_retires_the_old`——换键 + state_root 变 + 旧密钥作废 + 新密钥可用；`..._rejects_bad_signature_and_nonce`；`..._rejects_no_op`；`..._rejects_active_validator`）；`net` `key_rotation_gossip_reaches_every_node_and_dedups`。既有 `header_gossip_shrinks_the_wire_payload_vs_full_blocks` 随 B4 调整——8 个空承诺（256B）会压过空块的 body，故改为在一个装了 3 笔 tx 的块上断言 header < 全块（cert 两侧相消），这是更忠实的"header 省掉 body"不变量。
+
+**已知边界 / 非目标**：不含活跃验证人实时轮换（守护进程签名密钥的高度边界自动交接，需同持新旧两键，风险高，后续）；不解耦 operator/consensus 密钥（Cosmos 式独立共识密钥，用户选了耦合）；不做旧密钥归档签名 / 多 slot keystore（原 M176 候选里的部分）；轮换新密钥来源不限（运维可先 `encrypt-key` 做成 M175 keystore，但本轮不强耦合）。
+
+## 持久化加密-only TLS 证书（Milestone 178）
+
+审计前预备。生产就绪度评估标记过：P2P / metrics / RPC 三处的 TLS 都是临时自签证书，每次重启经 `rcgen` 现生成一张新的，指纹每次都变——运维没法固定证书指纹（trust-on-first-use 每次重启就断）。
+
+- **范围**：只针对**加密-only** TLS（`enable_tls` 不带 `require_peer_certs`）。genesis-pinned mTLS（`require_peer_certs`）的证书本就从验证人 seed 确定性派生、天生持久，不在本轮。
+- **`load_or_create_encrypt_only_tls_setup(cert_path, key_path)`**（`daemon.rs`）：两文件都在 → 加载；否则生成一次 → 写盘（证书普通权限、私钥 `write_private_der` 走 `0600`）→ 用。存 **DER**（正是 rustls 消费的字节形，也是指纹计算的字节形），所以加载只是 `fs::read` → `CertificateDer` / `PrivateKeyDer`，**无需 PEM 解析、不引新 dep**。
+- **重构**：抽出共享尾 `encrypt_only_setup_from_der(cert_der, key_der)`（幂等装 ring crypto provider + 建 accept-any server/client config）。临时路径 `build_encrypt_only_tls_setup`（现生成）与持久路径都调它，零行为分叉。
+- **配置**：`NetworkConfig` 加 `tls_cert_path` / `tls_key_path`（`Option<String>`，`#[serde(default)]`）。`validate` 强制**成对或都无**（单边设置 → `BadNetwork`，因为单证书或单密钥既无法加载也无法连贯写）。新 `tls_persist_paths()` 取出 `(cert, key)` 对。
+- **接线**：三处 acceptor——P2P 加密-only（`Node::start` 的 `match (mtls, persist_paths)`：仅在非 mTLS 且配置了路径时走持久）、metrics、RPC（经 `encrypt_only_acceptor` 闭包），以及 light 节点（永远加密-only）——配置了就持久、否则临时。**一张持久证书供三处共用**，运维只需 pin 一个指纹。
+- **向后兼容**：默认 unset ⇒ 逐字节保持 pre-M178 临时证书行为。私钥 `0600` 写盘逻辑在 daemon 内自带（`write_private_der`，不跨模块依赖 `main.rs` 的 `write_key_file`）。
+- **测试（+2 → 676）**：`persistent_tls_cert_is_generated_then_reused`（`daemon.rs`——首调文件不存在 ⇒ 生成+写盘；再调 ⇒ 加载不重生成（cert/key 字节逐一不变，即指纹跨重启稳定）；Unix 下私钥 `0600`。确定性、不碰 socket 故无端口冲突 flaky）+ `tls_persist_paths_are_both_or_neither`（`config.rs`——默认 None 合法、成对合法、单边 `BadNetwork`）。既有 metrics/RPC TLS 集成测走共享代码的临时分支、全绿即证重构无回归。
+- **已知边界**：加密-only TLS 仍是 accept-any-cert（M41 本就无 PKI、不校验服务端身份）——持久化只是稳定指纹供带外 pin，**不改变"加密-only 不认证对端"的语义**（对端认证仍归 `require_peer_auth` / mTLS）；证书不做到期 / 轮换调度（自签长期有效，轮换 = 删文件重启重生成）；存 DER 而非 PEM（运维取指纹：`openssl x509 -inform DER -in cert.der -fingerprint -sha256`），PEM 便利性属后续可选项；metrics/RPC 与 P2P 共用同一对路径（一个指纹），若要分端点独立证书属后续项。
+
+## 监听端连接数上限（Milestone 177 · 预认证 DoS 硬化）
+
+审计前预备。我自己的生产就绪度评估标记过：三条 accept 循环——P2P `run_listener`、以及启用时的 metrics / RPC 端点——对每个被 `accept` 的连接无条件 `tokio::spawn` 一个处理任务，**无并发上限**。P2P 层 `require_peer_auth` 默认关闭，所以一个不持任何密钥的攻击者狂开连接就能耗尽文件描述符 / 内存。
+
+- **机制**：每条 accept 循环持一个 `tokio::sync::Semaphore(max)`。新 helper `admit_inbound` 在 `accept` 后做 `try_acquire_owned`：
+  - 拿到 `OwnedSemaphorePermit` → 把它 move 进 spawn 的任务（连接活着就占着，任务结束 drop 释放槽位），再处理连接；
+  - 到上限（`try_acquire_owned` 失败）→ **立即 `drop(stream)` 关掉新连接并继续 accept**，不堆积任务。
+  非阻塞：满了就拒，不排队，所以连接洪水无法把任务数 / 内存推到无界。
+- **配置**：`NetworkConfig` 加 `max_inbound_connections: usize`，`#[serde(default = ...)]` = **256**（对任何真实验证人网够用——入站受 peer 数约束；对滥用够紧）。每条监听器各自计数。`NetworkConfig::validate()` 拒 0（否则 accept-then-drop 永久停摆），`load_node_config` 调用之；新 `ConfigError::BadNetwork`。
+- **向后兼容**：旧 `[network]` 段缺该键 ⇒ serde 填 256，既有配置原样工作。localnet / 既有 daemon 测试每节点只有 ≤ 几条入站，远低于上限，故行为不变（全套 socket 集成测绿即证三条循环接线正确）。
+- **不引新 dep**：`tokio` 已含 `sync` feature（`Semaphore`/`OwnedSemaphorePermit`）。
+- **测试（+2 → 674）**：`admit_inbound_enforces_the_concurrency_cap`（`daemon.rs`——恰发 `cap` 个 permit、满后 `None`、drop 一个释放槽位、再满再拒的确定性单元测；不碰 socket 故无端口冲突 flaky 风险，这也是刻意的——现有套件已有硬编码端口冲突的偶发 flaky）+ `max_inbound_connections_defaults_parses_and_validates`（`config.rs`——缺键回落 256、显式值解析、0 被 `BadNetwork` 拒）。
+- **已知边界**：只做**并发连接数**上限（最根本的稳态资源界），**未做 accept 速率**（每秒新连接）令牌桶——并发上限已封顶资源，被拒连接立即关闭成本极低，速率桶属可选精化；metrics/RPC 与 P2P 共用同一 `max_inbound_connections`（运维端点连接数远小于该值，无碍），若要为运维端点单设更小上限属后续项；单个已认证 peer 内部的消息层限速（M161/M162 的 mempool tx 限速）是另一层，本轮不动。
+
+## 修复 `consumed_unbonds` 的跨链重放防护漏洞（Milestone 176 · 潜在共识分叉）
+
+M175 之后继续审计前预备。M171/M172 引入的 `BridgeSource.consumed_unbonds`（跨链 unbonding 镜像的重放去重集，M173 起类型是 `BTreeSet<(source_height, index)>`）**既不进 `state_root`、也不进 snapshot codec**（decode 侧写死空集）。这比先前记的"重启后重放窗口重开"严重——是一个**潜在共识分叉**：
+
+- `apply_bridge_unbond`（`lib.rs`）用 `consumed_unbonds` **决定区块有效性**：遇到 `(source_height, index)` 已在集合里的重放 `BridgeUnbond` 就返回 `BridgeUnbondReplay`，令整块无效回滚。
+- 但该集合不在 `state_root` 里 ⇒ 持有该对的**全量重放节点**会拒绝这个重放区块，而丢了该集合的 **snapshot-同步节点**会接受它。两者 `state_root` 相同、却对同一区块的有效性分歧 ⇒ 分叉。
+
+**三处修复**：
+1. **`state_root`**（`lib.rs`）：在 `bridge_sources` 循环里折入 `consumed_unbonds`——`u64(len)` + 每个 `(height, index)` 两个 `u64`。`BTreeSet` 有序迭代保证字节规范。这把它从"本地簿记"升为共识关键状态，分叉不再可能（两节点集合不同 ⇒ `state_root` 不同 ⇒ 承诺检查/证书复验会抓到）。
+2. **snapshot**（`codec.rs`）：`encode_snapshot` 持久化该集合，`decode_snapshot` 读回。snapshot-同步节点遂恢复与全量节点一致的集合。
+3. **`SNAPSHOT_VERSION` 1 → 2**：字节布局变了，严格版本校验拒收 v1 旧 snapshot（`BadEnum`），运维须重新 snap——pre-production，snapshot 本就可弃。
+
+**head 中性**：`state_root` 的新增字节只在有 `bridge_sources` 的链上出现（`demo`/`localnet`/除桥接测试外的全部测试都 `bridge_sources: vec![]`，循环体不执行）。故 localnet 头不动、全套既有测试绿即为证。**M134 `verify_snapshot_against_header` 自动获益**——它比对 decode 后重算的 `state_root` 与 header 的 `state_root`，现在二者都含 `consumed_unbonds`，所以一个丢了该集合的 snapshot 会 `state_root` 不符而被拒（正是我们要的安全性质）。
+
+- **测试（+2 → 672）**：`snapshot_round_trips_consumed_unbonds`（构造带非空 `consumed`+`consumed_unbonds` 的 `BridgeSource`，encode→decode 完整保真 + 再编码稳定）+ `state_root_covers_consumed_unbonds`（只往该集合加一个 `(height, index)` 就使 `state_root` 变化——钉死共识关键性）。既有 `snapshot_rejects_bad_version_and_trailing_bytes`（用 version=999）仍有效。
+- **已知边界 / 文档观察**：实测 localnet 头已是 `1215aa75…566e86`，而 README 多条里程碑仍写 wire-v1 的 `a045426e…3b87bc`——这是 **M171 B3 wire bump**（新增 block 字段 `bridge_unbondings` + 头部承诺槽）合法移头但未在文档改写新值的遗留，**非 M176 回归**（已 stash 对比 M175 提交态，同为 `1215aa75`，确认 M176 head 中性）；修正那些陈旧的头值字符串属后续文档清理。`consumed`（BridgeRedeem 的 lock_id 去重集）从 M31 起就正确进了 `state_root` 与 snapshot——只有 M171 新加的 `consumed_unbonds` 漏了，本轮补齐。
+
+## 加密验证人 keystore（Milestone 175 · Web3 Secret Storage v3）
+
+审计前预备的第一项。在此之前，验证人私钥只有明文形态：配置里的 `seed_hex = "..."` 或 `mnemonic = "..."`，或 `keygen` 写出的明文 seed 文件。对主网验证人这不可接受。M175 加一条**可选**的加密路径，不动既有明文路径（向后兼容）。
+
+- **格式**：以太坊 Web3 Secret Storage **v3** 的子集（Geth/Parity keystore JSON）。`scrypt`(N=2^18, r=8, p=1, dklen=32) 从密码派生 32 字节；前 16 字节是 AES-128-CTR 密钥，后 16 字节与密文拼接后过 Keccak-256 得 MAC。唯一偏离标准的是 plaintext——这里是 32 字节 ed25519 seed（`Keypair::from_seed` 的输入），而非 secp256k1 私钥。**刻意不自创格式**：外部审计机构已审过这套 KDF/MAC/参数无数遍，复用它直接缩小审计面。
+  ```json
+  {"crypto":{"kdf":"scrypt","kdfparams":{"dklen":32,"n":262144,"r":8,"p":1,"salt":"<hex>"},
+   "cipher":"aes-128-ctr","cipherparams":{"iv":"<hex>"},"ciphertext":"<hex>","mac":"<hex>"},
+   "id":"<uuid-v4>","version":3}
+  ```
+- **`src/keystore.rs`**（新模块，把全部密码学集中一处便于审计专项 review）：
+  - `encrypt_seed(&[u8;32], password) -> EncryptedKeystore`：随机 salt/iv/id（`getrandom`），scrypt 派生，AES-128-CTR 加密，Keccak-256 MAC。
+  - `decrypt_seed(json, password) -> [u8;32]`：**先验 MAC 再解密**——错密码与篡改 ciphertext 都返回 `MacMismatch`，两种情况刻意不可区分，且永不吐出密钥材料。MAC 用常量时间比较。
+  - `parse_keystore(json)`：只做结构/schema/hex/参数校验，**不解密**（供 `check-config` dry-run 用，不需要密码）。
+  - `to_json`：pretty JSON。UUID `id` 由 16 字节 `getrandom` 手工格式化（版本/变体 nibble 置位），**不引 `uuid` crate**。
+- **`src/config.rs`**：`ValidatorKeyConfig` 加 `encrypted_keystore_path: Option<String>`。优先级 keystore > mnemonic > seed_hex。新 `keypair_with_password(password)` 走 keystore 解密；`keypair()`（无密码入口）对 keystore 配置返回 `ConfigError::KeystoreDecrypt` 指向前者（既有 seed_hex/mnemonic 调用点不受影响）。非 keystore 路径两个方法行为逐字节一致（抽出 `seed_from_mnemonic_or_hex`）。
+- **`src/main.rs` CLI**：
+  - `node encrypt-key --out F [--passphrase S] [--force]`：交互式把现有 seed-hex 或 BIP-39 mnemonic 加密成 keystore。**明文也从终端无回显读**（`rpassword`——这正是 keystore 要保护的密钥材料，不能落终端 scrollback），密码无回显 + 二次确认，plaintext 永不落盘；`--out` 存在即拒绝覆盖（除非 `--force`）。用于把 legacy 明文配置迁移到 `encrypted_keystore_path`。
+  - `node keygen --new-mnemonic --encrypt [--force]`：一步生成助记词 + 加密 keystore（助记词仍打印到终端供抄写，seed 不以明文落盘）；同样拒绝覆盖已存在的 `--out`。
+  - `node run`：keystore 配置下启动时无回显提示密码，或读 `ZHIXING_KEYSTORE_PASSWORD` 环境变量（systemd `EnvironmentFile`/CI 无人值守用）。密码永不写入配置文件或磁盘。
+  - `node check-config`：对 keystore 配置做结构校验（文件存在 + 解析为 v3 + scrypt 参数边界）而不解密——dry-run 不该提示密码。
+- **scrypt 成本上界**（防被篡改的 keystore 做资源耗尽）：`validate_scrypt_cost` 对文件里的 `(n, r, p)` 设天花板——`128·N·r ≤ 1 GiB` 工作内存、`r ≥ 1`、`p ∈ [1, 16]`。没有这个上界，一个能写配置目录的攻击者把 keystore 的 `n` 改成 2^40（仍是合法的 2 的幂）就能让 `node run` 在 scrypt KDF 处 OOM；现在 dry-run 与 decrypt 都在**任何 KDF 工作之前**拒绝。标准 Web3SS profile（N=2^18, r=8 ⇒ 256 MiB）舒适落在界内。
+- **依赖**：新增 `scrypt`/`aes`/`ctr`/`sha3`/`serde_json`/`rpassword`，全部与既有 `sha2`/`hmac`/`pbkdf2` 同代（`digest 0.10`/`cipher 0.4`），无第二代 trait 进依赖树；`serde_json` 原已经 `tracing-subscriber` 间接在树里。`rpassword` 保证密码（及导入时的明文密钥）无回显——一个会把密钥/密码回显到终端的工具本身就是审计发现。
+- **测试（+17 → 670）**：`keystore.rs` 11（往返；错密码 `MacMismatch`；篡改 ciphertext；不支持的 version/kdf/cipher；Web3SS schema 形状 + UUID 形状；`checked_log_n` 幂次校验；运维手工上调 `n` 后仍能解密——证明读的是文件参数而非编译常量；同 seed+密码两次加密得不同 salt/密文但都能解回；**MAC 哈希是 Keccak-256 而非 SHA3-256**——用空输入 KAT `c5d2…a470` 钉死，防静默 interop 破坏，这是 round-trip 自洽测试抓不到的；scrypt 成本边界强制；资源耗尽型 keystore 端到端被拒）+ `config.rs` 4（keystore 需密码；配置经真实 keystore 文件往返 + 错密码失败；keystore 优先级压过 seed_hex；无 keystore 时 `keypair_with_password` 回落 seed_hex）+ `main.rs` 2（check-config 结构校验真实 keystore 报 role validator；损坏 keystore 报 `KeystoreDecrypt`）。对照 Ethereum 官方 Web3SS scrypt 整体 KAT（解密其发布的 keystore JSON → 32 字节私钥）作为后续补项——仅因本构建环境无网络取不到那串精确密文/mac 字节而顺延；构造按 Web3SS 规范逐字段对齐（AES 密钥 = DK[0..16]，MAC = Keccak256(DK[16..32] ‖ ciphertext)，AES-128-CTR 128-bit 大端计数器），Keccak + round-trip 测试已覆盖原语与自洽性。
+- **已知边界**：`N=2^18` 是 Web3SS 2017 基线（为审计对齐而非最强；keystore 是明文 JSON，运维可在成本上界内手工上调 `n`，代码读文件的 `n` 而非编译常量——已测）；只加密 seed 不加密 mnemonic（seed 推导确定性，加密 seed 足够且与 `seed_hex` 路径统一）；交互式密码提示需 TTY（`rpassword` 读 `/dev/tty`），自动化走 `ZHIXING_KEYSTORE_PASSWORD`（以 `/proc/<pid>/environ` 暴露换无人值守，交互式运维应优先提示）；plaintext 保护的是**静态密钥**（被盗的配置目录/备份/笔记本），不保护运行中进程内存；解密后的 seed 与密码**未 zeroize**——模块头显式声明不保护运行时内存，且 ed25519-dalek 的 `SigningKey` 本身也未 zeroize-wrap，部分 zeroize 只给假保证，故保持诚实声明留作后续；强度取决于密码（建议 ≥20 字符随机）。**不**做密钥轮换（M176 候选）、HSM/KMS 集成、多 keystore slot——属后续篮子。
+
+## 修复 `dec_validator_set_inline` 未校验长度的远程可触发崩溃（Milestone 174）
+
+生产就绪度评估的副产物——评估过程中在代码里找到一个真实可远程触发的漏洞，当场修复，不是提前规划的里程碑。
+
+- **漏洞**：`BridgeHeader.next_set` 的解码（`codec.rs` 的 `dec_validator_set_inline`）是唯一一处**内联**验证人集解码，与所有其余长度前缀列表都走 `Dec::count()`（有 `MAX_ITEMS = 1_000_000` 上限）不同——它直接 `let n = d.u32()? as usize` 读裸长度，立即 `Vec::with_capacity(n)`。一个伪造的、接近 `u32::MAX`（约 42.9 亿）的长度字段会让节点尝试为 `Validator`（48 字节/条）预留超百 GB 内存；Rust 的全局分配器在这类规模的分配失败上是**直接中止进程**（`abort`），不是可以 `catch_unwind` 的 panic——也不会先检查缓冲区剩余字节是否真的够多就先尝试分配。
+- **可达性**：`decode_block` → `dec_bridge_header` → `dec_validator_set_inline`，经 `GossipMsg::Blocks` 到达。`[network] require_peer_auth` 默认 `false`（`NetworkConfig::default()`），即一个只走 cleartext hello、**不持有任何验证人密钥**的对端，发一条精心构造的 `Blocks` 消息即可让任意节点进程中止——是一个真实的预认证 DoS，不需要先通过认证或拿到签名权。
+- **修复**：`dec_validator_set_inline` 读出裸 `u32` 后立即对 `MAX_ITEMS` 校验，超限返回 `CodecError::TooManyItems`，再分配——与其余所有列表解码的纪律看齐。不改 wire 格式（校验在解码端新增，编码端字节不变），对任何诚实对端零影响。
+- **测试（+1 → 653）**：`bridge_header_rejects_forged_next_set_count`（`codec.rs`）用真实编码的 `BridgeHeader` 定位 inline count 字段的字节偏移，覆写为 `u32::MAX`，断言在任何分配尝试之前即被 `TooManyItems(u32::MAX as u64)` 拒绝。
 
 ## `merkle::Proof` 加 authenticated `key`（Milestone 173）
 

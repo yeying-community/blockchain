@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# M210: start every generated validator as a background daemon (DEPLOYMENT.md §6).
+# Logs → testnet/out/n<id>/node.log, pid → testnet/out/n<id>/pid. Stop with down.sh
+# (SIGTERM → graceful shutdown; never SIGKILL a validator).
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+BIN="$ROOT/node/target/release/node"
+OUT="$HERE/out"
+[ -f "$OUT/password" ] || { echo "run testnet/gen.sh first" >&2; exit 1; }
+
+export ZHIXING_KEYSTORE_PASSWORD="$(cat "$OUT/password")"
+export RUST_LOG="${RUST_LOG:-info}"
+
+# Best-effort guard: refuse to spawn a node whose p2p port is already held (e.g. an
+# orphan from an aborted run) — otherwise the new process dies on bind and a stale one
+# keeps serving stale state. Needs lsof; skipped silently if unavailable.
+port_busy() { command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
+
+for d in "$OUT"/n*/; do
+  d="${d%/}"
+  id="$(basename "$d" | sed 's/^n//')"
+  if [ -f "$d/pid" ] && kill -0 "$(cat "$d/pid")" 2>/dev/null; then
+    echo "  n$id already running (pid $(cat "$d/pid"))"; continue
+  fi
+  if port_busy "90$id"; then
+    echo "  n$id: port 90$id already in use (stale daemon?) — run testnet/down.sh or kill it" >&2
+    exit 1
+  fi
+  # M219: if this node signs via a remote `node signer`, start that signer first (it holds
+  # the key; the node's config points at its socket). Idempotent per run.
+  if [ -f "$d/signer.socket" ]; then
+    sock="$(cat "$d/signer.socket")"
+    if [ -f "$d/signer.pid" ] && kill -0 "$(cat "$d/signer.pid")" 2>/dev/null; then
+      :
+    else
+      nohup "$BIN" signer --keystore "$OUT/keys/val$id.json" --socket "$sock" \
+        --hwm "$d/signer.hwm" >> "$d/signer.log" 2>&1 &
+      echo $! > "$d/signer.pid"
+      for _ in $(seq 1 100); do [ -S "$sock" ] && break; sleep 0.1; done
+      [ -S "$sock" ] || { echo "  n$id: signer did not bind $sock (see $d/signer.log)" >&2; exit 1; }
+      echo "  n$id signer started (pid $(cat "$d/signer.pid"))  socket: $sock"
+    fi
+  fi
+  nohup "$BIN" run --config "$d/node.toml" >> "$d/node.log" 2>&1 &
+  echo $! > "$d/pid"
+  echo "  n$id started (pid $!)  log: $d/node.log"
+done
+echo "metrics: http://127.0.0.1:91<id>/metrics  (Bearer METRICS_TOKEN from out/tokens.env)"
+echo "rpc:     http://127.0.0.1:92<id>/height | /head | /header/{h} | /proposals"

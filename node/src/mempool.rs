@@ -404,6 +404,8 @@ impl Mempool {
             // and `Chain::seal` (or `Chain::commit`'s fallback) fills it in.
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
+            contributions_root: [0u8; 32],
+            unbonding_root: [0u8; 32],
             txs: included,
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
@@ -412,6 +414,9 @@ impl Mempool {
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
             bridge_unbondings: Vec::new(),
+            key_rotations: Vec::new(),
+            gov_proposals: Vec::new(),
+            gov_votes: Vec::new(),
         })
     }
 
@@ -494,6 +499,7 @@ mod tests {
             seed_nodes: vec![(unit(0), 0)],
             params: DeltaKParams::default(),
             base_emission_micro: 8 * MICRO,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: vec![
