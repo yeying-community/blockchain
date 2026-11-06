@@ -385,6 +385,20 @@ python3 sim/run.py --compare  # baseline 场景 Python vs Rust 后端对比
   - nonce 反重放 顺延至 M85+）
   - 内容寻址区块哈希链 + 状态根。ΔK 复用引擎，与白皮书 B.2.3 是同一份契约。引擎纯 std、零依赖、可离线编译；节点作为**应用层**取审计过的 `ed25519-dalek` 做签名，并自 M32 起为联网守护进程引入 `tokio`（异步运行时）+ `serde`/`toml`（配置）+ M37 起 `tracing`/`tracing-subscriber`（结构化日志）——共识核心 `lib.rs` 仍 serde-free。
 
+## 快速上手(单节点 + 浏览器)
+
+```sh
+./cmd           # 一键:构建 → 起单节点本地网(心跳出块)+ 区块浏览器;打印 URL
+./cmd submit    # 账户2 提交知识 → 被接受后铸出 cNFT + 认知图谱节点 + 作者增发
+./cmd bond      # 账户1(=验证人+评议人)绑定质押,使其治理投票有权重
+./cmd unbond    # 解绑质押 → 进入解绑队列(冷却后释放,见浏览器 Staking 页)
+./cmd propose 1 base_emission=12000000  # 发起治理提案 · ./cmd vote 1 <id> true 投票 · ./cmd gov 查看
+./cmd status    # 看高度 / 供应
+./cmd down      # 停止   ·   ./cmd reset 清空 .localnet 重来
+```
+
+起好后打开 **http://localhost:8080**(区块浏览器,见 [`tools/explorer/`](tools/explorer/README.md))即可实时看区块、交易、账户、验证人、治理、cNFT、供应;`./cmd submit` 后可在 **cNFTs / Account / Blocks** 页看到新内容。节点 RPC 在 `127.0.0.1:9221`,指标在 `:9121/metrics`。多验证人测试网见 [`testnet/`](testnet/README.md)。
+
 ```bash
 cd node && cargo run --release --bin node -- demo    # 内存演示链
 cargo run --release --bin node -- build              # mempool 规范排序出块
@@ -422,7 +436,7 @@ cargo test --release                                 # 647 项单元测试（见
 
 ## 里程碑变更日志（M6–M171）
 
-截至 M221，node 有 **755** 项单元测试（697 lib + 58 bin，另 2 个 `#[ignore]`），engine 另有 **11** 项。早期里程碑（M6–M23）主题：确定性/守恒/回滚/持久化/Merkle/BFT/认证链/最终性复验/动态验证人集/P2P gossip/质押绑定/等价双签罚没/块级 ops 走 gossip/轻客户端跟随验证人集/验证人集 Merkle 承诺入头/头部轻同步传输/钱包 SPV 账户证明。此后逐里程碑：
+截至 M239，node 有 **768** 项单元测试（707 lib + 61 bin，另 2 个 `#[ignore]`），engine 另有 **11** 项。生产就绪自评见 [`docs/PRODUCTION-READINESS-2026-11.md`](docs/PRODUCTION-READINESS-2026-11.md)（结论:受控/许可制测试网可行,高价值主网前仍需独立审计 + 经济校准 + 规模化测试）。早期里程碑（M6–M23）主题：确定性/守恒/回滚/持久化/Merkle/BFT/认证链/最终性复验/动态验证人集/P2P gossip/质押绑定/等价双签罚没/块级 ops 走 gossip/轻客户端跟随验证人集/验证人集 Merkle 承诺入头/头部轻同步传输/钱包 SPV 账户证明。此后逐里程碑：
 
 - **M24** 泛化批量化证明请求总线：Account/Reviewer/Validator 同一 GetProof 对、单一 verify_proof_against_header 验证器、reviewer_proof 闭合审阅人路径、MAX_PROOF_BATCH=32 上限
 - **M25** 图节点 cert-signed 包含证明

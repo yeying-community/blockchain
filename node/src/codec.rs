@@ -362,10 +362,17 @@ pub fn decode_certified_header(buf: &[u8]) -> Result<CertifiedHeader, CodecError
         return Err(CodecError::UnexpectedEof);
     }
     let n_updates = u64::from_be_bytes(buf[276..284].try_into().unwrap());
-    let header_len = 284 + (n_updates as usize) * 48 + 320; // 604 base + 48 per update
-    if buf.len() < header_len {
-        return Err(CodecError::UnexpectedEof);
-    }
+    // SEC/fuzz: `n_updates` is attacker-controlled — compute the length in checked arithmetic so
+    // a huge value can't overflow `usize` (a debug/overflow-checked panic, caught by cargo-fuzz).
+    // Any overflow, or a length past the buffer, is a truncated/malformed header ⇒ `UnexpectedEof`
+    // (no allocation: `header_len` is bounded by `buf.len()`).
+    let header_len = match (n_updates as usize)
+        .checked_mul(48)
+        .and_then(|u| u.checked_add(284 + 320))
+    {
+        Some(len) if len <= buf.len() => len, // 604 base + 48 per update
+        _ => return Err(CodecError::UnexpectedEof),
+    };
     let header = decode_header(&buf[..header_len])?;
     let cert = decode_commit(&buf[header_len..])?;
     Ok(CertifiedHeader { header, cert })
@@ -1602,7 +1609,10 @@ pub fn decode_account(buf: &[u8]) -> Result<Account, CodecError> {
 /// v5 (M194): the snapshot now also serializes the governance `proposals` map +
 /// `next_proposal_id` (M194 folds them into `state_root`). A v4 snapshot lacks
 /// them, so v4 is now rejected — regenerate.
-pub const SNAPSHOT_VERSION: u32 = 5;
+///
+/// v6 (M235): adds `max_validator_power_bps` (§10.11 validator power share cap, folded into
+/// `state_root`). A v5 snapshot lacks it, so v5 is now rejected — regenerate.
+pub const SNAPSHOT_VERSION: u32 = 6;
 
 /// Write the account's state fields into the shared stream (same layout as
 /// [`encode_account`], inlined so the snapshot controls framing).
@@ -1674,6 +1684,7 @@ pub fn encode_snapshot(s: &ChainState) -> Vec<u8> {
     e.u64(s.base_emission_micro);
     e.u64(s.decay_half_life_blocks); // M187 (§6.2): emission time-decay half-life
     e.u32(s.slash_bps);
+    e.u32(s.max_validator_power_bps); // M235 (§10.11): validator power share cap
     e.raw(&s.genesis_hash);
     // ΔK params
     let p = &s.params;
@@ -1797,6 +1808,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
     let base_emission_micro = d.u64()?;
     let decay_half_life_blocks = d.u64()?; // M187 (§6.2)
     let slash_bps = d.u32()?;
+    let max_validator_power_bps = d.u32()?; // M235 (§10.11)
     let mut genesis_hash = [0u8; 32];
     genesis_hash.copy_from_slice(d.take(32)?);
     let params = DeltaKParams {
@@ -1964,6 +1976,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
         base_emission_micro,
         decay_half_life_blocks,
         slash_bps,
+        max_validator_power_bps,
         supply,
         treasury,
         bonded,
@@ -3226,6 +3239,22 @@ mod tests {
     }
 
     #[test]
+    fn decode_certified_header_rejects_overflowing_n_updates_without_panicking() {
+        // Regression (cargo-fuzz `decode_all`): `n_updates` (buf[276..284]) is attacker-
+        // controlled; `284 + n_updates*48 + 320` overflowed `usize` and panicked before the
+        // length check. A huge count must now return `UnexpectedEof`, never panic.
+        let mut buf = vec![0u8; 284]; // the minimum fixed-prefix length
+        buf[276..284].copy_from_slice(&u64::MAX.to_be_bytes()); // n_updates = 2^64-1
+        assert!(matches!(
+            decode_certified_header(&buf),
+            Err(CodecError::UnexpectedEof)
+        ));
+        // A merely-large count that still overflows when ×48 is likewise rejected, not panicked.
+        buf[276..284].copy_from_slice(&(usize::MAX as u64 / 8).to_be_bytes());
+        assert!(decode_certified_header(&buf).is_err());
+    }
+
+    #[test]
     fn decode_header_any_accepts_both_bare_and_certified() {
         // M211: `decode_header_any` must accept EITHER a bare BlockHeader hex
         // (`encode_header`) or the certified form `GET /header/{h}` returns
@@ -4082,6 +4111,7 @@ mod tests {
             base_emission_micro: 8 * MICRO,
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
+            max_validator_power_bps: 3_333, // M235 (§10.11): snapshot round-trip covers v6 field
             timestamp_days: 1.5,
             validators: vec![(21, pk(21), 3), (22, pk(22), 1)],
             bridge_sources: vec![],

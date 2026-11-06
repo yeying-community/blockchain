@@ -481,6 +481,12 @@ enum Cmd {
         op: Box<crate::GovVote>,
         reply: oneshot::Sender<Result<Hash, crate::ChainError>>,
     },
+    /// M229: submit a signed bond/unbond `StakeOp` to a running node (stage + flood), the
+    /// write counterpart to the `/bonds` read. Verifies the signature; `Ok(hash)` once staged.
+    SubmitStakeOp {
+        op: Box<crate::StakeOp>,
+        reply: oneshot::Sender<Result<Hash, crate::ChainError>>,
+    },
     /// M115: a pre-flight validation — run `validate_tx` against current committed state
     /// WITHOUT admitting the tx to the mempool. A wallet checks acceptability before
     /// actually submitting. `Ok(())` ⇒ would be accepted; `Err` ⇒ would be rejected (reason).
@@ -633,6 +639,12 @@ enum Cmd {
     QueryTxHeight {
         hash: crate::Hash,
         reply: oneshot::Sender<Option<u64>>,
+    },
+    /// M223: read a committed tx's decoded fields + mined height for `/tx/{hash}/detail`.
+    /// `None` ⇒ unknown/uncommitted hash, or the mining block was pruned (snapshot-boot).
+    QueryTxDetail {
+        hash: crate::Hash,
+        reply: oneshot::Sender<Option<(u64, crate::SubmissionTx)>>,
     },
     /// M113: read a committed block's header + body counts by height for `/block/{height}`.
     /// `None` ⇒ no such committed block (past the tip, or genesis height 0).
@@ -1698,6 +1710,18 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 let _ = tx.send(GossipMsg::Status {
                     height: actor.node.height(),
                 });
+                // M238 (§10.10): if we are running a consensus instance, re-deliver our own
+                // votes for the in-flight height to the (re)connected peer. A peer that was down
+                // during a quorum-loss halt restarts at round 0 while we churned to a high round;
+                // fire-and-forget gossip never replays those past votes, so its L55 round-skip
+                // can't fire and the chain stays wedged until a full restart. Re-sending our
+                // signed votes lets it observe f+1 across reconnected peers and skip up to the
+                // live round — closing the §10.10 auto-recovery gap without any unsafe jump.
+                if let Some(cons) = actor.cons.as_ref() {
+                    for m in cons.round.my_height_votes() {
+                        let _ = tx.send(GossipMsg::Consensus(Box::new(m)));
+                    }
+                }
                 // M39: kick discovery — hand the new peer our address book (incl.
                 // our own listen addr) so it can learn + dial the rest of the mesh.
                 if actor.peer_exchange {
@@ -1792,6 +1816,28 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                         Ok(h)
                     }
                     Err(e) => Err(e),
+                };
+                let _ = reply.send(res);
+            }
+            Cmd::SubmitStakeOp { op, reply } => {
+                // M229: verify the account's signature, then stage + flood the stake op
+                // (nonce/amount/validator-set rules are enforced at apply, which rolls the
+                // whole block back on failure). Mirrors the gov-op submit path.
+                let res = match actor.node.chain.state.accounts.get(&op.account) {
+                    Some(acct)
+                        if verify(
+                            &acct.pubkey,
+                            &crate::codec::stakeop_signing_bytes(&op),
+                            &op.signature,
+                        ) =>
+                    {
+                        let h = op.hash();
+                        let out = actor.node.submit_local_stake_op(*op);
+                        actor.route(out);
+                        Ok(h)
+                    }
+                    Some(_) => Err(crate::ChainError::BadSignature(op.account)),
+                    None => Err(crate::ChainError::UnknownAccount(op.account)),
                 };
                 let _ = reply.send(res);
             }
@@ -1973,6 +2019,18 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             Cmd::QueryTxHeight { hash, reply } => {
                 // M112: O(1) inclusion lookup against the node-local tx index.
                 let _ = reply.send(actor.tx_index.get(&hash).copied());
+            }
+            Cmd::QueryTxDetail { hash, reply } => {
+                // M223: inclusion height (tx index) → committed block (O(1) `block_at`) → the
+                // matching tx body. `None` if unknown/uncommitted or the block was pruned.
+                let detail = actor.tx_index.get(&hash).copied().and_then(|h| {
+                    actor
+                        .node
+                        .block_at(h)
+                        .and_then(|b| b.txs.iter().find(|t| t.hash() == hash).cloned())
+                        .map(|t| (h, t))
+                });
+                let _ = reply.send(detail);
             }
             Cmd::QueryBlock { height, reply } => {
                 // M113: locate the committed block at `height` and summarize its header + body.
@@ -3251,12 +3309,16 @@ fn http_response(status_line: &str, body: &str) -> String {
 /// JSON from the request's `Accept` header, so shared caches must key on it (lest a JSON
 /// body be replayed to a text client, or vice-versa). M82: the response also negotiates on
 /// `Accept-Charset` (UTF-8-only ⇒ possible `406`), so `Vary` widens to `Accept, Accept-Charset`.
+/// M223: every response carries `Access-Control-Allow-Origin: *` so a browser-based block
+/// explorer can read the (public) JSON API cross-origin. The read face is already public;
+/// write endpoints stay bearer-gated server-side (CORS is browser-enforced, not auth).
 fn http_response_ct(status_line: &str, content_type: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {}\r\n\
          Content-Type: {}\r\n\
          Content-Length: {}\r\n\
          Vary: Accept, Accept-Charset, Accept-Encoding\r\n\
+         Access-Control-Allow-Origin: *\r\n\
          Connection: close\r\n\
          \r\n\
          {}",
@@ -3536,6 +3598,10 @@ enum GetRoute {
     /// content hash mined? Pairs with `/mempool/{hash}` (pending): a wallet polls both to
     /// follow a submission from pool → block. 64-hex hash; malformed ⇒ 404.
     TxHeight(crate::Hash),
+    /// M223: `GET /tx/{hash}/detail` — the decoded fields of a committed tx (author, domain,
+    /// stake, fee, nonce, review/replication counts, timestamp, embedding dimension) plus its
+    /// mined height, for a block explorer. Unknown/uncommitted hash ⇒ 404; malformed ⇒ 404.
+    TxDetail(crate::Hash),
     /// M113: `GET /block/{height}` — a committed block's header + body counts, the on-wire
     /// companion to the `inspect-block` CLI. A height past the tip (or genesis, height 0,
     /// which has no log block) ⇒ 404. Non-numeric ⇒ 404.
@@ -4023,10 +4089,17 @@ fn route_get(path: &str) -> GetRoute {
                     .unwrap_or(GetRoute::NotFound)
             } else if let Some(rest) = p.strip_prefix("/tx/") {
                 // M112: `/tx/{hash}` is a committed-inclusion read — at which height (if any)
-                // was this tx mined? A malformed hash ⇒ 404.
-                parse_hash(rest)
-                    .map(GetRoute::TxHeight)
-                    .unwrap_or(GetRoute::NotFound)
+                // was this tx mined? M223: `/tx/{hash}/detail` returns the decoded tx fields
+                // (for a block explorer). A malformed hash ⇒ 404.
+                if let Some(h) = rest.strip_suffix("/detail") {
+                    parse_hash(h)
+                        .map(GetRoute::TxDetail)
+                        .unwrap_or(GetRoute::NotFound)
+                } else {
+                    parse_hash(rest)
+                        .map(GetRoute::TxHeight)
+                        .unwrap_or(GetRoute::NotFound)
+                }
             } else if let Some(rest) = p.strip_prefix("/block/") {
                 // M113/M114: `/block/{height}` is the header+counts read; `/block/{height}/txs`
                 // (M114) is the tx-reference list. A non-numeric height ⇒ 404; a height with no
@@ -4348,6 +4421,49 @@ fn json_tx_height(height: Option<u64>) -> String {
     }
 }
 
+/// M223: text render of a committed tx's decoded fields for `GET /tx/{hash}/detail`.
+/// Large/u64 ids keep the lossless quoted form in JSON; the raw embedding vector is omitted
+/// (only its dimension), and the signature is omitted (verifiable via SPV, not an explorer field).
+fn format_tx_detail(height: u64, tx: &crate::SubmissionTx) -> String {
+    format!(
+        "height={height}\nhash={}\nauthor={}\ndomain={}\nstake={}\nfee={}\nnonce={}\n\
+         reviews={}\nrepl_success={}\nrepl_total={}\ntimestamp_days={}\nembedding_dims={}",
+        crate::hash::hex(&tx.hash()),
+        tx.author,
+        tx.domain,
+        tx.stake,
+        tx.fee,
+        tx.nonce,
+        tx.reviews.len(),
+        tx.repl_success,
+        tx.repl_total,
+        json_f32(tx.timestamp_days),
+        tx.embedding.len(),
+    )
+}
+
+/// M223: JSON sibling of [`format_tx_detail`]. u64 ids are lossless quoted strings; small
+/// counts are bare numbers; `timestamp_days` is the bit-exact `json_f32`.
+fn json_tx_detail(height: u64, tx: &crate::SubmissionTx) -> String {
+    format!(
+        "{{\"height\":{},\"hash\":{},\"author\":{},\"domain\":{},\"stake\":{},\"fee\":{},\
+         \"nonce\":{},\"reviews\":{},\"repl_success\":{},\"repl_total\":{},\
+         \"timestamp_days\":{},\"embedding_dims\":{}}}",
+        json_u64(height),
+        json_str(&crate::hash::hex(&tx.hash())),
+        json_u64(tx.author),
+        tx.domain,
+        json_u64(tx.stake),
+        json_u64(tx.fee),
+        json_u64(tx.nonce),
+        tx.reviews.len(),
+        tx.repl_success,
+        tx.repl_total,
+        json_f32(tx.timestamp_days),
+        tx.embedding.len(),
+    )
+}
+
 /// M113: a committed block's header + body counts, for the `/block/{height}` read. The full
 /// tx/op bodies are large and self-addressable (`/tx/{hash}`); this is the lightweight index.
 struct BlockSummary {
@@ -4552,6 +4668,7 @@ const READ_ROUTES: &[&str] = &[
     "/bridge/lock/{id}/proof",
     "/mempool/{hash}",
     "/tx/{hash}",
+    "/tx/{hash}/detail",
     "/block/{height}",
     "/block/{height}/txs",
 ];
@@ -7018,6 +7135,26 @@ async fn serve_rpc_conn(
                     }
                 }
             }
+            GetRoute::TxDetail(hash) => {
+                // M223: decoded tx fields + mined height for a block explorer; 404 if the hash
+                // is unknown/uncommitted (or its block was pruned on a snapshot-booted node).
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryTxDetail { hash, reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(Some((height, tx))) => ok_body(
+                            fmt,
+                            &format_tx_detail(height, &tx),
+                            &json_tx_detail(height, &tx),
+                        ),
+                        Ok(None) => {
+                            http_response("404 Not Found", "tx not found in any committed block")
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
             GetRoute::Block(height) => {
                 // M113: committed-block read — the header + body counts, or 404 when there is
                 // no committed block at `height` (past the tip, or genesis height 0).
@@ -7521,6 +7658,44 @@ async fn serve_rpc_conn(
                 ok_body(fmt, &hex, &format!("{{\"hash\":{}}}", json_str(&hex)))
             }
             Ok(Err(e)) => error_body(fmt, gov_reject_status(&e), &e.to_string()),
+            Err(_) => http_response("503 Service Unavailable", "node stopped"),
+        };
+        let _ = stream.write_all(resp.as_bytes()).await;
+        let _ = stream.flush().await;
+        return;
+    }
+    if path == "/stake" {
+        // M229: `POST /stake` carries a raw codec-encoded StakeOp (bond/unbond); the actor
+        // verifies the signature, stages + floods it, and replies the op hash.
+        let op = match crate::codec::decode_stakeop(&body) {
+            Ok(op) => op,
+            Err(e) => {
+                let _ = stream
+                    .write_all(error_body(fmt, "400 Bad Request", &e.to_string()).as_bytes())
+                    .await;
+                let _ = stream.flush().await;
+                return;
+            }
+        };
+        let (reply, rx) = oneshot::channel();
+        if cmd
+            .send(Cmd::SubmitStakeOp {
+                op: Box::new(op),
+                reply,
+            })
+            .is_err()
+        {
+            let _ = stream
+                .write_all(http_response("503 Service Unavailable", "node stopped").as_bytes())
+                .await;
+            return;
+        }
+        let resp = match rx.await {
+            Ok(Ok(h)) => {
+                let hex = crate::hash::hex(&h);
+                ok_body(fmt, &hex, &format!("{{\"hash\":{}}}", json_str(&hex)))
+            }
+            Ok(Err(e)) => error_body(fmt, "422 Unprocessable Entity", &e.to_string()),
             Err(_) => http_response("503 Service Unavailable", "node stopped"),
         };
         let _ = stream.write_all(resp.as_bytes()).await;
@@ -9522,6 +9697,7 @@ mod tests {
             base_emission_micro: 8 * MICRO,
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
+            max_validator_power_bps: 0,
             timestamp_days: 0.0,
             validators: [21u64, 22, 23, 24]
                 .iter()
@@ -9962,6 +10138,119 @@ mod tests {
         assert!(
             chain.state.validators.get(21).is_none(),
             "validator 21 must be removed after being slashed for equivocation"
+        );
+
+        cleanup(&data_dirs);
+    }
+
+    #[tokio::test]
+    async fn equivocation_under_peer_auth_still_slashes() {
+        // M237 (§10.5): the same active-slashing guarantee as the test above, but the honest
+        // nodes now run with `require_peer_auth = true` (the production authenticated handshake).
+        // A Byzantine validator that holds a *valid* genesis key (here 21) still passes peer-auth
+        // — authentication proves key possession, not honesty — so the chain must still detect its
+        // double-sign and slash it. (mTLS / channel-binding are transport-only and never touch the
+        // signature-based slashing path, so peer-auth is the security-relevant layer to inject
+        // under; running over plain TCP lets the injector complete the signed handshake without a
+        // TLS client, which an attacker holding 21's key could equally do inside the TLS tunnel.)
+        use crate::consensus::{Vote, VoteType};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let live = [22u64, 23, 24];
+        let port_base = 19671u16;
+        let genesis = test_genesis(); // validators = 21,22,23,24
+
+        let mut nodes = Vec::new();
+        let mut data_dirs = BTreeMap::new();
+        for &id in &live {
+            let dir = tmp_dir(&format!("equiv-auth-n{id}"));
+            data_dirs.insert(id, dir.clone());
+            let mut cfg = node_config(id, port_base, &live, dir);
+            cfg.network.require_peer_auth = true; // production authenticated handshake
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
+                .await
+                .expect("start node");
+            nodes.push((id, node));
+        }
+
+        // Byzantine connection to each honest node, AUTHENTICATING as genesis validator 21.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut injectors = Vec::new();
+        for &id in &live {
+            let addr = format!("127.0.0.1:{}", port_base + (id - 21) as u16);
+            let stream = TcpStream::connect(&addr).await.expect("byzantine connect");
+            let _ = stream.set_nodelay(true);
+            let (mut rd, mut wr) = stream.into_split();
+            // 1) protocol version (as on every link).
+            negotiate_version(&mut rd, &mut wr)
+                .await
+                .expect("version negotiation");
+            // 2) the authenticated handshake, client side, as validator 21 (we hold kp(21)):
+            //    send HelloInit(id||pk||nonce), read the peer's, sign our transcript, exchange sigs.
+            let mut my_nonce = [0u8; 32];
+            getrandom::getrandom(&mut my_nonce).unwrap();
+            let mut init = Vec::with_capacity(72);
+            init.extend_from_slice(&21u64.to_be_bytes());
+            init.extend_from_slice(&kp(21).public());
+            init.extend_from_slice(&my_nonce);
+            wr.write_all(&init).await.expect("send HelloInit");
+            wr.flush().await.unwrap();
+            let mut pi = [0u8; 72];
+            rd.read_exact(&mut pi).await.expect("read peer HelloInit");
+            let peer_id = u64::from_be_bytes(pi[..8].try_into().unwrap());
+            let mut peer_nonce = [0u8; 32];
+            peer_nonce.copy_from_slice(&pi[40..72]);
+            // no TLS in this test ⇒ no channel binding (cb = None), exactly as the node computes it.
+            let transcript = auth_transcript(21, &my_nonce, peer_id, &peer_nonce, None);
+            let sig = kp(21).sign(&transcript);
+            wr.write_all(&sig).await.expect("send handshake signature");
+            wr.flush().await.unwrap();
+            let mut peer_sig = [0u8; 64];
+            rd.read_exact(&mut peer_sig)
+                .await
+                .expect("read peer signature");
+            // Drain (and discard) everything the honest node sends us.
+            tokio::spawn(async move { while read_frame(&mut rd).await.is_ok() {} });
+            injectors.push(wr);
+        }
+
+        // Flood two conflicting precommits until an honest node commits evidence against 21.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(50);
+        let mut ev_height: Option<u64> = None;
+        while tokio::time::Instant::now() < deadline {
+            let h = nodes[0].1.status().await.map(|(h, _)| h).unwrap_or(0);
+            let target = h + 1;
+            let va = Vote::signed(21, target, 0, [1u8; 32], VoteType::Precommit, &kp(21));
+            let vb = Vote::signed(21, target, 0, [2u8; 32], VoteType::Precommit, &kp(21));
+            let ma = GossipMsg::Consensus(Box::new(Msg::Vote(va)));
+            let mb = GossipMsg::Consensus(Box::new(Msg::Vote(vb)));
+            for wr in injectors.iter_mut() {
+                let _ = write_frame(wr, &ma).await;
+                let _ = write_frame(wr, &mb).await;
+            }
+            if let Ok(blocks) =
+                BlockLog::open(format!("{}/blocks.log", data_dirs[&22])).and_then(|l| l.read_all())
+            {
+                if let Some(b) = blocks
+                    .iter()
+                    .find(|b| b.slashing_evidence.iter().any(|e| e.vote_a.validator == 21))
+                {
+                    ev_height = Some(b.height);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+
+        let ev_height =
+            ev_height.expect("evidence against 21 committed on-chain even under peer-auth");
+        let (blocks, certs) =
+            read_prefix(&data_dirs[&22], ev_height as usize, Duration::from_secs(5)).await;
+        let chain =
+            crate::Chain::replay_verified(genesis.clone(), &blocks, &certs).expect("finality");
+        assert!(
+            chain.state.validators.get(21).is_none(),
+            "an authenticated-but-Byzantine validator is still slashed and removed"
         );
 
         cleanup(&data_dirs);
@@ -10868,6 +11157,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_stake_submit_over_tcp() {
+        // M229: `POST /stake` accepts a signed bond StakeOp (200 + op hash), rejects a
+        // bad signature and an unknown account (422). Verifies the submit endpoint (decode +
+        // sig-verify + stage); applying the bond to `/bonds` is existing staking behavior.
+        let dir = tmp_dir("rpc-stake");
+        let mut cfg = node_config(21, 21461, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:21492";
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
+        });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let _node = Node::start(cfg, genesis, Some(kp(21)), None)
+            .await
+            .expect("start node");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        async fn post(addr: &str, body: &[u8]) -> String {
+            let mut req = format!(
+                "POST /stake HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(body);
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(&req).await.expect("send");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        let bond = |acct: u64, signer: u64| {
+            crate::StakeOp {
+                account: acct,
+                kind: crate::BondKind::Bond,
+                amount: 5 * MICRO,
+                signature: [0u8; 64],
+            }
+            .signed(&kp(signer))
+        };
+
+        // Valid bond from account 1 → 200 + its op hash.
+        let op = bond(1, 1);
+        let t = post(rpc_addr, &crate::codec::encode_stakeop(&op)).await;
+        assert!(t.starts_with("HTTP/1.1 200 OK"), "valid bond: {t}");
+        assert!(
+            t.contains(&crate::hash::hex(&op.hash())),
+            "hash in body: {t}"
+        );
+
+        // Wrong signer (kp(2) signing account 1) → 422 BadSignature.
+        let t = post(rpc_addr, &crate::codec::encode_stakeop(&bond(1, 2))).await;
+        assert!(t.starts_with("HTTP/1.1 422"), "bad sig → 422: {t}");
+
+        // Unknown account (99 not in genesis) → 422 UnknownAccount.
+        let t = post(rpc_addr, &crate::codec::encode_stakeop(&bond(99, 99))).await;
+        assert!(t.starts_with("HTTP/1.1 422"), "unknown account → 422: {t}");
+
+        // Malformed body → 400.
+        let t = post(rpc_addr, b"not-a-stakeop").await;
+        assert!(t.starts_with("HTTP/1.1 400"), "malformed → 400: {t}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_endpoint_accepts_tx_over_tcp() {
         // M53: enable the ingress RPC, POST a codec-encoded tx over TCP, and
         // assert 200 + hash in the body; then confirm it entered the mempool.
@@ -11596,6 +11953,7 @@ mod tests {
             base_emission_micro: 0,
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
+            max_validator_power_bps: 0,
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
@@ -12866,6 +13224,46 @@ mod tests {
         assert!(
             bad.starts_with("HTTP/1.1 404 Not Found"),
             "malformed ⇒ 404: {bad}"
+        );
+
+        // M223: `/tx/{hash}/detail` returns the decoded fields (text + JSON); CORS header is
+        // present for a browser explorer; an unknown hash ⇒ 404.
+        let detail = get(rpc_addr, &format!("/tx/{h}/detail")).await;
+        assert!(
+            detail.starts_with("HTTP/1.1 200 OK"),
+            "detail status: {detail}"
+        );
+        assert!(
+            detail.contains("Access-Control-Allow-Origin: *"),
+            "CORS header present: {detail}"
+        );
+        let dbody = body_of(&detail);
+        assert!(
+            dbody.contains(&format!("height={committed}")),
+            "detail body: {dbody}"
+        );
+        assert!(dbody.contains("author=1"), "detail author: {dbody}");
+        assert!(dbody.contains("nonce=0"), "detail nonce: {dbody}");
+        assert!(
+            dbody.contains("embedding_dims="),
+            "detail embedding dims: {dbody}"
+        );
+
+        let detail_json = get(rpc_addr, &format!("/tx/{h}/detail?format=json")).await;
+        let jbody = body_of(&detail_json);
+        assert!(
+            jbody.contains("\"author\":\"1\""),
+            "detail json author: {jbody}"
+        );
+        assert!(
+            jbody.contains(&format!("\"height\":\"{committed}\"")),
+            "detail json height: {jbody}"
+        );
+
+        let detail_absent = get(rpc_addr, &format!("/tx/{other}/detail")).await;
+        assert!(
+            detail_absent.starts_with("HTTP/1.1 404 Not Found"),
+            "unknown tx detail ⇒ 404: {detail_absent}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -15029,6 +15427,7 @@ mod tests {
             base_emission_micro: 0,
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
+            max_validator_power_bps: 0,
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
@@ -15545,6 +15944,15 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             GetRoute::TxHeight(bytes) => assert_eq!(bytes, [0x9au8; 32]),
             _ => panic!("expected TxHeight for a valid 64-hex hash"),
         }
+        // M223: the `/detail` suffix routes to TxDetail with the same hash.
+        match route_get(&format!("/tx/{h}/detail")) {
+            GetRoute::TxDetail(bytes) => assert_eq!(bytes, [0x9au8; 32]),
+            _ => panic!("expected TxDetail for /tx/{{hash}}/detail"),
+        }
+        assert!(
+            matches!(route_get("/tx/bad/detail"), GetRoute::NotFound),
+            "non-hex /detail ⇒ 404"
+        );
         assert!(
             matches!(route_get("/tx/bad"), GetRoute::NotFound),
             "non-hex ⇒ 404"
@@ -15947,6 +16355,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             "/mempool",
             "/block/{height}",
             "/tx/{hash}",
+            "/tx/{hash}/detail",
         ] {
             assert!(text.lines().any(|l| l == p), "text index lists {p}: {text}");
         }
@@ -16193,6 +16602,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             base_emission_micro: 0,
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
+            max_validator_power_bps: 0,
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],

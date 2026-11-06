@@ -55,7 +55,7 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 # 其中位锚点测(见 §6)验证共识浮点逐位一致。
 ```
 
-- 测试总数:**node 755(697 lib + 58 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
+- 测试总数:**node 768(707 lib + 61 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
   环境依赖测;M213 的 `seed_fuzz_corpus` 语料生成器,均非安全相关)。
 - `unsafe`:**全仓非测试代码 0 处**(`grep -rn unsafe engine/src node/src`)。
 - 无 `cargo-audit` 门禁(当前 advisory,依赖树未确认无 RUSTSEC —— 见 §10)。
@@ -220,11 +220,62 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 4. **治理刚上线**(M193–198),未经对抗/洪流/临界票数压测。
 5. **无长跑/网络分区/混沌测**;fuzz 有两层:always-on 的 "fuzz-lite"(确定性 PRNG 轰全部 29 个
    `decode_*` 入口,stable CI 门禁)+ **M213 cargo-fuzz**(`node/fuzz/` libFuzzer `decode_all`
-   多路目标 + 提交的种子语料,nightly CI advisory 跑;见 `node/fuzz/README.md`)。仍无混沌/分区测。
+   多路目标 + 提交的种子语料,nightly CI advisory 跑;见 `node/fuzz/README.md`)。**M231 起**补
+   `testnet/chaos.sh`:对 4 验证人测试网注入**崩溃容错**(杀少数、存活 >2/3 继续出块且不分叉)、
+   **崩溃恢复**(重启节点追回同一 head)、**失去法定数的安全停摆**(在线 < 法定数时停摆而非分叉)
+   + 恢复——均为 loopback 可达场景(无需 root/iptables)。**M232 起**补 `testnet/soak.sh`:
+   长跑稳定性 soak,每采样点断言活性(高度严格递增)、不分叉/不漂移(跨节点区块哈希 **+ state_root**
+   一致)、供应守恒且跨节点一致、无内存泄漏(RSS 增幅有界)、干净日志。**活体拜占庭 → 罚没已有集成测**
+   (`equivocation_over_tcp_slashes_the_offender`,daemon.rs:真实 TCP 套接字上一个冒充验证人的裸 peer
+   泛洪两张冲突 precommit,诚实节点经 wire 观测双签 → 产证据 → 入块 → 罚没并移出验证人集;另有
+   `slashes_an_equivocating_validator_through_the_certified_chain` 走认证链)。**M234 起** `soak.sh load`
+   驱动真实 **tx 负载**(从加密 keystore 授权知识 tx → `submit-tx` 投到 bearer 门控写面;CLI 现发配置
+   token,M233/M234;实测 5/5 tx 接受、供应守恒+跨节点一致)。**M236 起** `gen.sh --permissioned`
+   开**完全加固许可制姿态**(genesis-pinned mTLS `require_peer_certs` + RFC5705 `bind_channel`,叠加
+   既有 peer-auth + TLS);实测该姿态下 `smoke`/`chaos`/`soak load` **全过**(收敛、崩溃容错+安全停摆+
+   mTLS 重连恢复、tx 经 mTLS gossip 落块)。**M237 起**补 `equivocation_under_peer_auth_still_slashes`:
+   honest 节点开 `require_peer_auth`,一个持**有效创世密钥**的拜占庭验证人(21)完成认证握手后仍泛洪
+   双签——链照常检测 → 产证据 → 入块 → 罚没移除它(证明认证层拦不住"有合法密钥的内鬼",罚没仍生效;
+   mTLS/通道绑定为传输层,不触碰基于签名的罚没路径,故在 peer-auth 层注入即安全相关闭环)。仍无**真正的
+   网络分区注入**(iptables/tc 延迟·丢包,需 root,本环境不可做)、**加固姿态(mTLS)下的双签注入**
+   (已在 peer-auth 层注入;mTLS 层需 TLS 客户端注入器,属传输层、安全等价)、**小时/天级或跨机规模的
+   长跑**(当前 loopback、数百区块级)。见 §10.10 的活性恢复边界、§10.11 的绑定准入边界。
 6. **`cargo-audit` 当前 advisory**(依赖树未确认无 RUSTSEC)。
 7. **滚动升级未支持**(只能干净拒连不兼容 peer)。设计见 [`docs/design/rolling-upgrade.md`](design/rolling-upgrade.md)(设计稿,待实现)。
 8. **弱主观性检查点分发**是运维事项(协议只提供验证基元)。
 9. TLS 版本协商在 `require_peer_auth` 下先于认证,MITM 篡改版本只致**拒连**(非降级),属 DoS。
+10. **失去法定数停摆后的自动活性恢复不完整**(M231 `chaos.sh` Phase B 暴露)。失去 >2/3 在线的
+    停摆期间,**保持在线**的验证人对待定高度不断换轮(propose 超时 → round++);被杀后重启的节点
+    从 round 0 开始。法定数恢复后两侧轮次号**不经 gossip 自动对齐**(无轮次追赶 / catch-up),存活
+    节点仍卡住(`/metrics` 见 `zhixing_consensus_active=1` 但 `zhixing_height` 冻结),即便所有
+    peer 已重连。**安全性始终不破**:无 >2/3 不出块 → 不分叉、正确停摆(供应守恒、state_root 一致)。
+    **仅自动活性恢复受影响**。
+    **M238 已修复**:节点在**对端(重)连接时**(`Cmd::Register`)向其重发**自己对待定高度所有轮次的
+    已签名投票**(`RoundState::my_height_votes`)。重启的节点(round 0)由此跨重连对端观察到 `f+1` 个
+    验证人在更高轮次的投票,触发**既有 L55 轮次跳转**跳到活跃轮次——无新的不安全跳转,仅重投已签名的
+    自有票。实测 `chaos.sh` Phase B 现**只重启被杀节点即自动恢复**(连跑两次,链在同一 head 续至 h13/h34),
+    不再需要全量重启。残余:重发在对端"同高度"时才有效;若对端尚落后高度,先走区块同步,随后新一轮
+    连接/重发对齐(混沌实测稳定)。
+11. **绑定即验证人权力,无在运证明 / 无激活延迟 / 无权力爬坡**(M234 tx-load soak 过程中实测暴露)。
+    `apply_block_inner` 对**任何**绑定了质押的账户直接 `ValidatorUpdate { id, power: bonds[id] }`——
+    即一笔 `bond` 会**立刻**把该账户注入活跃验证人集,权力 = 绑定额。若该账户的密钥**并未运行验证人
+    节点**,这份权力是永远不会投票的"幽灵权力";当它超过总权力的 1/3 时,法定数**永久不可达**——
+    链停摆且**重启也无法恢复**(与 §10.10 不同,这不是轮次漂移,而是集合本身已不可能达成 quorum)。
+    实测:4 个 power=1(总 4)的验证人链上,用一个**不运行节点**的创世账户绑定 1000 → 它以 power=1000
+    独占 >2/3 → 全链冻结,`gen.sh` 重来才恢复。**安全性不破**(不分叉、供应守恒),是**活性**风险。
+    这是本链经济/共识模型的**已知边界**(bond == stake == power,无许可验证人准入很常见),但锐利之处在于
+    **无 proof-of-operation、无绑定激活延迟、无单笔权力占比上限**,故小规模链上一笔绑定即可瘫痪共识。
+    运维缓解:受控/许可制网络下绑定由可信方操作、且只对**在运密钥**绑定;主网前应加准入门槛(最小/
+    封顶权力、激活延迟、或绑定与在运证明挂钩)。因此 `testnet/soak.sh` 的负载用**知识 tx**(不动验证人集)
+    而非 stake-op。
+    **M235 已缓解**:新增创世参数 `max_validator_power_bps`(默认 `0`=禁用;`testnet/gen.sh` 设 `3333`=1/3)。
+    `apply_block_inner` 拒绝任何会让**新加入**验证人超过该占比的更新(`ValidatorPowerShareExceeded`,
+    整块回滚);折入 `state_root`(SEC-02 式,防篡改)。**创世/既有验证人豁免**(它们是运营方选定且已在运的
+    参与者,豁免也让单验证人链与正常再绑定可用);`mempool`/候选块经 `filter_applicable_stake_ops` 丢弃超限
+    绑定以免生产停摆(镜像 SEC-01 的 gov 过滤)。启用后单账户无法再凭一笔绑定占 ≥1/3 → 幽灵验证人不能瘫痪
+    quorum。**残余**:① 豁免的既有验证人若**后续**增绑超 1/3 再下线仍可影响活性(范围窄,与 §10.2 活性问责
+    重叠);② `0` 默认为向后兼容,运营方须**显式**在创世启用;③ 治理动态调参(`GovParam`)为后续项。属
+    **已缓解的已知边界**。
 
 ## 11. 负责任披露
 

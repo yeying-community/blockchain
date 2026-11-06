@@ -48,8 +48,8 @@ use zhixing_node::store::{BlockLog, CertLog};
 use zhixing_node::validator::{Validator, ValidatorSet, ValidatorUpdate};
 use zhixing_node::{
     hex, Block, BondKind, BridgeHeader, BridgeLock, BridgeRedeem, BridgeUnbond, Chain, ChainError,
-    ChainState, Genesis, KeyRotation, Keypair, Review, SlashEvidence, StakeOp, SubmissionTx, Vote,
-    VoteType, MICRO,
+    ChainState, Genesis, GovParam, GovProposal, GovVote, KeyRotation, Keypair, Review,
+    SlashEvidence, StakeOp, SubmissionTx, Vote, VoteType, MICRO,
 };
 
 type Emb = [f32; DIM];
@@ -144,6 +144,7 @@ fn demo_genesis() -> Genesis {
         base_emission_micro: 8 * MICRO,
         decay_half_life_blocks: 0, // M187: decay disabled in the demo (canon unchanged)
         slash_bps: 10_000,
+        max_validator_power_bps: 0,
         timestamp_days: 0.0,
         validators: vset
             .validators()
@@ -326,6 +327,9 @@ fn main() {
         "submit-tx" => cmd_submit_tx(config_arg(&args), tx_arg(&args)),
         "rpc" => cmd_rpc(&args),
         "encode-tx" => cmd_encode_tx(&args),
+        "encode-gov-proposal" => cmd_encode_gov_proposal(&args),
+        "encode-gov-vote" => cmd_encode_gov_vote(&args),
+        "encode-stakeop" => cmd_encode_stakeop(&args),
         "keygen" => cmd_keygen(&args),
         "encrypt-key" => cmd_encrypt_key(&args),
         "signer" => cmd_signer(&args),
@@ -427,7 +431,10 @@ fn usage() {
     eprintln!("  node inspect-genesis --config F  dump the config's genesis contents: every account (id/balance/pubkey), reviewer, validator, plus params (the detail view to genesis-hash's identity)");
     eprintln!("  node submit-tx --config F --tx F  submit a codec-encoded tx to a running daemon's [rpc] ingress endpoint; print accepted hash or reject reason");
     eprintln!("  node rpc --config F --path P [--post FILE]  send a request to the config's [rpc] endpoint and print the response body; GET by default, or POST FILE's raw bytes (e.g. /validate, /submit_tx, /batch)");
-    eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--fee MICRO] [--nonce N] [--config F]  author+sign a tx offline into a submit-tx file; print its hash; M122: --fee paid to the proposer (default 0), --nonce must equal the author's account nonce (default 0)");
+    eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--fee MICRO] [--nonce N] [--config F]  author+sign a tx offline into a submit-tx file; print its hash; M122: --fee paid to the proposer (default 0), --nonce must equal the author's account nonce (default 0); M233: --key-file is a raw 64-hex seed OR an encrypted keystore (ZHIXING_KEYSTORE_PASSWORD) — same for encode-stakeop/encode-gov-*");
+    eprintln!("  node encode-gov-proposal --key-file F --out F --proposer N --param name=value --voting-period N [--nonce N]  M228: author+sign a GovProposal (param: base_emission|slash_bps|decay_half_life) into a raw op file for `node rpc --path /gov/proposal --post F`");
+    eprintln!("  node encode-gov-vote --key-file F --out F --proposal-id N --voter N --approve true|false [--nonce N]  M228: author+sign a GovVote into a raw op file for `node rpc --path /gov/vote --post F`");
+    eprintln!("  node encode-stakeop --key-file F --out F --account N --kind bond|unbond --amount N  M229: author+sign a bond/unbond StakeOp into a raw op file for `node rpc --path /stake --post F`");
     eprintln!("  node inspect-tx --tx F [--pubkey HEX]  decode a codec-encoded tx file and print its fields + content hash; with --pubkey, also verify the signature (the read-side companion to encode-tx)");
     eprintln!("  node keygen --out F [--seed HEX]  generate (or derive from a 64-hex seed) an ed25519 keypair; write the seed file (for encode-tx --key-file) and print the pubkey");
     eprintln!("  node keygen ... --new-mnemonic [--encrypt]  M169/M175: generate a fresh BIP-39 mnemonic; --encrypt (M175) writes an encrypted Web3SS keystore to --out (prompts for a password) instead of a plaintext seed file");
@@ -3935,6 +3942,26 @@ fn derive_pubkey(seed_hex: &str, field: &str) -> Result<String, config::ConfigEr
     Ok(hex(&Keypair::from_seed(seed).public()))
 }
 
+/// M233: resolve a signing seed from `--key-file`, accepting EITHER a 64-hex raw seed (what
+/// `keygen` writes) OR a Web3 Secret Storage v3 encrypted keystore (what `keygen --encrypt` /
+/// `encrypt-key` / the `testnet/` harness write). A keystore is decrypted with the password
+/// from `ZHIXING_KEYSTORE_PASSWORD` (unattended) or a no-echo prompt — the same discipline as
+/// `node run` / `node signer`. This lets the offline op-authoring commands (`encode-tx` /
+/// `encode-stakeop` / `encode-gov-*`) sign from an encrypted keystore, not just a plaintext
+/// seed — e.g. driving tx load against the production-parity testnet (`testnet/soak.sh`).
+fn read_seed_from_key_file(path: &str) -> [u8; 32] {
+    let contents = std::fs::read_to_string(path).unwrap_or_else(|e| fail("read key file", e));
+    let trimmed = contents.trim();
+    // A raw seed is exactly 64 hex chars; anything else is treated as keystore JSON.
+    if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return config::decode_seed(trimmed, "--key-file")
+            .unwrap_or_else(|e| fail_msg("decode key seed", &e));
+    }
+    let password = read_keystore_password_from("ZHIXING_KEYSTORE_PASSWORD", path);
+    zhixing_node::keystore::decrypt_seed(&contents, &password)
+        .unwrap_or_else(|e| fail_msg("decrypt keystore", &e))
+}
+
 /// M99: `node pubkey (--key-file F | --seed HEX) [--genesis-id N ...]` — derive and print the
 /// pubkey for an existing seed **without writing any file** (unlike `keygen`, which recovers a
 /// pubkey only as a side effect of writing a seed file). Read-only; pairs with
@@ -4259,15 +4286,12 @@ fn cmd_submit_tx(config_path: String, tx_path: String) {
     }
 
     let mut stream = std::net::TcpStream::connect(&addr).unwrap_or_else(|e| fail("connect rpc", e));
-    let header = format!(
-        "POST /submit_tx HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
+    // M234: carry the configured `[rpc] auth_token` as a bearer so a token-gated write face
+    // accepts the submission (empty token ⇒ no header, unchanged for open loopback nets).
+    let token = (!rpc.auth_token.is_empty()).then_some(rpc.auth_token.as_str());
+    let req = rpc_post_request(&addr, "/submit_tx", &body, token);
     stream
-        .write_all(header.as_bytes())
-        .unwrap_or_else(|e| fail("send request", e));
-    stream
-        .write_all(&body)
+        .write_all(&req)
         .unwrap_or_else(|e| fail("send request", e));
 
     let mut resp = Vec::new();
@@ -4297,10 +4321,17 @@ fn rpc_get_request(host: &str, path: &str) -> String {
 
 /// M117: build a full HTTP/1.1 POST request (header block + raw body) for the RPC client's
 /// `--post` mode. Returns bytes (not a `String`) so a binary codec body passes through
-/// untouched; `Content-Length` is the exact body length. Pure for unit testing.
-fn rpc_post_request(host: &str, path: &str, body: &[u8]) -> Vec<u8> {
+/// untouched; `Content-Length` is the exact body length. M234: `token` adds an
+/// `Authorization: Bearer <token>` header so the client can reach a bearer-gated write face
+/// (`[rpc] auth_token`); an empty/`None` token sends no auth header (public reads unaffected).
+/// Pure for unit testing.
+fn rpc_post_request(host: &str, path: &str, body: &[u8], token: Option<&str>) -> Vec<u8> {
+    let auth = match token {
+        Some(t) if !t.is_empty() => format!("Authorization: Bearer {t}\r\n"),
+        _ => String::new(),
+    };
     let mut req = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();
@@ -4338,13 +4369,16 @@ fn cmd_rpc(args: &[String]) {
         ),
     };
     let addr = rpc.listen.clone();
+    // M234: send `[rpc] auth_token` as a bearer on POST so bearer-gated writes
+    // (/submit_tx, /gov/*, /stake) are accepted; reads stay public (no header needed).
+    let token = (!rpc.auth_token.is_empty()).then_some(rpc.auth_token.as_str());
 
     let mut stream = std::net::TcpStream::connect(&addr).unwrap_or_else(|e| fail("connect rpc", e));
     match opt_arg(args, "--post") {
         Some(file) => {
             let body = std::fs::read(file).unwrap_or_else(|e| fail("read post body", e));
             stream
-                .write_all(&rpc_post_request(&addr, path, &body))
+                .write_all(&rpc_post_request(&addr, path, &body, token))
                 .unwrap_or_else(|e| fail("send request", e));
         }
         None => {
@@ -4517,11 +4551,9 @@ fn cmd_encode_tx(args: &[String]) {
         .map(|r| parse_review(r).unwrap_or_else(|e| fail_msg("encode-tx review", &e)))
         .collect();
 
-    // --key-file holds a 64-char hex seed (a trailing newline is tolerated via
-    // `trim`); reuse config::decode_seed for identical parsing + BadHex errors.
-    let key_hex = std::fs::read_to_string(key_path).unwrap_or_else(|e| fail("read key file", e));
-    let seed = config::decode_seed(key_hex.trim(), "--key-file")
-        .unwrap_or_else(|e| fail_msg("decode key seed", &e));
+    // --key-file is a raw 64-hex seed OR an encrypted keystore (M233); see
+    // `read_seed_from_key_file`.
+    let seed = read_seed_from_key_file(key_path);
     let kp = Keypair::from_seed(seed);
 
     // Optional guardrail: the derived pubkey must match the author's genesis entry.
@@ -4570,6 +4602,120 @@ fn cmd_encode_tx(args: &[String]) {
     std::fs::write(out_path, &bytes).unwrap_or_else(|e| fail("write tx file", e));
     println!("encoded {}", hex(&tx.hash()));
     println!("bytes {}", bytes.len());
+    println!("out {out_path}");
+}
+
+/// M228: parse a `--param name=value` governance target into a [`GovParam`]. Supports the
+/// three scalar knobs (`base_emission`, `slash_bps`, `decay_half_life`); the ΔK fields
+/// (`GovParam::DeltaK`) are not expressible on the CLI yet (they need per-field addressing).
+fn parse_gov_param(s: &str) -> Result<GovParam, String> {
+    let (name, val) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected name=value, got `{s}`"))?;
+    let val = val.trim();
+    let bad = || format!("`{val}` is not a valid number for {name}");
+    match name.trim() {
+        "base_emission" => Ok(GovParam::BaseEmission(val.parse().map_err(|_| bad())?)),
+        "slash_bps" => Ok(GovParam::SlashBps(val.parse().map_err(|_| bad())?)),
+        "decay_half_life" => Ok(GovParam::DecayHalfLife(val.parse().map_err(|_| bad())?)),
+        other => Err(format!(
+            "unknown/unsupported param `{other}` (CLI supports base_emission, slash_bps, decay_half_life)"
+        )),
+    }
+}
+
+/// M228: author + ed25519-sign a `GovProposal` offline (the producer side of M198's
+/// `POST /gov/proposal`), writing the raw `codec::encode_gov_proposal` bytes to `--out` for
+/// `node rpc --path /gov/proposal --post <out>`. Mirrors `encode-tx`: `--key-file` is the
+/// proposer's 64-hex seed; `--param name=value` names the target; the id is assigned on apply.
+fn cmd_encode_gov_proposal(args: &[String]) {
+    let key_path = req_arg(args, "--key-file");
+    let out_path = req_arg(args, "--out");
+    let proposer: u64 = parse_arg(args, "--proposer");
+    let voting_period: u64 = parse_arg(args, "--voting-period");
+    let nonce: u64 = opt_arg(args, "--nonce")
+        .map(|s| s.parse().unwrap_or(0))
+        .unwrap_or(0);
+    let param = parse_gov_param(req_arg(args, "--param"))
+        .unwrap_or_else(|e| fail_msg("encode-gov-proposal param", &e));
+    let seed = read_seed_from_key_file(key_path);
+    let op = GovProposal {
+        proposer,
+        param,
+        voting_period,
+        nonce,
+        signature: [0u8; 64],
+    }
+    .signed(&Keypair::from_seed(seed));
+    let bytes = zhixing_node::codec::encode_gov_proposal(&op);
+    if let Err(e) = zhixing_node::codec::decode_gov_proposal(&bytes) {
+        fail_msg("encode-gov-proposal self-check", &e);
+    }
+    std::fs::write(out_path, &bytes).unwrap_or_else(|e| fail("write op file", e));
+    println!("encoded {}", hex(&op.hash()));
+    println!("out {out_path}");
+}
+
+/// M228: author + ed25519-sign a `GovVote` offline (producer side of `POST /gov/vote`).
+/// `--key-file` is the voter's seed; `--proposal-id` the open proposal; `--approve true|false`.
+fn cmd_encode_gov_vote(args: &[String]) {
+    let key_path = req_arg(args, "--key-file");
+    let out_path = req_arg(args, "--out");
+    let proposal_id: u64 = parse_arg(args, "--proposal-id");
+    let voter: u64 = parse_arg(args, "--voter");
+    let approve: bool = parse_arg(args, "--approve");
+    let nonce: u64 = opt_arg(args, "--nonce")
+        .map(|s| s.parse().unwrap_or(0))
+        .unwrap_or(0);
+    let seed = read_seed_from_key_file(key_path);
+    let op = GovVote {
+        proposal_id,
+        voter,
+        approve,
+        nonce,
+        signature: [0u8; 64],
+    }
+    .signed(&Keypair::from_seed(seed));
+    let bytes = zhixing_node::codec::encode_gov_vote(&op);
+    if let Err(e) = zhixing_node::codec::decode_gov_vote(&bytes) {
+        fail_msg("encode-gov-vote self-check", &e);
+    }
+    std::fs::write(out_path, &bytes).unwrap_or_else(|e| fail("write op file", e));
+    println!("encoded {}", hex(&op.hash()));
+    println!("out {out_path}");
+}
+
+/// M229: author + ed25519-sign a bond/unbond `StakeOp` offline, writing raw
+/// `codec::encode_stakeop` bytes to `--out` for `node rpc --path /stake --post <out>`.
+/// The write counterpart to the `/bonds` read — lets an operator change stake on a running
+/// node (amount/nonce/validator rules checked at apply). `--kind bond|unbond`.
+fn cmd_encode_stakeop(args: &[String]) {
+    let key_path = req_arg(args, "--key-file");
+    let out_path = req_arg(args, "--out");
+    let account: u64 = parse_arg(args, "--account");
+    let amount: u64 = parse_arg(args, "--amount");
+    let kind = match req_arg(args, "--kind") {
+        "bond" => BondKind::Bond,
+        "unbond" => BondKind::Unbond,
+        other => fail_msg(
+            "encode-stakeop kind",
+            &format!("`{other}` (use bond|unbond)"),
+        ),
+    };
+    let seed = read_seed_from_key_file(key_path);
+    let op = StakeOp {
+        account,
+        kind,
+        amount,
+        signature: [0u8; 64],
+    }
+    .signed(&Keypair::from_seed(seed));
+    let bytes = zhixing_node::codec::encode_stakeop(&op);
+    if let Err(e) = zhixing_node::codec::decode_stakeop(&bytes) {
+        fail_msg("encode-stakeop self-check", &e);
+    }
+    std::fs::write(out_path, &bytes).unwrap_or_else(|e| fail("write op file", e));
+    println!("encoded {}", hex(&op.hash()));
     println!("out {out_path}");
 }
 
@@ -5693,6 +5839,32 @@ fn demo_driver_seeds() -> std::collections::BTreeMap<u64, [u8; 32]> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn parse_gov_param_scalars_and_errors() {
+        // M228: the three CLI-expressible governance params parse to the right variant/type.
+        assert_eq!(
+            parse_gov_param("base_emission=9000000").unwrap(),
+            GovParam::BaseEmission(9_000_000)
+        );
+        assert_eq!(
+            parse_gov_param("slash_bps=5000").unwrap(),
+            GovParam::SlashBps(5000)
+        );
+        assert_eq!(
+            parse_gov_param("decay_half_life=1000").unwrap(),
+            GovParam::DecayHalfLife(1000)
+        );
+        assert!(
+            parse_gov_param("slash_bps=notnum").is_err(),
+            "non-numeric value"
+        );
+        assert!(
+            parse_gov_param("deltak_min=0.1").is_err(),
+            "ΔK not CLI-expressible"
+        );
+        assert!(parse_gov_param("no_equals_sign").is_err(), "missing =");
+    }
+
     /// M179 (doc-integrity guard): the `demo` chain's cert-signed STATE roots are
     /// M181/M183: guard the demo chain's cert-signed STATE roots against silent
     /// drift. `merkle_root` (accounts_root) is the wire-v1 value the READMEs cite
@@ -5718,7 +5890,8 @@ mod tests {
         }
         assert_eq!(
             hex(&chain.state.state_root()),
-            "01c163cec782b5022db9993b822c1d0b9a1defb5c90875306a4073b2a98d296b"
+            // M235: re-baselined — the §10.11 share cap folds into state_root (SEC-02 style).
+            "f656223f0db70b2683c3b6cac1ac017f2165d39983e211554010a99730010ddd"
         );
         assert_eq!(
             hex(&chain.state.merkle_root()),
@@ -5740,6 +5913,36 @@ mod tests {
         std::env::set_var(var, "");
         assert!(std::env::var(var).unwrap().is_empty());
         std::env::remove_var(var);
+    }
+
+    #[test]
+    fn read_seed_from_key_file_accepts_raw_seed_and_keystore() {
+        // M233: `--key-file` resolves EITHER a raw 64-hex seed OR an encrypted keystore,
+        // so the offline op-authoring commands can sign from the production-parity
+        // keystores the testnet ships (not just plaintext seeds).
+        let seed = seed_for(7);
+        let dir = std::env::temp_dir();
+
+        // (1) raw 64-hex seed (trailing newline tolerated)
+        let raw = dir.join(format!("zx-m233-{}-raw", std::process::id()));
+        std::fs::write(&raw, format!("{}\n", zhixing_node::hash::hex(&seed))).unwrap();
+        assert_eq!(read_seed_from_key_file(raw.to_str().unwrap()), seed);
+        let _ = std::fs::remove_file(&raw);
+
+        // (2) Web3 Secret Storage v3 encrypted keystore, password via env (unattended)
+        let ks = zhixing_node::keystore::encrypt_seed(&seed, "pw-m233").unwrap();
+        let json = zhixing_node::keystore::to_json(&ks).unwrap();
+        let ksf = dir.join(format!("zx-m233-{}-ks.json", std::process::id()));
+        std::fs::write(&ksf, &json).unwrap();
+        let var = "ZHIXING_KEYSTORE_PASSWORD";
+        let prev = std::env::var(var).ok();
+        std::env::set_var(var, "pw-m233");
+        assert_eq!(read_seed_from_key_file(ksf.to_str().unwrap()), seed);
+        match prev {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+        let _ = std::fs::remove_file(&ksf);
     }
 
     fn seed_for(id: u64) -> [u8; 32] {
@@ -6596,11 +6799,15 @@ mod tests {
     #[test]
     fn rpc_post_request_includes_content_length_and_body() {
         // M117: a POST carries the body after a Content-Length header equal to its byte length.
-        let req = rpc_post_request("127.0.0.1:9000", "/validate", b"hello");
+        let req = rpc_post_request("127.0.0.1:9000", "/validate", b"hello", None);
         let text = String::from_utf8(req).unwrap();
         assert!(text.starts_with("POST /validate HTTP/1.1\r\n"), "{text}");
         assert!(text.contains("Host: 127.0.0.1:9000\r\n"), "{text}");
         assert!(text.contains("Content-Length: 5\r\n"), "{text}");
+        assert!(
+            !text.contains("Authorization"),
+            "no auth header without a token"
+        );
         assert!(text.ends_with("\r\n\r\nhello"), "{text}");
     }
 
@@ -6609,7 +6816,7 @@ mod tests {
         // M117: a binary (non-UTF-8) body — like a codec-encoded tx — passes through byte-for
         // byte; the request is bytes, not a String, so nothing is mangled.
         let body: Vec<u8> = vec![0x00, 0xff, 0x80, 0x01, 0xfe];
-        let req = rpc_post_request("h:1", "/submit_tx", &body);
+        let req = rpc_post_request("h:1", "/submit_tx", &body, None);
         assert!(req.ends_with(&body), "binary body preserved at the tail");
         // Content-Length reflects the raw length.
         assert!(String::from_utf8_lossy(&req).contains("Content-Length: 5\r\n"));
@@ -6618,10 +6825,27 @@ mod tests {
     #[test]
     fn rpc_post_request_empty_body() {
         // M117: an empty body ⇒ Content-Length: 0 and nothing after the header terminator.
-        let req = rpc_post_request("h:1", "/x", b"");
+        let req = rpc_post_request("h:1", "/x", b"", None);
         let text = String::from_utf8(req).unwrap();
         assert!(text.contains("Content-Length: 0\r\n"), "{text}");
         assert!(text.ends_with("\r\n\r\n"), "{text}");
+    }
+
+    #[test]
+    fn rpc_post_request_adds_bearer_when_token_present() {
+        // M234: a non-empty token adds exactly one `Authorization: Bearer <token>` header
+        // before Content-Length; an empty token adds none (public reads unaffected).
+        let req = rpc_post_request("h:1", "/stake", b"xy", Some("s3cr3t"));
+        let text = String::from_utf8(req).unwrap();
+        assert!(
+            text.contains("Authorization: Bearer s3cr3t\r\n"),
+            "bearer header present: {text}"
+        );
+        assert!(text.contains("Content-Length: 2\r\n"), "{text}");
+        assert!(text.ends_with("\r\n\r\nxy"), "{text}");
+        // an empty token behaves like None
+        let req2 = rpc_post_request("h:1", "/stake", b"xy", Some(""));
+        assert!(!String::from_utf8(req2).unwrap().contains("Authorization"));
     }
 
     // M98: build a signed tx and its canonical encoding for inspect-tx tests.

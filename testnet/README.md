@@ -10,8 +10,46 @@ testnet/gen.sh            # 1) 密钥 → genesis → 每节点配置 → check-
 testnet/up.sh             # 2) 后台启动全部验证人(SIGTERM 优雅关闭)
 testnet/smoke.sh 3        # 3) 所有节点到达高度 3 且同一区块哈希(一条链)
 testnet/recover.sh 5      # 4) 备份/恢复 + 快照 fast-sync 演练(§11「备份/恢复演练」)
-testnet/down.sh           # 5) 优雅停止
+testnet/chaos.sh          # 5) 混沌/故障注入:崩溃容错 + 崩溃恢复 + 失去法定数的安全停摆 + 恢复
+testnet/soak.sh           # 6) 长跑稳定性:活性 + 不分叉/不漂移 + 供应守恒且跨节点一致 + 无泄漏 + 干净日志
+testnet/down.sh           # 7) 优雅停止
 ```
+
+### 混沌演练(M231,`chaos.sh`)
+
+对**运行中**的测试网注入两类 loopback 上可达的故障(无需 root/iptables):
+
+- **Phase A 崩溃容错 + 恢复**:`SIGKILL` 掉**少数**验证人(= BFT 容错预算 `f = N − 法定数`)。
+  存活的 >2/3 必须**继续出块且不分叉**;重启被杀节点,它必须**追回**到同一 head(崩溃恢复重放)。
+  `store.rs` 对每条记录 `sync_all`,故硬杀(SIGKILL)留下干净记录边界,重启可净回放——这是对
+  真实崩溃/断电的测试,不是优雅排空。
+- **Phase B 失去法定数时的安全性**:再杀一个(在线 < 法定数)。链必须**停摆**(无 >2/3 不出块)
+  ——证明它在失去法定数时**停摆而非分叉**。恢复需**全量重启**(不只是被杀的节点)。
+
+> **已知边界(本演练暴露,见 [`docs/SECURITY.md`](../docs/SECURITY.md) §10.10)**:失去法定数停摆期间,
+> **保持在线**的节点会对待定高度不断换轮(round++),被杀节点重启时从 round 0 开始;法定数恢复后
+> 两者的轮次号**不经 gossip 自动对齐**,存活节点仍卡住(`consensus_active=1` 但高度冻结)。**安全性
+> 始终不破**(不分叉、正确停摆),仅**自动活性恢复不完整**;全量重启让每个节点回到待定高度的干净
+> 轮次即恢复。`chaos.sh` 的 Phase B 据此做全量重启。属共识线待修项(轮次追赶),非安全缺陷。
+
+### 长跑稳定性 soak(M232,`soak.sh`)
+
+对**运行中**的测试网持续采样一段时间,每个采样点断言会被泄漏/时钟漂移/状态分叉/日志暴涨
+打破的不变量:**活性**(每节点高度严格递增,无停摆)、**不分叉/不漂移**(所有节点在滞后高度上
+区块哈希 **与 state_root 均一致**)、**供应守恒且跨节点一致**(`/supply conserved=true` 且 supply
+数值全网相同)、**无内存泄漏**(每节点 RSS 增幅 < `LEAK_PCT%`)、**干净日志**(运行期间无
+error/panic 行)。
+
+```sh
+testnet/soak.sh [DURATION_S=180] [INTERVAL_S=10] [LAG=2] [LEAK_PCT=50] [load]
+```
+
+默认无负载(依赖 `create_empty_blocks` 心跳,数千块无需造 tx)。**第 5 参数 `load`(M234)驱动真实写
+负载**:每采样从账户 2 的加密 keystore(M233)授权一笔**知识 tx**,经 `submit-tx` 投到首节点的 bearer
+门控写面(CLI 现发配置里的 `[rpc] auth_token`,M234)。用 tx 而非 bond 是有意的——**一笔 `bond` 会立刻
+变成验证人权力**,不运行节点的账户绑定超 1/3 会**永久瘫痪共识**(见 [`docs/SECURITY.md`](../docs/SECURITY.md)
+§10.11);知识 tx 只增发/记账,**绝不动验证人集**,是安全的持续负载。实测 5/5 tx 被接受、供应随增发增长
+且全程守恒+跨节点一致。真正的上线前 soak 应为**小时/天级**;本脚本是可重复的**分钟级门禁**。
 
 默认 **4 验证人**(id 21–24,容 1 拜占庭)+ **3 个有余额账户**(id 1–3,tx 作者)+
 3 个评议人(id 10–12)。`gen.sh -n 7 -a 5` 改规模;`--force` 重新生成(**销毁**旧密钥)。
@@ -24,6 +62,15 @@ testnet/down.sh           # 5) 优雅停止
 `smoke.sh` 应照常收敛——证明远程签名验证人与在进程验证人在同一条链上共识(含 peer-auth
 握手亦经签名器)。见 [`docs/design/remote-signer.md`](../docs/design/remote-signer.md) 与
 DEPLOYMENT §2b。
+
+### 完全加固的许可制姿态(M236,`--permissioned`)
+
+默认测试网已开 `enable_tls + require_peer_auth`;`gen.sh --permissioned` 再开 **genesis-pinned
+mTLS**(`require_peer_certs`,RFC7250 raw-pubkey,用各节点的创世 ed25519 种子,无需证书文件)+
+**RFC5705 通道绑定**(`bind_channel`,防中继)——即 DEPLOYMENT §5 的生产许可制全套。实测该姿态下
+`smoke.sh`(收敛)、`chaos.sh`(崩溃容错 + 安全停摆 + 恢复,恢复握手经 mTLS+签名重连)、
+`soak.sh load`(知识 tx 经 mTLS gossip 落块、供应守恒+跨节点一致)**全部通过**——补上了此前"加固
+姿态仅收敛过、未经混沌/负载"的空白。
 
 ## 生成物(`testnet/out/`,已 gitignore,**切勿提交**)
 
