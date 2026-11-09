@@ -172,7 +172,10 @@ async fn read_hello<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<u64> {
 /// `unbonding_root`) wire breaks landed while this constant was still `1`, so a B5/B6
 /// node and a B7 node would have passed the handshake and only failed later on
 /// incompatible frames. Every future wire break MUST bump this (CI/review gate).
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// 测试网阶段 1(B8 wire):bumped to **4** — blocks carry `knowledge_ops` and headers an 11th
+/// per-body commitment (`knowledge_ops_commitment`). The testnet starts from a fresh genesis.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// M221 (rolling-upgrade S1): the LOWEST wire version this build still speaks. Together
 /// with [`PROTOCOL_VERSION`] (the highest) this build advertises the supported range
@@ -181,7 +184,7 @@ pub const PROTOCOL_VERSION: u32 = 3;
 /// rolling upgrade keeps the old version in this range (then drops it a release later —
 /// a sliding window). Equal to `PROTOCOL_VERSION` today ⇒ single-version behavior, but
 /// now negotiated as a range so future upgrades need no coordinated full-network stop.
-pub const MIN_WIRE_VERSION: u32 = 3;
+pub const MIN_WIRE_VERSION: u32 = 4;
 
 /// M192 / M221: exchange supported wire-version *ranges* at connection open and agree on
 /// the highest common version (returned). Writes our `[MIN_WIRE_VERSION, PROTOCOL_VERSION]`,
@@ -486,6 +489,25 @@ enum Cmd {
     SubmitStakeOp {
         op: Box<crate::StakeOp>,
         reply: oneshot::Sender<Result<Hash, crate::ChainError>>,
+    },
+    /// K5:提交一条已签名的知识 op(入池 + 泛洪)。准入走 GossipNode 与 gossip 共用的路径,
+    /// 未入池时把结构化原因返回给 RPC 调用方。
+    SubmitKnowledgeOp {
+        op: Box<crate::knowledge::KnowledgeOp>,
+        reply: oneshot::Sender<Result<Hash, crate::ChainError>>,
+    },
+    /// K5:知识单元目录(按 id 排序),附各单元当前版本的可信度。
+    QueryUnits {
+        reply: oneshot::Sender<Vec<UnitSummary>>,
+    },
+    /// K5:单个知识单元的完整信息(全部版本、引用、核验、逐版本可信度)。
+    QueryUnit {
+        id: u64,
+        reply: oneshot::Sender<Option<UnitDetail>>,
+    },
+    /// K5:成员目录(按 id 排序),附当前是否已过见习期。
+    QueryMembers {
+        reply: oneshot::Sender<Vec<(u64, crate::knowledge::Member, bool)>>,
     },
     /// M115: a pre-flight validation — run `validate_tx` against current committed state
     /// WITHOUT admitting the tx to the mempool. A wallet checks acceptability before
@@ -1818,6 +1840,67 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     Err(e) => Err(e),
                 };
                 let _ = reply.send(res);
+            }
+            Cmd::SubmitKnowledgeOp { op, reply } => {
+                let h = op.hash();
+                let res = match actor.node.submit_local_knowledge_op(*op) {
+                    Ok(out) => {
+                        actor.route(out);
+                        Ok(h)
+                    }
+                    Err(e) => Err(e),
+                };
+                let _ = reply.send(res);
+            }
+            Cmd::QueryUnits { reply } => {
+                let k = &actor.node.chain.state.knowledge;
+                let list = k
+                    .units
+                    .values()
+                    .filter_map(|u| {
+                        Some(UnitSummary {
+                            id: u.id,
+                            author: u.author,
+                            layer: u.layer,
+                            domain: u.domain,
+                            created_height: u.created_height,
+                            versions: u.versions.len() as u32,
+                            cred: k.current_credibility(u.id)?,
+                        })
+                    })
+                    .collect();
+                let _ = reply.send(list);
+            }
+            Cmd::QueryUnit { id, reply } => {
+                let k = &actor.node.chain.state.knowledge;
+                let detail = k.units.get(&id).map(|u| UnitDetail {
+                    unit: u.clone(),
+                    versions: u
+                        .versions
+                        .iter()
+                        .filter_map(|v| {
+                            let cred = k.credibility(id, v.n)?;
+                            let verifs = k
+                                .verifications
+                                .range((id, v.n, 0)..=(id, v.n, u64::MAX))
+                                .map(|(_, r)| r.clone())
+                                .collect();
+                            Some((cred, verifs))
+                        })
+                        .collect(),
+                });
+                let _ = reply.send(detail);
+            }
+            Cmd::QueryMembers { reply } => {
+                let state = &actor.node.chain.state;
+                let h = state.height;
+                let list = state
+                    .knowledge
+                    .members
+                    .iter()
+                    .map(|(&id, m)| (id, m.clone(), state.knowledge.is_established(id, h)))
+                    .collect();
+                let _ = reply.send(list);
             }
             Cmd::SubmitStakeOp { op, reply } => {
                 // M229: verify the account's signature, then stage + flood the stake op
@@ -3295,6 +3378,303 @@ fn gov_reject_status(e: &crate::ChainError) -> &'static str {
     }
 }
 
+/// K5:知识 op 提交被拒时的 HTTP 状态码(与治理 op 一致)。
+fn knowledge_reject_status(e: &crate::ChainError) -> &'static str {
+    match e {
+        crate::ChainError::KnowledgePoolFull
+        | crate::ChainError::KnowledgeAccountQuotaExceeded { .. } => "429 Too Many Requests",
+        crate::ChainError::KnowledgeAlreadySeen => "409 Conflict",
+        _ => "422 Unprocessable Entity",
+    }
+}
+
+/// K5:知识单元目录的一项。
+struct UnitSummary {
+    id: u64,
+    author: u64,
+    layer: crate::knowledge::Layer,
+    domain: u32,
+    created_height: u64,
+    versions: u32,
+    cred: crate::knowledge::Credibility,
+}
+
+/// K5:单个知识单元的完整信息;`versions[i]` 对应 `unit.versions[i]` 的(可信度, 核验记录)。
+struct UnitDetail {
+    unit: crate::knowledge::KnowledgeUnit,
+    versions: Vec<(
+        crate::knowledge::Credibility,
+        Vec<crate::knowledge::Verification>,
+    )>,
+}
+
+fn layer_name(l: crate::knowledge::Layer) -> &'static str {
+    use crate::knowledge::Layer;
+    match l {
+        Layer::Foundation => "foundation",
+        Layer::Explanation => "explanation",
+        Layer::Scenario => "scenario",
+        Layer::Application => "application",
+    }
+}
+
+fn source_name(s: &crate::knowledge::Source) -> String {
+    use crate::knowledge::Source;
+    match s {
+        Source::Human => "human".into(),
+        Source::Model(m) => format!("model:{m}"),
+        Source::ModelVerified(m) => format!("model-verified:{m}"),
+    }
+}
+
+fn cite_kind_name(k: crate::knowledge::CiteKind) -> &'static str {
+    match k {
+        crate::knowledge::CiteKind::Basis => "basis",
+        crate::knowledge::CiteKind::SeeAlso => "see-also",
+    }
+}
+
+fn verdict_name(v: crate::knowledge::Verdict) -> &'static str {
+    match v {
+        crate::knowledge::Verdict::Pass => "pass",
+        crate::knowledge::Verdict::NeedsRevision => "needs-revision",
+    }
+}
+
+fn format_bottleneck(b: Option<(u64, u32)>) -> String {
+    b.map(|(u, v)| format!("{u}v{v}"))
+        .unwrap_or_else(|| "-".into())
+}
+
+fn json_bottleneck(b: Option<(u64, u32)>) -> String {
+    match b {
+        Some((u, v)) => format!(
+            "{{\"unit\":{},\"version\":{}}}",
+            json_u64(u),
+            json_u64(v as u64)
+        ),
+        None => "null".into(),
+    }
+}
+
+fn json_credibility(c: &crate::knowledge::Credibility) -> String {
+    let stale = c
+        .stale_cites
+        .iter()
+        .map(|(u, cited, cur)| {
+            format!(
+                "{{\"unit\":{},\"cited\":{},\"current\":{}}}",
+                json_u64(*u),
+                json_u64(*cited as u64),
+                json_u64(*cur as u64)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"passes\":{},\"self_bps\":{},\"effective_bps\":{},\"bottleneck\":{},\"stale_cites\":[{}]}}",
+        json_u64(c.passes as u64),
+        json_u64(c.self_bps as u64),
+        json_u64(c.effective_bps as u64),
+        json_bottleneck(c.bottleneck),
+        stale
+    )
+}
+
+fn format_unit_listing(units: &[UnitSummary]) -> String {
+    units
+        .iter()
+        .map(|u| {
+            format!(
+                "id={} layer={} domain={} author={} created_height={} versions={} passes={} self_bps={} effective_bps={} bottleneck={}",
+                u.id,
+                layer_name(u.layer),
+                u.domain,
+                u.author,
+                u.created_height,
+                u.versions,
+                u.cred.passes,
+                u.cred.self_bps,
+                u.cred.effective_bps,
+                format_bottleneck(u.cred.bottleneck)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn json_unit_listing(units: &[UnitSummary]) -> String {
+    let items = units
+        .iter()
+        .map(|u| {
+            format!(
+                "{{\"id\":{},\"layer\":{},\"domain\":{},\"author\":{},\"created_height\":{},\"versions\":{},\"credibility\":{}}}",
+                json_u64(u.id),
+                json_str(layer_name(u.layer)),
+                json_u64(u.domain as u64),
+                json_u64(u.author),
+                json_u64(u.created_height),
+                json_u64(u.versions as u64),
+                json_credibility(&u.cred)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+fn format_unit_detail(d: &UnitDetail) -> String {
+    let u = &d.unit;
+    let mut out = vec![format!(
+        "id={} layer={} domain={} author={} created_height={} license={}",
+        u.id,
+        layer_name(u.layer),
+        u.domain,
+        u.author,
+        u.created_height,
+        crate::knowledge::CONTENT_LICENSE
+    )];
+    for (v, (cred, verifs)) in u.versions.iter().zip(&d.versions) {
+        out.push(format!(
+            "version={} publisher={} published_height={} source={} passes={} self_bps={} effective_bps={} bottleneck={}",
+            v.n,
+            v.publisher,
+            v.published_height,
+            source_name(&v.payload.source),
+            cred.passes,
+            cred.self_bps,
+            cred.effective_bps,
+            format_bottleneck(cred.bottleneck)
+        ));
+        for b in &v.payload.bodies {
+            out.push(format!(
+                "  body lang={} hash={}",
+                b.lang,
+                crate::hash::hex(&b.hash)
+            ));
+        }
+        for c in &v.payload.cites {
+            out.push(format!(
+                "  cite unit={} version={} kind={}",
+                c.unit,
+                c.version,
+                cite_kind_name(c.kind)
+            ));
+        }
+        for (unit, cited, cur) in &cred.stale_cites {
+            out.push(format!(
+                "  stale_cite unit={unit} cited={cited} current={cur}"
+            ));
+        }
+        for r in verifs {
+            out.push(format!(
+                "  verification verifier={} verdict={} height={}",
+                r.verifier,
+                verdict_name(r.verdict),
+                r.height
+            ));
+        }
+    }
+    out.join("\n")
+}
+
+fn json_unit_detail(d: &UnitDetail) -> String {
+    let u = &d.unit;
+    let versions = u
+        .versions
+        .iter()
+        .zip(&d.versions)
+        .map(|(v, (cred, verifs))| {
+            let bodies = v
+                .payload
+                .bodies
+                .iter()
+                .map(|b| format!("{{\"lang\":{},\"hash\":{}}}", json_str(&b.lang), json_str(&crate::hash::hex(&b.hash))))
+                .collect::<Vec<_>>()
+                .join(",");
+            let cites = v
+                .payload
+                .cites
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{{\"unit\":{},\"version\":{},\"kind\":{}}}",
+                        json_u64(c.unit),
+                        json_u64(c.version as u64),
+                        json_str(cite_kind_name(c.kind))
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let vs = verifs
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{{\"verifier\":{},\"verdict\":{},\"height\":{},\"note_hash\":{}}}",
+                        json_u64(r.verifier),
+                        json_str(verdict_name(r.verdict)),
+                        json_u64(r.height),
+                        json_str(&crate::hash::hex(&r.note_hash))
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "{{\"n\":{},\"publisher\":{},\"published_height\":{},\"source\":{},\"bodies\":[{}],\"cites\":[{}],\"verifications\":[{}],\"credibility\":{}}}",
+                json_u64(v.n as u64),
+                json_u64(v.publisher),
+                json_u64(v.published_height),
+                json_str(&source_name(&v.payload.source)),
+                bodies,
+                cites,
+                vs,
+                json_credibility(cred)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"id\":{},\"layer\":{},\"domain\":{},\"author\":{},\"created_height\":{},\"license\":{},\"versions\":[{}]}}",
+        json_u64(u.id),
+        json_str(layer_name(u.layer)),
+        json_u64(u.domain as u64),
+        json_u64(u.author),
+        json_u64(u.created_height),
+        json_str(crate::knowledge::CONTENT_LICENSE),
+        versions
+    )
+}
+
+fn format_member_listing(ms: &[(u64, crate::knowledge::Member, bool)]) -> String {
+    ms.iter()
+        .map(|(id, m, est)| {
+            format!(
+                "id={id} joined_height={} inviter={} last_invite_height={} established={est}",
+                m.joined_height, m.inviter, m.last_invite_height
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn json_member_listing(ms: &[(u64, crate::knowledge::Member, bool)]) -> String {
+    let items = ms
+        .iter()
+        .map(|(id, m, est)| {
+            format!(
+                "{{\"id\":{},\"joined_height\":{},\"inviter\":{},\"last_invite_height\":{},\"established\":{}}}",
+                json_u64(*id),
+                json_u64(m.joined_height),
+                json_u64(m.inviter),
+                json_u64(m.last_invite_height),
+                est
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
 fn http_response(status_line: &str, body: &str) -> String {
     // M66: delegate to the Content-Type-aware builder with the historic plaintext type,
     // so every pre-M66 caller's output stays byte-identical.
@@ -3527,6 +3907,12 @@ async fn run_rpc(
 /// unrecognized path) so the endpoint stays a liveness probe exactly as before M58;
 /// only a malformed `/account/<non-numeric>` resolves to `NotFound` (→ 404).
 enum GetRoute {
+    /// K5:`GET /units` 知识单元目录。
+    Units,
+    /// K5:`GET /unit/{id}` 单个知识单元。
+    Unit(u64),
+    /// K5:`GET /members` 成员目录。
+    Members,
     Health,
     Height,
     Head,
@@ -3985,6 +4371,9 @@ fn route_get(path: &str) -> GetRoute {
         // M197: the governance proposal directory. Exact-match; no `/proposal/` single-read
         // prefix, so `/proposals/` simply falls through to `Health`.
         "/proposals" => GetRoute::Proposals,
+        // K5:知识单元目录与成员目录(精确匹配);单个单元走下方 `/unit/` 前缀。
+        "/units" => GetRoute::Units,
+        "/members" => GetRoute::Members,
         // M86: the plain cognitive-graph directory. Exact-match; the `/graph/` prefix
         // (single reads/proofs) is handled in the fallthrough arm below, where `/graph/`
         // with an empty id already resolves to `NotFound`.
@@ -4027,7 +4416,12 @@ fn route_get(path: &str) -> GetRoute {
         // range is taken from `?from=H&limit=N` query params, defaults `from=1, limit=DEFAULT`.
         "/headers" => GetRoute::Headers,
         p => {
-            if let Some(rest) = p.strip_prefix("/account/") {
+            if let Some(rest) = p.strip_prefix("/unit/") {
+                // K5:`/unit/{id}`;空或非数字 id ⇒ 404。
+                rest.parse::<u64>()
+                    .map(GetRoute::Unit)
+                    .unwrap_or(GetRoute::NotFound)
+            } else if let Some(rest) = p.strip_prefix("/account/") {
                 // M59: `{id}/proof` is the verifiable read; a bare `{id}` is the M58
                 // plain read. An empty or non-numeric id in either shape ⇒ 404.
                 match rest.strip_suffix("/proof") {
@@ -4190,7 +4584,7 @@ fn proof_kind_label(k: ProofKind) -> &'static str {
 fn format_account(id: u64, a: &Account) -> String {
     format!(
         "id={id} balance={} staked_total={} earned_total={} slashed_total={} \
-         submissions={} accepted={} pubkey={}",
+         submissions={} accepted={} pubkey={} nonce={}",
         a.balance,
         a.staked_total,
         a.earned_total,
@@ -4198,6 +4592,7 @@ fn format_account(id: u64, a: &Account) -> String {
         a.submissions,
         a.accepted,
         crate::hash::hex(&a.pubkey),
+        a.nonce,
     )
 }
 
@@ -4641,6 +5036,8 @@ const READ_ROUTES: &[&str] = &[
     "/reviewers",
     "/cnfts",
     "/proposals",
+    "/units",
+    "/members",
     "/graph",
     "/bonds",
     "/unbonding",
@@ -4671,6 +5068,7 @@ const READ_ROUTES: &[&str] = &[
     "/tx/{hash}/detail",
     "/block/{height}",
     "/block/{height}/txs",
+    "/unit/{id}",
 ];
 
 /// M118: render the route index as one path per line. Pure for unit testing.
@@ -4692,7 +5090,7 @@ fn json_routes() -> String {
 fn json_account(id: u64, a: &Account) -> String {
     format!(
         "{{\"id\":{},\"balance\":{},\"staked_total\":{},\"earned_total\":{},\
-         \"slashed_total\":{},\"submissions\":{},\"accepted\":{},\"pubkey\":{}}}",
+         \"slashed_total\":{},\"submissions\":{},\"accepted\":{},\"pubkey\":{},\"nonce\":{}}}",
         json_u64(id),
         json_u64(a.balance),
         json_u64(a.staked_total),
@@ -4701,6 +5099,7 @@ fn json_account(id: u64, a: &Account) -> String {
         json_u64(a.submissions),
         json_u64(a.accepted),
         json_str(&crate::hash::hex(&a.pubkey)),
+        json_u64(a.nonce),
     )
 }
 
@@ -6790,6 +7189,93 @@ async fn serve_rpc_conn(
                     }
                 }
             }
+            GetRoute::Units => {
+                // K5:知识单元目录,按 id 分页(游标为单元 id),每项附当前版本的可信度。
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryUnits { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let keys: Vec<u64> = listing.iter().map(|u| u.id).collect();
+                            let cursor = usize_param(query, "cursor").map(|c| c as u64);
+                            let start = if cursor.is_some() {
+                                key_after(&keys, cursor.as_ref())
+                            } else {
+                                usize_param(query, "offset").unwrap_or(0)
+                            };
+                            let limit = effective_limit(usize_param(query, "limit"));
+                            let total = listing.len();
+                            let start = start.min(total);
+                            let page = &listing[start..(start + limit).min(total)];
+                            let cur =
+                                last_key(&keys[start..(start + page.len())]).map(|k| k.to_string());
+                            ok_body(
+                                fmt,
+                                &format_page_cursor(
+                                    &format_unit_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
+                                &json_page_cursor(&json_unit_listing(page), total, cur.as_deref()),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Unit(id) => {
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryUnit { id, reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(Some(d)) => ok_body(fmt, &format_unit_detail(&d), &json_unit_detail(&d)),
+                        Ok(None) => {
+                            error_body(fmt, "404 Not Found", &format!("no knowledge unit {id}"))
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Members => {
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryMembers { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let keys: Vec<u64> = listing.iter().map(|m| m.0).collect();
+                            let cursor = usize_param(query, "cursor").map(|c| c as u64);
+                            let start = if cursor.is_some() {
+                                key_after(&keys, cursor.as_ref())
+                            } else {
+                                usize_param(query, "offset").unwrap_or(0)
+                            };
+                            let limit = effective_limit(usize_param(query, "limit"));
+                            let total = listing.len();
+                            let start = start.min(total);
+                            let page = &listing[start..(start + limit).min(total)];
+                            let cur =
+                                last_key(&keys[start..(start + page.len())]).map(|k| k.to_string());
+                            ok_body(
+                                fmt,
+                                &format_page_cursor(
+                                    &format_member_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
+                                &json_page_cursor(
+                                    &json_member_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
             GetRoute::Proposals => {
                 // M197: governance proposal directory — always a (possibly empty) `200`.
                 // Same pagination stack, cursor keyed by proposal id.
@@ -7658,6 +8144,44 @@ async fn serve_rpc_conn(
                 ok_body(fmt, &hex, &format!("{{\"hash\":{}}}", json_str(&hex)))
             }
             Ok(Err(e)) => error_body(fmt, gov_reject_status(&e), &e.to_string()),
+            Err(_) => http_response("503 Service Unavailable", "node stopped"),
+        };
+        let _ = stream.write_all(resp.as_bytes()).await;
+        let _ = stream.flush().await;
+        return;
+    }
+    if path == "/knowledge" {
+        // K5:`POST /knowledge` 提交编码后的知识 op(入池 + 泛洪)。与治理 op 相同的状态码约定:
+        // 200 + op 哈希;400 无法解码;409 已在池中;429 池满或账户配额满;422 其他拒绝原因。
+        let op = match crate::codec::decode_knowledge_op(&body) {
+            Ok(op) => op,
+            Err(e) => {
+                let _ = stream
+                    .write_all(error_body(fmt, "400 Bad Request", &e.to_string()).as_bytes())
+                    .await;
+                let _ = stream.flush().await;
+                return;
+            }
+        };
+        let (reply, rx) = oneshot::channel();
+        if cmd
+            .send(Cmd::SubmitKnowledgeOp {
+                op: Box::new(op),
+                reply,
+            })
+            .is_err()
+        {
+            let _ = stream
+                .write_all(http_response("503 Service Unavailable", "node stopped").as_bytes())
+                .await;
+            return;
+        }
+        let resp = match rx.await {
+            Ok(Ok(h)) => {
+                let hex = crate::hash::hex(&h);
+                ok_body(fmt, &hex, &format!("{{\"hash\":{}}}", json_str(&hex)))
+            }
+            Ok(Err(e)) => error_body(fmt, knowledge_reject_status(&e), &e.to_string()),
             Err(_) => http_response("503 Service Unavailable", "node stopped"),
         };
         let _ = stream.write_all(resp.as_bytes()).await;
@@ -9698,6 +10222,7 @@ mod tests {
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
             max_validator_power_bps: 0,
+            knowledge: crate::knowledge::KnowledgeGenesis::default(),
             timestamp_days: 0.0,
             validators: [21u64, 22, 23, 24]
                 .iter()
@@ -11225,6 +11750,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_knowledge_submit_and_read_over_tcp() {
+        // K5:`POST /knowledge` 提交 → 入块 → `/units`、`/unit/{id}`、`/members` 可读;
+        // 另一账户核验后可信度上升;无法解码 400、重复 409、签名错误 422。
+        use crate::knowledge::*;
+        let dir = tmp_dir("rpc-knowledge");
+        let mut cfg = node_config(21, 21561, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:21592";
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
+        });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        genesis.knowledge.domains = vec![2];
+        let _node = Node::start(cfg, genesis, Some(kp(21)), None)
+            .await
+            .expect("start node");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        async fn post(addr: &str, body: &[u8]) -> String {
+            let mut req = format!(
+                "POST /knowledge HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(body);
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(&req).await.expect("send");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+            );
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        async fn wait_for(addr: &str, path: &str, needle: &str) -> String {
+            for _ in 0..100 {
+                let r = get(addr, path).await;
+                if r.contains(needle) {
+                    return r;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!("{path} never contained {needle}");
+        }
+        let create = KnowledgeOp {
+            actor: 1,
+            action: KnowledgeAction::CreateUnit {
+                layer: Layer::Foundation,
+                domain: 2,
+                version: VersionPayload {
+                    bodies: vec![Body {
+                        lang: "zh".into(),
+                        hash: [7u8; 32],
+                    }],
+                    source: Source::Model("claude-opus-5-5".into()),
+                    cites: vec![],
+                },
+            },
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let bytes = crate::codec::encode_knowledge_op(&create);
+        let t = post(rpc_addr, &bytes).await;
+        assert!(t.starts_with("HTTP/1.1 200 OK"), "create: {t}");
+        assert!(
+            t.contains(&crate::hash::hex(&create.hash())),
+            "hash in body: {t}"
+        );
+        // 同一条再交一次:已在池中(或已入块后序号过旧)→ 被拒,不会返回误导性的 200
+        let t = post(rpc_addr, &bytes).await;
+        assert!(
+            t.starts_with("HTTP/1.1 409") || t.starts_with("HTTP/1.1 422"),
+            "duplicate: {t}"
+        );
+
+        // 入块后可读:模型生成、无人核验 → 1000 bps
+        let units = wait_for(rpc_addr, "/units", "\"effective_bps\":\"1000\"").await;
+        assert!(units.contains("\"layer\":\"foundation\""), "{units}");
+        let one = get(rpc_addr, "/unit/1").await;
+        assert!(one.contains("\"license\":\"CC-BY-4.0\""), "{one}");
+        assert!(
+            one.contains("\"source\":\"model:claude-opus-5-5\""),
+            "{one}"
+        );
+        assert!(get(rpc_addr, "/unit/99").await.starts_with("HTTP/1.1 404"));
+        assert!(get(rpc_addr, "/unit/x").await.starts_with("HTTP/1.1 404"));
+
+        // 账户 2 核验通过 → 自身可信度 0.2 + 0.2 = 4000 bps
+        let verify = KnowledgeOp {
+            actor: 2,
+            action: KnowledgeAction::Verify {
+                unit: 1,
+                version: 1,
+                verdict: Verdict::Pass,
+                note_hash: [0u8; 32],
+            },
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(2));
+        let t = post(rpc_addr, &crate::codec::encode_knowledge_op(&verify)).await;
+        assert!(t.starts_with("HTTP/1.1 200 OK"), "verify: {t}");
+        let one = wait_for(rpc_addr, "/unit/1", "\"passes\":\"1\"").await;
+        assert!(one.contains("\"effective_bps\":\"4000\""), "{one}");
+        assert!(one.contains("\"verdict\":\"pass\""), "{one}");
+
+        let members = get(rpc_addr, "/members").await;
+        assert!(members.contains("\"established\":true"), "{members}");
+
+        // 签名错误 → 422;无法解码 → 400
+        let forged = KnowledgeOp {
+            actor: 3,
+            ..verify.clone()
+        }
+        .signed(&kp(2));
+        let t = post(rpc_addr, &crate::codec::encode_knowledge_op(&forged)).await;
+        assert!(t.starts_with("HTTP/1.1 422"), "bad sig: {t}");
+        let t = post(rpc_addr, b"not-a-knowledge-op").await;
+        assert!(t.starts_with("HTTP/1.1 400"), "malformed: {t}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_endpoint_accepts_tx_over_tcp() {
         // M53: enable the ingress RPC, POST a codec-encoded tx over TCP, and
         // assert 200 + hash in the body; then confirm it entered the mempool.
@@ -11465,13 +12125,13 @@ mod tests {
             slashed_total: 5,
             submissions: 6,
             accepted: 7,
-            nonce: 0,
+            nonce: 9,
         };
         assert_eq!(
             format_account(1, &a),
             format!(
                 "id=1 balance=12 staked_total=3 earned_total=4 slashed_total=5 \
-                 submissions=6 accepted=7 pubkey={}",
+                 submissions=6 accepted=7 pubkey={} nonce=9",
                 crate::hash::hex(&[0xab; 32])
             )
         );
@@ -11954,6 +12614,7 @@ mod tests {
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
             max_validator_power_bps: 0,
+            knowledge: crate::knowledge::KnowledgeGenesis::default(),
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
@@ -15428,6 +16089,7 @@ mod tests {
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
             max_validator_power_bps: 0,
+            knowledge: crate::knowledge::KnowledgeGenesis::default(),
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
@@ -16603,6 +17265,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
             max_validator_power_bps: 0,
+            knowledge: crate::knowledge::KnowledgeGenesis::default(),
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
@@ -18399,6 +19062,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             key_rotations_commitment: [0u8; 32],
             gov_proposals_commitment: [0u8; 32],
             gov_votes_commitment: [0u8; 32],
+            knowledge_ops_commitment: [0u8; 32],
             proposer: 0,
         };
         let cert = Commit {
@@ -18629,6 +19293,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             key_rotations_commitment: [0u8; 32],
             gov_proposals_commitment: [0u8; 32],
             gov_votes_commitment: [0u8; 32],
+            knowledge_ops_commitment: [0u8; 32],
             proposer: 0,
         };
         let cert = |height: u64| Commit {
@@ -18769,6 +19434,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             key_rotations_commitment: [0u8; 32],
             gov_proposals_commitment: [0u8; 32],
             gov_votes_commitment: [0u8; 32],
+            knowledge_ops_commitment: [0u8; 32],
             proposer: 0,
         };
         let cert = |height: u64| Commit {
@@ -18872,6 +19538,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             key_rotations_commitment: [0u8; 32],
             gov_proposals_commitment: [0u8; 32],
             gov_votes_commitment: [0u8; 32],
+            knowledge_ops_commitment: [0u8; 32],
             proposer: 0,
         };
         let cert = |height: u64| Commit {
@@ -18981,6 +19648,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             key_rotations: vec![],
             gov_proposals: Vec::new(),
             gov_votes: Vec::new(),
+            knowledge_ops: Vec::new(),
             proposer: 0,
         };
         let j = json_range_blocks(&[(block, cert(7))]);
